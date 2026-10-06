@@ -6422,19 +6422,16 @@ app.post('/api/courses', requireAdminAuth, async (req, res) => {
     body.tracks  = _cleanTracks(body.tracks);
     body.subject = _slugKey(body.subject);
 
-    /* ⭐ FIX (2026-10-06): MongoDB's text indexes default their
-       language_override field to a field literally named
-       "language". An empty string — which is exactly what the
-       admin form sends when the optional "Language" input is
-       left blank — makes .save() throw:
-           "language override unsupported: "
-       Normalise it here so the save can never fail. Unknown
-       values ("Hindi", "en-IN", …) become "none". */
-    if (body.language !== undefined) {
-      const lang = _sanitizeCourseLanguage(body.language);
-      if (lang) body.language = lang;
-      else      delete body.language;
-    }
+    /* ⭐ FIX (2026-10-06): MongoDB's text index uses a language_override
+       field called "language". Storing "" throws
+       "language override unsupported: ". The Course schema has
+       `language: { default: '' }`, which puts the empty string back even
+       after we delete it from the payload — so `delete body.language`
+       does NOT work. We must ALWAYS write a valid value.
+       'none' is a supported MongoDB language and means "no stemming",
+       which is the correct semantic for a course whose Language field
+       was left blank by the admin. */
+    body.language = _sanitizeCourseLanguage(body.language) || 'none';
 
     // Normalise types so a bad client payload can never cause a Mongoose cast error
     body.featured  = body.featured === true || body.featured === 'true';
