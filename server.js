@@ -6345,6 +6345,55 @@ function _validChapterId(course, id) {
   if (typeof course.chapters.id !== 'function') return '';
   try { return course.chapters.id(s) ? s : ''; } catch (e) { return ''; }
 }
+/* ============================================================
+   COURSE LANGUAGE SANITISER
+   ------------------------------------------------------------
+   MongoDB's text indexes default their `language_override` field
+   to a field literally named "language". Storing an empty string
+   — or any value that is not one of MongoDB's supported
+   text-search languages (e.g. "Hindi", "en-IN", "Kannada") —
+   makes `new Course(body).save()` throw:
+
+       language override unsupported: <value>
+
+   The admin's "Language (Optional)" input is free text, so we
+   normalise it here before it reaches Mongoose:
+
+     • empty / missing            → the field is dropped entirely
+     • a supported language name  → lowercased and stored as-is
+     • a known short code ("en")  → mapped to its full name
+     • anything else ("hindi", …) → "none"
+        ("none" tells MongoDB to use no stemming / stopwords —
+         which is correct for languages it does not support.)
+
+   The Course schema is unchanged. The admin-visible value
+   continues to round-trip through the "Language" field.
+   ============================================================ */
+const MONGO_TEXT_LANGUAGES = new Set([
+  'none', 'danish', 'dutch', 'english', 'finnish', 'french', 'german',
+  'hungarian', 'italian', 'norwegian', 'portuguese', 'romanian',
+  'russian', 'spanish', 'swedish', 'turkish'
+]);
+const COURSE_LANG_ALIASES = {
+  'en': 'english', 'en-us': 'english', 'en-gb': 'english', 'eng': 'english',
+  'de': 'german',  'de-de': 'german',
+  'fr': 'french',  'fr-fr': 'french',
+  'es': 'spanish', 'es-es': 'spanish',
+  'pt': 'portuguese', 'pt-br': 'portuguese',
+  'it': 'italian', 'it-it': 'italian',
+  'ru': 'russian', 'ru-ru': 'russian',
+  'nl': 'dutch', 'da': 'danish', 'fi': 'finnish', 'hu': 'hungarian',
+  'no': 'norwegian', 'ro': 'romanian', 'sv': 'swedish', 'tr': 'turkish'
+};
+function _sanitizeCourseLanguage(value) {
+  if (value === undefined || value === null) return '';
+  const clean = String(value).trim().toLowerCase();
+  if (!clean) return '';
+  if (MONGO_TEXT_LANGUAGES.has(clean)) return clean;
+  if (COURSE_LANG_ALIASES[clean]) return COURSE_LANG_ALIASES[clean];
+  return 'none';
+}
+
 /* Sanitises an incoming course body so an old or partially-broken
    client payload can never trigger a Mongoose cast error. Called
    from POST /api/courses before building the Course document. */
@@ -6360,7 +6409,6 @@ function _normaliseCourseBody(b) {
   }
   return b;
 }
-
 app.post('/api/courses', requireAdminAuth, async (req, res) => {
   try {
     const body = Object.assign({}, req.body || {});
@@ -6373,6 +6421,20 @@ app.post('/api/courses', requireAdminAuth, async (req, res) => {
 
     body.tracks  = _cleanTracks(body.tracks);
     body.subject = _slugKey(body.subject);
+
+    /* ⭐ FIX (2026-10-06): MongoDB's text indexes default their
+       language_override field to a field literally named
+       "language". An empty string — which is exactly what the
+       admin form sends when the optional "Language" input is
+       left blank — makes .save() throw:
+           "language override unsupported: "
+       Normalise it here so the save can never fail. Unknown
+       values ("Hindi", "en-IN", …) become "none". */
+    if (body.language !== undefined) {
+      const lang = _sanitizeCourseLanguage(body.language);
+      if (lang) body.language = lang;
+      else      delete body.language;
+    }
 
     // Normalise types so a bad client payload can never cause a Mongoose cast error
     body.featured  = body.featured === true || body.featured === 'true';
@@ -6412,6 +6474,7 @@ app.post('/api/courses', requireAdminAuth, async (req, res) => {
     res.status(500).json({ success: false, message: 'Could not create course: ' + friendly });
   }
 });
+
 
 app.put('/api/courses/:id', requireAdminAuth, async (req, res) => {
   try {
