@@ -1,11 +1,11 @@
 # RankerNode Android app
 
 A real Android app (APK) for RankerNode — not a browser shortcut. It opens
-`https://altitudeacademy.example/app` full-screen, with its own icon and name, no browser
+`https://rankernode.example/app` full-screen, with its own icon and name, no browser
 bar and no browser badge.
 
 ## What it does
-- **Own app** — package `com.altitudeacademy.app`, appears in the app drawer and Settings → Apps.
+- **Own app** — package `com.rankernode.app`, appears in the app drawer and Settings → Apps.
 - **Screenshots and screen recording are blocked** inside the app (Android `FLAG_SECURE`); the
   recent-apps preview is blank too.
 - **Uploads work** — AI Doubt Solver attachments, contributions, profile photos; the **Photo**
@@ -16,7 +16,7 @@ bar and no browser badge.
 - **Back button** goes back through the site; an **offline screen** retries by itself.
 - **Updates** — the app checks the website every few hours and offers a newer version when you
   upload one in Admin → Mobile App.
-- The website can tell it is running in the app (the user-agent contains `AltitudeAcademyApp/`), so
+- The website can tell it is running in the app (the user-agent contains `RankerNodeApp/`), so
   "Get App" buttons are hidden there.
 
 Voice typing in the AI Doubt Solver is a browser feature that Android's in-app web view does not
@@ -32,7 +32,7 @@ GitHub builds the APK for you:
 2. Push to `main` (any change inside `android-app/`), or open **GitHub → Actions →
    "Android app (APK)" → Run workflow**.
 3. After ~5 minutes open the finished run → **Artifacts** (or **Releases**) → download
-   `AltitudeAcademy-1.0.N.apk`.
+   `RankerNode-1.0.N.apk`.
 4. On the website: **Admin → Mobile App → Upload new version** → choose that APK.
    From then on the Android "Get App" button downloads it, and installed apps offer the update.
 

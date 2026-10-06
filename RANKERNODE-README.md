@@ -37,12 +37,12 @@ Open a course in **Admin → Courses → Edit**, then go to the **Chapters** tab
 Material types are now aimed at exam preparation: Video Lecture, Chapter Notes, Slides, DPP, Assignment, PYQs, Solutions, Formula Sheet, NCERT, Chapter Test, Books, Audio, Diagram and Other.
 
 ## Separate from AeroGyan
-- **Database:** `.env` points at a new database called `altitude-academy` on the same MongoDB cluster, so courses and students are not shared.
+- **Database:** `.env` points at a new database called `rankernode` on the same MongoDB cluster, so courses and students are not shared.
 - **Login secret:** `JWT_SECRET` is a new random value, so AeroGyan logins don't work here.
 - **Port:** `PORT=5002`, so it can run on the same server next to AeroGyan (which uses 5001).
-- **Cloudinary:** uploads go to the `altitude-academy/` folder.
+- **Cloudinary:** uploads go to the `rankernode/` folder.
 - **Android:**
-  - The package is `com.altitudeacademy.app`, with its own icon and name.
+  - The package is `com.rankernode.app`, with its own icon and name.
   - It uses its own signing key in `android-signing/`. That folder is git-ignored, so back it up.
 - **Uploads:** the site starts with no uploaded files.
 
@@ -54,20 +54,20 @@ Still shared, because the same keys were copied. Change them in `.env` if you wa
 - the admin login (`ADMIN_*`)
 
 ## Before going live
-1. **Domain.** Replace `altitudeacademy.example` with the real domain in:
+1. **Domain.** Replace `rankernode.example` with the real domain in:
    - `android-app/app.properties` (`APP_URL`)
    - `landing.html` (the email link in the "About" section)
 2. **Git.** This folder is **not** connected to AeroGyan's GitHub repository. Create a new repository and push there. Never add AeroGyan's remote.
    ```
    git init && git add -A && git commit -m "RankerNode"
-   git remote add origin https://github.com/<you>/altitude-academy.git
+   git remote add origin https://github.com/<you>/rankernode.git
    git push -u origin main
    ```
 3. **Android builds.** Move `android-app/ci/android-apk.yml` to `.github/workflows/android-apk.yml`. Then add the 4 secrets listed in `android-signing/GITHUB-SECRETS-README.txt` to the new repository.
 4. **On the server:**
    ```
    npm install
-   node server.js        # or: pm2 start server.js --name altitude-academy
+   node server.js        # or: pm2 start server.js --name rankernode
    ```
    Point the new domain (nginx) at port 5002.
 5. **First setup.** Log in as admin, open **Categories** to check the five categories, then:

@@ -13753,7 +13753,7 @@ app.post('/api/admin/app-release/android', requireAdminAuth, (req, res) => {
         cleanup();
         return res.status(415).json({ success: false, message: 'That file is not an Android app (.apk). Upload the RankerNode-x.y.z.apk built by GitHub.' });
       }
-      /* version: from the form, else from the file name "AltitudeAcademy-1.0.12.apk" */
+      /* version: from the form, else from the file name "RankerNode-1.0.12.apk" */
       const fromName = /(\d+)\.(\d+)\.(\d+)/.exec(String(req.file.originalname || ''));
       let version = String((req.body && req.body.version) || (fromName ? fromName[0] : '')).trim().slice(0, 20);
       if (!/^\d+(\.\d+){0,3}$/.test(version)) version = '';

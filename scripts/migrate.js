@@ -31,7 +31,7 @@ cloudinary.config({
           console.log(`📤 Uploading: ${mat.title} (${course.name})`);
           const result = await cloudinary.uploader.upload(mat.fileData, {
             resource_type: 'auto',
-            folder: 'altitude-academy/uploads',
+            folder: 'rankernode/uploads',
             public_id: `mat_${mat._id}`
           });
           mat.url = result.secure_url;

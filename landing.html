@@ -3880,9 +3880,9 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
 
   /* ---------- 1. Config — leave blank to use PWA install ---------- */
   const APP_DOWNLOADS = {
-    android: { apkUrl: '' },   // e.g. 'https://cdn.altitudeacademy.example/altitudeacademy-v1.2.0.apk'
-    windows: { exeUrl: '' },   // e.g. 'https://cdn.altitudeacademy.example/AltitudeAcademy-Setup-1.2.0.exe'
-    mac:     { dmgUrl: '' }    // e.g. 'https://cdn.altitudeacademy.example/AltitudeAcademy-1.2.0.dmg'
+    android: { apkUrl: '' },   // e.g. 'https://cdn.rankernode.example/rankernode-v1.2.0.apk'
+    windows: { exeUrl: '' },   // e.g. 'https://cdn.rankernode.example/RankerNode-Setup-1.2.0.exe'
+    mac:     { dmgUrl: '' }    // e.g. 'https://cdn.rankernode.example/RankerNode-1.2.0.dmg'
   };
 
   /* ---------- 2. State ---------- */
@@ -4017,7 +4017,7 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
       if (detectPlatform() !== 'android') {
         showInstallGuide(card, hint, 'Get the Android app', [
           'Open <strong>' + location.host + '</strong> on your <strong>Android phone</strong> and tap <strong>Get App</strong>.',
-          'Or download it here and send it to your phone: <a href="' + directUrl + '" style="font-weight:700;">AltitudeAcademy.apk</a>' + (apkInfo ? ' (' + fmtMB(apkInfo.size) + ')' : '') + '.'
+          'Or download it here and send it to your phone: <a href="' + directUrl + '" style="font-weight:700;">RankerNode.apk</a>' + (apkInfo ? ' (' + fmtMB(apkInfo.size) + ')' : '') + '.'
         ]);
         return;
       }

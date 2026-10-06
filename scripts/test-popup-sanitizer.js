@@ -19,9 +19,9 @@ bad.forEach(h => {
   const out = s(h);
   assert(!/<script|onerror|onload|onclick|javascript:|<iframe|<svg|expression\(|<object|<style|<form|<input|data:image/i.test(out), 'unsafe: ' + h + ' → ' + out);
 });
-const good = '<h1 style="text-align: center; color: #fde68a;">🪔 Happy Diwali</h1><p><b>Bold</b> <span style="font-size: 20px;">big</span> <a href="https://altitudeacademy.example/x">link</a></p><img src="/popup-media/pp-abc-0123456789.webp" style="width: 50%; border-radius: 14px;"><ul><li>one</li></ul>';
+const good = '<h1 style="text-align: center; color: #fde68a;">🪔 Happy Diwali</h1><p><b>Bold</b> <span style="font-size: 20px;">big</span> <a href="https://rankernode.example/x">link</a></p><img src="/popup-media/pp-abc-0123456789.webp" style="width: 50%; border-radius: 14px;"><ul><li>one</li></ul>';
 const out = s(good);
-['<h1', 'text-align: center', 'color: #fde68a', '<b>', 'font-size: 20px', 'href="https://altitudeacademy.example/x"', 'target="_blank"', 'src="/popup-media/pp-abc-0123456789.webp"', 'width: 50%', '<li>one</li>', '🪔']
+['<h1', 'text-align: center', 'color: #fde68a', '<b>', 'font-size: 20px', 'href="https://rankernode.example/x"', 'target="_blank"', 'src="/popup-media/pp-abc-0123456789.webp"', 'width: 50%', '<li>one</li>', '🪔']
   .forEach(k => assert(out.includes(k), 'kept: ' + k + ' in ' + out));
 const c = ctx.c({ name: '', durationSec: 999, showOn: 'evil', frequency: 'x', design: { bg1: 'red;background:url(x)', width: 'xl' }, button: { text: 'Go', url: 'javascript:alert(1)' }, startAt: 'nope' });
 assert.strictEqual(c.durationSec, 120); assert.strictEqual(c.showOn, 'both'); assert.strictEqual(c.frequency, 'session');

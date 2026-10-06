@@ -9033,7 +9033,7 @@ async function startSubscriptionCheckout() {
       description: data.title + ' — ₹' + data.amount + '/month',
       prefill: {
         name: currentUser.fullName || currentUser.username,
-        email: currentUser.email || 'student@altitudeacademy.example',
+        email: currentUser.email || 'student@rankernode.example',
         contact: '9999999999'
       },
       theme: { color: '#4f46e5' },
@@ -17523,7 +17523,7 @@ async function proceedCheckout() {
       description: `${createRes.planTitle} — ${createRes.durationDays} days${createRes.couponCode ? ' · ' + createRes.couponCode : ''}`,
       prefill: {
         name: currentUser.fullName || currentUser.username,
-        email: currentUser.email || 'student@altitudeacademy.example',
+        email: currentUser.email || 'student@rankernode.example',
         contact: '9999999999'
       },
       theme: { color: '#4f46e5' },
@@ -24689,7 +24689,7 @@ async function renderAdminMobileApp() {
           <label class="ma-drop" id="maDrop">
             <input type="file" id="maFile" accept=".apk,application/vnd.android.package-archive">
             <i class="fas fa-file-arrow-up"></i>
-            <span id="maFileLabel">Choose <b>AltitudeAcademy-1.0.N.apk</b> (from GitHub → Actions)</span>
+            <span id="maFileLabel">Choose <b>RankerNode-1.0.N.apk</b> (from GitHub → Actions)</span>
           </label>
           <div class="lp-field-row">
             <label class="lp-field"><span>Version</span><input type="text" id="maVersion" placeholder="1.0.12" pattern="\\d+(\\.\\d+){0,3}" required></label>
@@ -24705,7 +24705,7 @@ async function renderAdminMobileApp() {
         <h3><i class="fas fa-circle-info"></i> How to make a new version</h3>
         <ol>
           <li>Push your code to GitHub (or open <b>GitHub → Actions → "Android app (APK)" → Run workflow</b>).</li>
-          <li>After about 5 minutes, open the finished run and download <b>AltitudeAcademy-1.0.N.apk</b> from <b>Artifacts</b> (or <b>Releases</b>).</li>
+          <li>After about 5 minutes, open the finished run and download <b>RankerNode-1.0.N.apk</b> from <b>Artifacts</b> (or <b>Releases</b>).</li>
           <li>Upload it here. Version and build number fill in by themselves from the file name.</li>
         </ol>
         <p class="ma-muted">The app opens your website full-screen with its own icon — no browser bar or badge — and Android blocks screenshots and screen recording inside it. Installed apps offer the new version automatically within a few hours.</p>
