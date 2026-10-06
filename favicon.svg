@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="RankerNode">
+  <title>RankerNode</title>
+  <desc>A mountain peak with a rising gold chevron above it.</desc>
+  <defs>
+    <linearGradient id="aaMtn" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#3730A3"/>
+    </linearGradient>
+  </defs>
+  <path fill="#0EA5E9" d="M232 448 L352 236 L472 448 Z"/>
+  <path fill="url(#aaMtn)" d="M40 448 L216 150 L392 448 Z"/>
+  <path fill="#FFFFFF" d="M216 150 L264 231 L240 218 L216 242 L192 218 L168 231 Z"/>
+  <path fill="none" stroke="#F59E0B" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" d="M164 104 L216 56 L268 104"/>
+</svg>

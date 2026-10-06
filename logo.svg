@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 640" width="512" height="640" role="img" aria-label="RankerNode">
+  <title>RankerNode</title>
+  <path fill="#0EA5E9" d="M232 448 L352 236 L472 448 Z"/>
+  <path fill="#4F46E5" d="M40 448 L216 150 L392 448 Z"/>
+  <path fill="#FFFFFF" d="M216 150 L264 231 L240 218 L216 242 L192 218 L168 231 Z"/>
+  <path fill="none" stroke="#F59E0B" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" d="M164 104 L216 56 L268 104"/>
+  <text x="256" y="560" text-anchor="middle"
+        font-family="'Inter','Helvetica Neue',Arial,sans-serif"
+        font-weight="800" font-size="40" letter-spacing="8"
+        fill="#3730A3">RankerNode</text>
+</svg>

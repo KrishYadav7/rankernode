@@ -1,0 +1,100 @@
+# ============================================================
+#  Build the RankerNode Android app (signed APK) in the cloud.
+#  Runs when android-app/ changes on main, or by hand:
+#  GitHub → Actions → "Android app (APK)" → Run workflow.
+#  The finished AltitudeAcademy-<version>.apk appears under the run's
+#  "Artifacts" (and as a GitHub Release). Upload it in
+#  Admin → Mobile App on the website.
+#
+#  One-time setup — repository Settings → Secrets and variables
+#  → Actions → New repository secret:
+#     ANDROID_KEYSTORE_BASE64   (contents of release-keystore.base64.txt)
+#     ANDROID_KEYSTORE_PASSWORD
+#     ANDROID_KEY_ALIAS
+#     ANDROID_KEY_PASSWORD
+# ============================================================
+name: Android app (APK)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/android-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check signing secrets
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KSP: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KP: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KS" ] || [ -z "$KSP" ] || [ -z "$KA" ] || [ -z "$KP" ]; then
+            echo "::error::Signing secrets are missing. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD (see android-app/README.md)."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Restore the signing key
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$KS" | base64 --decode > "$RUNNER_TEMP/release.jks"
+
+      - name: Build signed APK
+        working-directory: android-app
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 1.0.${{ github.run_number }}
+          KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Name the APK
+        id: apk
+        run: |
+          OUT="AltitudeAcademy-1.0.${{ github.run_number }}.apk"
+          cp android-app/app/build/outputs/apk/release/app-release.apk "$OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+          sha256sum "$OUT"
+
+      - name: Remove the signing key from the runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AltitudeAcademy-1.0.${{ github.run_number }}
+          path: ${{ steps.apk.outputs.file }}
+          retention-days: 90
+
+      - name: Publish as a GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-v1.0.${{ github.run_number }}
+          name: RankerNode Android 1.0.${{ github.run_number }}
+          body: |
+            Signed Android app. Upload this APK in the website's Admin → Mobile App tab
+            so students get it from the "Get App" button.
+          files: ${{ steps.apk.outputs.file }}

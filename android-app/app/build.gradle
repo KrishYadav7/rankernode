@@ -1,0 +1,73 @@
+plugins {
+    id 'com.android.application'
+}
+
+/* ---- settings from ../app.properties (or the APP_URL environment variable) ---- */
+def appProps = new Properties()
+def propsFile = rootProject.file('app.properties')
+if (propsFile.exists()) propsFile.withInputStream { appProps.load(it) }
+def appUrl = (System.getenv('APP_URL') ?: appProps.getProperty('APP_URL', '')).trim()
+if (!appUrl.startsWith('https://')) {
+    throw new GradleException('Set APP_URL=https://your-domain/app in android-app/app.properties')
+}
+def appHost = new URI(appUrl).host
+
+/* ---- version: the cloud build passes the build number ---- */
+def vCode = (System.getenv('VERSION_CODE') ?: '1').toInteger()
+def vName = System.getenv('VERSION_NAME') ?: "1.0.${vCode}"
+
+android {
+    namespace 'com.altitudeacademy.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.altitudeacademy.app'
+        minSdk 24
+        targetSdk 34
+        versionCode vCode
+        versionName vName
+        buildConfigField 'String', 'APP_URL', "\"${appUrl}\""
+        manifestPlaceholders = [appHost: appHost]
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    signingConfigs {
+        release {
+            def ks = System.getenv('KEYSTORE_FILE')
+            if (ks) {
+                storeFile file(ks)
+                storePassword System.getenv('KEYSTORE_PASSWORD')
+                keyAlias System.getenv('KEY_ALIAS')
+                keyPassword System.getenv('KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (System.getenv('KEYSTORE_FILE')) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.13.1'      // FileProvider (camera photos for uploads)
+}

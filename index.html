@@ -1,0 +1,1856 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1226">
+  <!-- ⭐ Pre-paint theme: set data-theme before CSS paints (no light→dark flash) -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('aero_theme');
+        if (t !== 'light' && t !== 'dim' && t !== 'dark') {
+          t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+<link rel="manifest" href="manifest.json?v=138">
+  <!-- Logo / Favicon -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=138">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=138">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=138">
+  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png?v=138">
+  <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png?v=138">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=138">
+  <link rel="shortcut icon" href="/favicon-32.png?v=138">
+  <title>RankerNode – Learn. Practice. Rank.</title>
+
+  <!-- Critical preconnects (only 3 — extra ones waste time) -->
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+
+  <!-- PDF.js — self-hosted (vendor/pdfjs/). Only the WORKER is
+       preloaded here: it is the file PDF.js actually needs the
+       moment a student opens a PDF, and it is large enough (1.1 MB)
+       that having it already in flight saves ~1 second on the first
+       open. The library itself is NOT preloaded because
+       preloadPDFOnIntent() (app.js) already starts it the moment
+       the user hovers a material card — preloading it here would
+       waste 300 KB on every login page that never opens a PDF. -->
+  <link rel="preload" as="script"
+        href="/vendor/pdfjs/pdf.worker.min.js">
+
+
+  <!-- Google Fonts — non-blocking -->
+  <link rel="preload" as="style"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+        onload="this.onload=null;this.rel='stylesheet'">
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"></noscript>
+
+  <!-- Font Awesome — non-blocking (was the #1 first-paint killer) -->
+  <link rel="preload" as="style"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+        onload="this.onload=null;this.rel='stylesheet'">
+  <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"></noscript>
+
+  <!-- App stylesheet — blocking (must be, small) -->
+  <link rel="stylesheet" href="styles.css?v=138">
+
+
+  <!-- Inline critical fallback so icons don't flash before FA loads -->
+  <style>
+    .fa, .fas, .far, .fal, .fab, .fa-solid, .fa-regular, .fa-brands {
+      font-family: 'Font Awesome 6 Free', 'Font Awesome 6 Brands', sans-serif;
+      font-style: normal; font-weight: 900;
+    }
+  </style>
+
+  <!--
+    MathJax config — kept but the LIBRARY is loaded on-demand
+    (only when a quiz editor or quiz player actually needs it).
+    This removes ~700 KB from every cold page load.
+  -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true,
+        processEnvironments: true,
+        processRefs: true,
+        tags: 'none',
+        packages: {
+          '[+]': [
+            'ams', 'newcommand', 'configmacros', 'noundefined', 'noerrors',
+            'mhchem', 'boldsymbol', 'html', 'textmacros', 'color',
+            'mathtools', 'physics', 'cancel', 'enclose', 'unicode'
+          ]
+        },
+        macros: {
+          RR: '\\mathbb{R}', NN: '\\mathbb{N}', ZZ: '\\mathbb{Z}',
+          CC: '\\mathbb{C}', QQ: '\\mathbb{Q}', dd: '\\mathrm{d}',
+          braket: ['\\left\\langle #1 \\right\\rangle', 1],
+          ket:    ['\\left| #1 \\right\\rangle', 1],
+          bra:    ['\\left\\langle #1 \\right|', 1]
+        }
+      },
+      options: {
+        skipHtmlTags: ['script','noscript','style','textarea','pre','code'],
+        ignoreHtmlClass: 'no-mathjax',
+        enableMenu: false,
+        renderActions: { addMenu: [] }
+      },
+      chtml: { scale: 1.05, minScale: 0.5, matchFontHeight: true },
+      startup: { typeset: false }
+    };
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header id="appHeader" style="display:none;">
+      <!-- UPDATED: Added onclick and cursor style to make the logo act as a Home button -->
+      <div class="brand" onclick="navigateStudent('home')" style="cursor:pointer;">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 512 512" width="100%" height="100%" focusable="false">
+            <path fill="#0EA5E9" d="M232 448 L352 236 L472 448 Z"/>
+            <path fill="#4F46E5" d="M40 448 L216 150 L392 448 Z"/>
+            <path fill="#FFFFFF" d="M216 150 L264 231 L240 218 L216 242 L192 218 L168 231 Z"/>
+            <path fill="none" stroke="#F59E0B" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" d="M164 104 L216 56 L268 104"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>RankerNode</h1>
+          <span>Learn. Practice. Rank.</span>
+        </div>
+      </div>
+
+      <button type="button" class="nav-toggle" id="navToggle" aria-label="Open navigation menu"
+              aria-controls="mainNav" aria-expanded="false">
+        <span class="nav-toggle-bars" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+
+      <nav class="main-nav" id="mainNav"></nav>
+
+            <div class="user-info">
+        <button class="icon-btn" id="globalSearchTrigger" aria-label="Global search (Ctrl+K)" title="Search (Ctrl+K)">
+          <i class="fas fa-search"></i>
+        </button>
+
+        <div class="notif-wrap" id="notifWrap">
+          <button class="icon-btn notif-btn" id="notifBtn" aria-label="Notifications">
+            <i class="fas fa-bell"></i>
+            <span class="notif-badge" id="notifBadge" style="display:none;">0</span>
+          </button>
+          <div class="notif-dropdown" id="notifDropdown">
+            <div class="notif-header">
+              <h4>Notifications</h4>
+              <button class="notif-mark-all" id="notifMarkAll" style="display:none;">Mark all read</button>
+            </div>
+            <div class="notif-list" id="notifList">
+              <div class="notif-empty"><i class="fas fa-bell-slash"></i><p>No notifications yet.</p></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ⭐ Single animated light/dark switch (Settings lives in the profile menu).
+             Dim stays available under Settings → Appearance; when Dim is active this
+             switch shows the moon and a click returns to Light. -->
+        <button type="button" class="theme-switch" id="themeToggle" role="switch"
+                aria-checked="false" aria-label="Switch to dark mode" title="Switch to dark mode">
+          <span class="ts-track" aria-hidden="true">
+            <span class="ts-knob">
+              <svg class="ts-icon" viewBox="0 0 24 24" focusable="false">
+                <mask id="tsMoonMaskApp">
+                  <rect width="24" height="24" fill="#fff"/>
+                  <circle class="ts-bite" cx="19" cy="5" r="7" fill="#000"/>
+                </mask>
+                <circle class="ts-core" cx="12" cy="12" r="8" fill="currentColor" mask="url(#tsMoonMaskApp)"/>
+                <g class="ts-rays" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <line x1="12" y1="1.5" x2="12" y2="3.2"/><line x1="12" y1="20.8" x2="12" y2="22.5"/>
+                  <line x1="1.5" y1="12" x2="3.2" y2="12"/><line x1="20.8" y1="12" x2="22.5" y2="12"/>
+                  <line x1="4.6" y1="4.6" x2="5.8" y2="5.8"/><line x1="18.2" y1="18.2" x2="19.4" y2="19.4"/>
+                  <line x1="4.6" y1="19.4" x2="5.8" y2="18.2"/><line x1="18.2" y1="5.8" x2="19.4" y2="4.6"/>
+                </g>
+              </svg>
+            </span>
+          </span>
+        </button>
+
+        <span class="streak-badge" id="streakBadge" style="display:none;" title="Daily streak">
+          <i class="fas fa-fire"></i> <span id="streakCount">0</span>
+        </span>
+
+        <!-- NEW: Profile Chip & Dropdown -->
+        <div class="user-profile-wrap" id="userProfileWrap">
+          <button class="user-profile-btn" id="userProfileBtn">
+            <div class="user-avatar-sm" id="userAvatarSm">U</div>
+            <span id="userDisplay" class="user-name">User</span>
+            <i class="fas fa-chevron-down profile-chevron"></i>
+          </button>
+          
+          <div class="user-dropdown" id="userDropdown">
+            <div class="user-dropdown-header">
+              <div class="user-avatar-lg" id="userAvatarLg">U</div>
+              <div class="user-dropdown-info">
+                <strong id="userDisplayDropdown">User</strong>
+                <span class="role-badge" id="roleBadgeDropdown">Student</span>
+              </div>
+            </div>
+            <div class="user-dropdown-divider"></div>
+            <button class="user-dropdown-item" onclick="closeUserDropdown(); openSettingsModal();">
+              <i class="fas fa-gear"></i> Settings
+            </button>
+            <button class="user-dropdown-item logout" onclick="logout()">
+              <i class="fas fa-sign-out-alt"></i> Logout
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="main-content">
+
+      <!-- LOGIN -->
+      <section id="loginView" class="view active">
+        <div class="login-card">
+          <div class="login-icon"><i class="fas fa-graduation-cap"></i></div>
+          <h2>RankerNode</h2>
+          <p class="sub">Sign in to access course materials</p>
+          <div class="login-role-toggle">
+            <button class="active" data-role="student" onclick="setLoginRole('student')">
+              <i class="fas fa-user-graduate"></i> Student
+            </button>
+            <button data-role="admin" onclick="setLoginRole('admin')">
+              <i class="fas fa-user-cog"></i> Admin
+            </button>
+          </div>
+          <form id="loginForm" onsubmit="handleLogin(event)">
+            <div class="form-group">
+              <label>Username</label>
+              <div class="input-wrap"><i class="fas fa-user"></i>
+                <input type="text" id="loginUsername" placeholder="Enter your username" required>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Password</label>
+              <div class="input-wrap"><i class="fas fa-lock"></i>
+                <input type="password" id="loginPassword" placeholder="Enter your password" required>
+              </div>
+            </div>
+            <button type="submit" class="btn btn-primary btn-block btn-lg">
+              <i class="fas fa-sign-in-alt"></i> Sign In
+            </button>
+          </form>
+          <div class="login-footer" style="display:flex;flex-direction:column;gap:10px;align-items:center;">
+            <a href="#" onclick="showRegisterModal();return false;" class="link-inline">
+              <i class="fas fa-user-plus"></i> Register as Student
+            </a>
+            <a href="#" onclick="showForgotUsernameModal();return false;" class="link-inline">
+              <i class="fas fa-user-question"></i> Forgot Username?
+            </a>
+            <a href="#" onclick="showForgotPasswordModal();return false;" class="link-inline">
+              <i class="fas fa-key"></i> Forgot Password?
+            </a>
+                        <a href="#" onclick="openAlumniSubmitModal();return false;" class="link-inline" style="color:var(--gold-600);">
+              <i class="fas fa-graduation-cap"></i> Are you an alumni? Share your journey
+            </a>
+          </div>
+        </div>
+      </section>
+      <!-- ============================================================
+           STUDENT — AI DOUBT SOLVER (NEW HOME PAGE)
+           ============================================================ -->
+      <section id="studentAIHomeView" class="view">
+        <div class="ai-home-hero">
+          <div class="ai-home-orb ai-home-orb-1"></div>
+          <div class="ai-home-orb ai-home-orb-2"></div>
+          <div class="ai-home-orb ai-home-orb-3"></div>
+
+          <div class="ai-home-brand">
+            <div class="ai-home-icon">
+              <i class="fas fa-robot"></i>
+              <span class="ai-home-pulse"></span>
+            </div>
+            <div class="ai-home-title-block">
+              <span class="ai-home-badge">
+                <i class="fas fa-bolt"></i> Powered by AI
+              </span>
+              <h1>AI Doubt Solver By Krish Yadav</h1>
+              <p>Ask any Physics, Chemistry, Maths or Biology doubt — get step-by-step solutions, clear explanations, and real-world context in seconds.</p>
+            </div>
+          </div>
+
+          <!-- Wide-screen only (CSS reveals it from 1200px up).
+               Each chip pre-fills the composer via aiHomeUsePrompt(),
+               so the extra width carries real functionality instead
+               of being decoration. -->
+          <div class="ai-home-side">
+            <span class="ai-home-side-title"><i class="fas fa-lightbulb"></i> Try asking</span>
+            <div class="ai-prompt-list">
+              <button type="button" class="ai-prompt-chip" onclick="aiHomeUsePrompt(this)">
+                <i class="fas fa-wind"></i> What does the Reynolds number physically mean?
+              </button>
+              <button type="button" class="ai-prompt-chip" onclick="aiHomeUsePrompt(this)">
+                <i class="fas fa-fire"></i> Compare a ramjet and a scramjet engine
+              </button>
+              <button type="button" class="ai-prompt-chip" onclick="aiHomeUsePrompt(this)">
+                <i class="fas fa-circle-nodes"></i> Potential flow past a cylinder, step by step
+              </button>
+              <button type="button" class="ai-prompt-chip" onclick="aiHomeUsePrompt(this)">
+                <i class="fas fa-compass-drafting"></i> Static vs dynamic stability in aircraft
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="ai-chat-shell">
+          <div class="ai-chat-messages" id="aiChatMessages"></div>
+
+          <!-- Composer is built by app.js (_aiComposerHTML): attachments,
+               paste/drop, camera, maths keys + preview, voice, stop. -->
+          <div class="ai-chat-composer" id="aiComposer"></div>
+        </div>
+      </section>
+      <!-- STUDENT HOME -->
+      <section id="studentHomeView" class="view">
+        <div id="streakCardContainer"></div>
+        <div id="continueCardContainer"></div>
+
+        <div class="hero-section">
+          <div class="hero-orb hero-orb-1"></div>
+          <div class="hero-orb hero-orb-2"></div>
+          <div class="hero-content">
+            <span class="hero-tag"><i class="fas fa-sparkles"></i> JEE · NEET · Class 11 &amp; 12</span>
+            <h1>Welcome to RankerNode</h1>
+            <p>Chapter-wise video lectures, notes, DPPs and PYQs for JEE, NEET and Class 11–12 — all in one place.</p>
+            <a href="#" class="btn btn-accent btn-lg" onclick="event.preventDefault();navigateStudent('courses')">
+              <i class="fas fa-book-open"></i> Explore Courses
+            </a>
+          </div>
+          <div class="hero-image"><i class="fas fa-rocket"></i></div>
+
+          <!-- Wide-screen only (CSS reveals it from 1200px up).
+               Purely presentational: no id, no JS contract, and it
+               stays hidden on every narrower viewport, so the mobile
+               and tablet hero is byte-for-byte the same as before. -->
+          <div class="hero-side">
+            <span class="hero-side-title"><i class="fas fa-layer-group"></i> What&rsquo;s inside</span>
+            <div class="hero-chips">
+              <span class="hero-chip"><i class="fas fa-video"></i> Video Lectures</span>
+              <span class="hero-chip"><i class="fas fa-file-lines"></i> Chapter Notes</span>
+              <span class="hero-chip"><i class="fas fa-file-pdf"></i> PYQs</span>
+              <span class="hero-chip"><i class="fas fa-pen-ruler"></i> DPPs</span>
+              <span class="hero-chip"><i class="fas fa-chalkboard"></i> Slides</span>
+            </div>
+          </div>
+        </div>
+
+      <!-- LOCATE AND REPLACE THE "ABOUT THE FOUNDER" SECTION IN index.html -->
+<!-- LOCATE AND REPLACE THE "ABOUT THE FOUNDER" SECTION IN index.html -->
+<section class="about-owner section-card" id="aboutOwnerSection">
+  <h2><i class="fas fa-user-tie"></i> About the Founder</h2>
+  <div id="ownerProfileContainer"></div>
+</section>
+
+        <section class="about-professors section-card">
+          <h2><i class="fas fa-chalkboard-teacher"></i> Our Team</h2>
+          <div class="professors-grid" id="professorsGrid"></div>
+        </section>
+                <!-- NEW: Distinguished Alumni -->
+        <section class="about-alumni section-card" id="alumniSection" style="display:none;">
+          <div class="section-header-row">
+            <h2><i class="fas fa-graduation-cap"></i> Distinguished Alumni</h2>
+            <button class="btn btn-outline btn-sm" onclick="openAlumniSubmitModal()">
+              <i class="fas fa-user-plus"></i> Share Your Story
+            </button>
+          </div>
+          <div class="alumni-grid" id="alumniGrid"></div>
+        </section>
+
+        <!-- NEW: Supporters & Friends -->
+        <section class="about-friends section-card" id="friendsSection" style="display:none;">
+          <div class="section-header-row">
+            <h2><i class="fas fa-handshake"></i> Our Supporters &amp; Friends</h2>
+            <button class="btn btn-outline btn-sm" onclick="openFriendSubmitModal()">
+              <i class="fas fa-user-plus"></i> Join Us
+            </button>
+          </div>
+          <div class="friends-grid" id="friendsGrid"></div>
+        </section>
+
+        <!-- STUDENT FEEDBACK — public (approved-only) wall -->
+        <section class="section-card" id="studentFeedbackSection">
+          <div class="section-header-row">
+            <h2><i class="fas fa-star-half-alt"></i> Student Reviews</h2>
+            <button class="btn btn-primary btn-sm" onclick="openFeedbackModal()">
+              <i class="fas fa-pen"></i> Write Feedback
+            </button>
+          </div>
+          <p class="editor-hint" style="margin-top:-6px;margin-bottom:16px;">
+            Feedback is reviewed by the admin before being published.
+          </p>
+          <div id="studentFeedbackList">
+            <div class="empty-state" style="padding:30px 20px;">
+              <i class="fas fa-spinner fa-spin"></i>
+              <p>Loading reviews…</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- STUDENT CONTRIBUTIONS — upload & view own -->
+        <section class="section-card" id="studentContributionSection">
+          <div class="section-header-row">
+            <h2><i class="fas fa-hand-holding-heart"></i> Share Your Notes</h2>
+            <button class="btn btn-success btn-sm" onclick="openContributionModal()">
+              <i class="fas fa-upload"></i> Contribute
+            </button>
+          </div>
+          <p class="editor-hint" style="margin-top:-6px;margin-bottom:16px;">
+            Share your own study notes, summaries, or materials with your batchmates.
+            All submissions are reviewed by the admin.
+          </p>
+          <div id="myContributionsList">
+            <div class="empty-state" style="padding:30px 20px;">
+              <i class="fas fa-inbox"></i>
+              <p>You haven't contributed anything yet.</p>
+            </div>
+          </div>
+        </section>
+      </section>
+      <!-- ADMIN DASHBOARD -->
+      <section id="adminView" class="view">
+        <div class="dash-header">
+          <h2 id="adminPageTitle"><i class="fas fa-tachometer-alt"></i> Admin Dashboard</h2>
+          <div class="actions" id="adminHeaderActions"></div>
+        </div>
+
+              <div class="admin-tabs">
+          <button class="admin-tab" data-tab="overview" onclick="switchAdminTab('overview')">
+            <i class="fas fa-chart-pie"></i> Overview
+          </button>
+          <!-- FIXED: Removed the duplicate Live Activity button -->
+          <button class="admin-tab" data-tab="live" onclick="switchAdminTab('live')">
+            <i class="fas fa-signal"></i> Live Activity
+          </button>
+          <button class="admin-tab" data-tab="courses" onclick="switchAdminTab('courses')">
+            <i class="fas fa-graduation-cap"></i> Courses
+          </button>
+          <button class="admin-tab" data-tab="categories" onclick="switchAdminTab('categories')">
+            <i class="fas fa-compass"></i> Categories
+          </button>
+          <button class="admin-tab" data-tab="professors" onclick="switchAdminTab('professors')">
+            <i class="fas fa-user-tie"></i> Faculty
+          </button>
+          <button class="admin-tab" data-tab="students" onclick="switchAdminTab('students')">
+            <i class="fas fa-user-graduate"></i> Students
+          </button>
+          <button class="admin-tab" data-tab="replies" onclick="switchAdminTab('replies')">
+            <i class="fas fa-envelope-open-text"></i> Email Replies
+          </button>
+          <button class="admin-tab" data-tab="subscriptions" onclick="switchAdminTab('subscriptions')">
+            <i class="fas fa-repeat"></i> Subscriptions
+          </button>
+          <button class="admin-tab" data-tab="organization" onclick="switchAdminTab('organization')">
+            <i class="fas fa-building-user"></i> Organization
+          </button>
+          <button class="admin-tab" data-tab="community" onclick="switchAdminTab('community')">
+            <i class="fas fa-users"></i> Community
+          </button>
+          <button class="admin-tab" data-tab="security" onclick="switchAdminTab('security')">
+            <i class="fas fa-shield-halved"></i> Security
+          </button>
+          <button class="admin-tab" data-tab="feedback" onclick="switchAdminTab('feedback')">
+            <i class="fas fa-comment-dots"></i> Feedback
+          </button>
+          <button class="admin-tab" data-tab="contributions" onclick="switchAdminTab('contributions')">
+            <i class="fas fa-hand-holding-heart"></i> Contributions
+          </button>
+          <button class="admin-tab" data-tab="backup" onclick="switchAdminTab('backup')">
+            <i class="fas fa-database"></i> Backup
+          </button>
+          <button class="admin-tab" data-tab="branding" onclick="switchAdminTab('branding')">
+            <i class="fas fa-palette"></i> Branding
+          </button>
+          <button class="admin-tab" data-tab="certificates" onclick="switchAdminTab('certificates')">
+            <i class="fas fa-certificate"></i> Certificates
+          </button>
+          <button class="admin-tab" data-tab="popup" onclick="switchAdminTab('popup')">
+            <i class="fas fa-bullhorn"></i> Login Pop-up
+          </button>
+          <button class="admin-tab" data-tab="mobileapp" onclick="switchAdminTab('mobileapp')">
+            <i class="fas fa-mobile-screen"></i> Mobile App
+          </button>
+        </div>
+
+        <!-- ============================================================
+             ADMIN TAB CONTENTS
+             ============================================================ -->
+        <div id="adminTabOverview" class="admin-tab-content">
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-icon tone-brand"><i class="fas fa-graduation-cap"></i></div>
+              <div class="stat-info">
+                <div class="num" id="statCourses">0</div>
+                <div class="label">Total Courses</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon tone-cyan"><i class="fas fa-layer-group"></i></div>
+              <div class="stat-info">
+                <div class="num" id="statMaterials">0</div>
+                <div class="label">Total Materials</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon tone-emerald"><i class="fas fa-user-graduate"></i></div>
+              <div class="stat-info">
+                <div class="num" id="statStudents">0</div>
+                <div class="label">Students</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon tone-gold"><i class="fas fa-user-tie"></i></div>
+              <div class="stat-info">
+                <div class="num" id="statProfessors">0</div>
+                <div class="label">Professors</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-card" style="margin-top:24px;">
+            <h2><i class="fas fa-bolt"></i> Quick Actions</h2>
+            <div class="quick-actions-grid">
+              <button class="quick-action-card" onclick="openAddCourseModal()">
+                <div class="qa-icon tone-brand"><i class="fas fa-plus-circle"></i></div>
+                <div class="qa-info">
+                  <strong>Create Course</strong>
+                  <span>Add a new course to the catalog</span>
+                </div>
+              </button>
+              <button class="quick-action-card" onclick="openAddProfessorModal()">
+                <div class="qa-icon tone-gold"><i class="fas fa-user-plus"></i></div>
+                <div class="qa-info">
+                  <strong>Add Professor</strong>
+                  <span>Introduce a new team member</span>
+                </div>
+              </button>
+              <button class="quick-action-card" onclick="openStudentRegModal()">
+                <div class="qa-icon tone-emerald"><i class="fas fa-user-graduate"></i></div>
+                <div class="qa-info">
+                  <strong>Register Student</strong>
+                  <span>Create credentials manually</span>
+                </div>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div id="adminTabLive" class="admin-tab-content"></div>
+
+        <div id="adminTabCourses" class="admin-tab-content">
+          <div class="tab-toolbar">
+            <div class="search-bar" style="margin:0; flex:1; max-width:440px;">
+              <i class="fas fa-search"></i>
+              <input type="text" id="adminCourseSearch" placeholder="Search courses..." oninput="debouncedRenderAdminCourses()">
+            </div>
+          </div>
+
+          <!-- ⭐ NEW: Same filter bar as the student course view -->
+          <div class="filter-bar" id="adminFilterBar">
+            <select id="adminFilterSemester" onchange="renderAdminCourses()" title="Category">
+              <option value="">All categories</option>
+            </select>
+            <select id="adminFilterCategory" onchange="renderAdminCourses()" title="Subject">
+              <option value="">All subjects</option>
+            </select>
+            <select id="adminFilterDifficulty" onchange="renderAdminCourses()">
+              <option value="">All Levels</option>
+              <option value="Beginner">Beginner</option>
+              <option value="Intermediate">Intermediate</option>
+              <option value="Advanced">Advanced</option>
+            </select>
+            <select id="adminFilterPrice" onchange="renderAdminCourses()">
+              <option value="">All Prices</option>
+              <option value="free">Free</option>
+              <option value="premium">Premium</option>
+            </select>
+            <button class="btn btn-outline btn-sm" onclick="clearAdminCourseFilters()">
+              <i class="fas fa-times"></i> Clear
+            </button>
+          </div>
+
+          <div id="adminCourseList"></div>
+        </div>
+
+
+        <div id="adminTabCategories" class="admin-tab-content"></div>
+
+        <div id="adminTabProfessors" class="admin-tab-content">
+          <div class="tab-toolbar">
+            <div class="tab-toolbar-text">
+              <h3><i class="fas fa-user-tie"></i> All Professors</h3>
+              <span class="tab-toolbar-sub" id="professorCountLabel">0 members</span>
+            </div>
+            <button class="btn btn-success" onclick="openAddProfessorModal()">
+              <i class="fas fa-user-plus"></i> Add Professor
+            </button>
+          </div>
+          <div id="adminProfessorList"></div>
+        </div>
+
+        <div id="adminTabStudents" class="admin-tab-content">
+          <div class="tab-toolbar">
+            <div class="tab-toolbar-text">
+              <h3><i class="fas fa-user-graduate"></i> Registered Students</h3>
+              <span class="tab-toolbar-sub" id="studentCountLabel">0 students</span>
+            </div>
+            <button class="btn btn-success" onclick="openStudentRegModal()">
+              <i class="fas fa-user-plus"></i> Register Student
+            </button>
+          </div>
+
+          <!-- ⭐ FEATURE: Premium Access Control — search & filter students -->
+          <div class="student-filter-bar">
+            <div class="student-search-wrap">
+              <i class="fas fa-search"></i>
+              <input type="text"
+                     id="studentSearchInput"
+                     class="student-search-input"
+                     placeholder="Search by name, username, email, phone or student ID…"
+                     autocomplete="off"
+                     spellcheck="false"
+                     title="Press Enter to open the profile when one student matches"
+                     oninput="setStudentSearchFilter(this.value)"
+                     onkeydown="studentSearchKeydown(event)">
+              <button type="button" class="student-search-clear" id="studentSearchClear"
+                      title="Clear search" hidden onclick="clearStudentSearch()">
+                <i class="fas fa-times"></i>
+              </button>
+            </div>
+
+            <select id="studentPremiumFilter" class="student-filter-select"
+                    title="Filter by access level or account status"
+                    onchange="setStudentPremiumFilter(this.value)">
+              <option value="all">All access levels</option>
+              <option value="premium">Premium access only</option>
+              <option value="free">No premium access</option>
+              <option value="active">Active accounts</option>
+              <option value="suspended">Suspended accounts</option>
+            </select>
+
+            <select id="studentSortSelect" class="student-filter-select"
+                    title="Sort students"
+                    onchange="setStudentSort(this.value)">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="name">Name (A–Z)</option>
+            </select>
+
+            <button class="btn btn-outline btn-sm" id="studentFilterClearBtn"
+                    title="Clear search &amp; filters" onclick="clearStudentFilters()">
+              <i class="fas fa-filter-circle-xmark"></i> Clear
+            </button>
+          </div>
+
+          <div class="student-filter-summary" id="studentFilterSummary" hidden></div>
+
+          <div class="student-selection-bar" id="adminStudentSelectionBar"></div>
+
+          <div id="adminStudentList"></div>
+        </div>
+
+        <div id="adminTabReplies" class="admin-tab-content">
+          <div class="tab-toolbar">
+            <div class="tab-toolbar-text">
+              <h3><i class="fas fa-envelope-open-text"></i> Student Email Replies</h3>
+              <span class="tab-toolbar-sub" id="replyCountLabel">0 replies</span>
+            </div>
+            <button class="btn btn-outline" onclick="renderAdminEmailReplies()">
+              <i class="fas fa-rotate"></i> Refresh
+            </button>
+          </div>
+          <div id="adminEmailReplyList"></div>
+        </div>
+
+        <div id="adminTabSubscriptions" class="admin-tab-content">
+          <div id="adminSubscriptionsContent"></div>
+        </div>
+
+        <div id="adminTabOrganization" class="admin-tab-content">
+          <div id="adminOrganizationContent"></div>
+        </div>
+        <div id="adminTabCommunity" class="admin-tab-content">
+          <div id="adminCommunityContent"></div>
+        </div>
+        <div id="adminTabSecurity" class="admin-tab-content">
+          <div id="adminSecurityContent"></div>
+        </div>
+        <div id="adminTabFeedback" class="admin-tab-content">
+          <div id="adminFeedbackContent"></div>
+        </div>
+        <div id="adminTabContributions" class="admin-tab-content">
+          <div id="adminContributionsContent"></div>
+        </div>
+        <div id="adminTabBackup" class="admin-tab-content">
+          <div id="adminBackupContent"></div>
+        </div>
+        <div id="adminTabBranding" class="admin-tab-content">
+          <div id="adminBrandingContent"></div>
+        </div>
+        <div id="adminTabCertificates" class="admin-tab-content">
+          <div id="adminCertificatesContent"></div>
+        </div>
+        <div id="adminTabPopup" class="admin-tab-content">
+          <div id="adminPopupContent"></div>
+        </div>
+        <div id="adminTabMobileapp" class="admin-tab-content">
+          <div id="adminMobileAppContent"></div>
+        </div>
+      </section>
+
+      <!-- ADMIN COURSE EDITOR -->
+      <section id="adminEditView" class="view">
+        <button class="back-link" onclick="closeCourseEditor()">
+          <i class="fas fa-arrow-left"></i> Back to Dashboard
+        </button>
+        <div id="courseEditorContent"></div>
+      </section>
+
+      <!-- ADMIN ADD COURSE VIEW -->
+      <section id="adminAddCourseView" class="view">
+        <button class="back-link" onclick="switchAdminTab('courses')">
+          <i class="fas fa-arrow-left"></i> Back to Courses
+        </button>
+        <div class="dash-header">
+          <h2><i class="fas fa-graduation-cap"></i> Create New Course</h2>
+          <div class="actions">
+            <button class="btn btn-outline" onclick="switchAdminTab('courses')">Cancel</button>
+            <button class="btn btn-primary" onclick="saveNewCoursePage()"><i class="fas fa-save"></i> Create Course</button>
+          </div>
+        </div>
+        <div class="editor-body" id="addCourseFormContent"></div>
+      </section>
+
+      <!-- ADMIN ADD PROFESSOR VIEW -->
+      <section id="adminAddProfessorView" class="view">
+        <button class="back-link" onclick="switchAdminTab('professors')">
+          <i class="fas fa-arrow-left"></i> Back to Professors
+        </button>
+        <div class="dash-header">
+          <h2><i class="fas fa-user-tie"></i> Add New Professor</h2>
+          <div class="actions">
+            <button class="btn btn-outline" onclick="switchAdminTab('professors')">Cancel</button>
+            <button class="btn btn-primary" onclick="saveNewProfessorPage()"><i class="fas fa-save"></i> Save Professor</button>
+          </div>
+        </div>
+        <div class="editor-body" id="addProfessorFormContent"></div>
+      </section>
+
+      <!-- ADMIN ADD MATERIAL VIEW -->
+      <section id="adminAddMaterialView" class="view">
+        <button class="back-link" onclick="goBackToCourseEditorFromMaterial()">
+          <i class="fas fa-arrow-left"></i> Back to Course Editor
+        </button>
+        <div class="dash-header">
+          <h2><i class="fas fa-paperclip"></i> Add New Material</h2>
+          <div class="actions">
+            <button class="btn btn-outline" onclick="goBackToCourseEditorFromMaterial()">Cancel</button>
+            <button class="btn btn-primary" onclick="saveNewMaterialPage()"><i class="fas fa-save"></i> Save Material</button>
+          </div>
+        </div>
+        <div class="editor-body" id="addMaterialFormContent"></div>
+      </section>
+
+      <!-- ADMIN ADD STUDENT VIEW -->
+      <section id="adminAddStudentView" class="view">
+        <button class="back-link" onclick="switchAdminTab('students')">
+          <i class="fas fa-arrow-left"></i> Back to Students
+        </button>
+        <div class="dash-header">
+          <h2><i class="fas fa-user-graduate"></i> Register New Student</h2>
+          <div class="actions">
+            <button class="btn btn-outline" onclick="switchAdminTab('students')">Cancel</button>
+            <button class="btn btn-primary" onclick="saveNewStudentPage()"><i class="fas fa-save"></i> Create Student</button>
+          </div>
+        </div>
+        <div class="editor-body" id="addStudentFormContent"></div>
+      </section>
+      <!-- ADMIN QUIZ / PAPER EDITOR (full page) -->
+      <section id="adminQuizEditorView" class="view">
+        <div id="quizEditorContent"></div>
+      </section>
+      <!-- STUDENT COURSES -->
+      <section id="studentCoursesView" class="view">
+        <div class="dash-header">
+          <h2><i class="fas fa-graduation-cap"></i> Courses</h2>
+        </div>
+        <div id="acCategoryBar"></div>
+        <div class="search-bar"><i class="fas fa-search"></i>
+          <input type="text" id="studentCourseSearch" placeholder="Search courses or chapters…" oninput="debouncedRenderStudentCourses()">
+        </div>
+       <div class="filter-bar" id="studentFilterBar">
+  <select id="filterDifficulty" onchange="renderStudentCourses()">
+    <option value="">All Levels</option>
+    <option value="Beginner">Beginner</option>
+    <option value="Intermediate">Intermediate</option>
+    <option value="Advanced">Advanced</option>
+  </select>
+  <select id="filterPrice" onchange="renderStudentCourses()">
+    <option value="">All Prices</option>
+    <option value="free">Free</option>
+    <option value="premium">Premium</option>
+  </select>
+  <button class="btn btn-outline btn-sm" onclick="clearCourseFilters()">
+    <i class="fas fa-times"></i> Clear
+  </button>
+</div>
+        <div id="studentCourseList"></div>
+      </section>
+
+      <!-- STUDENT SAVED -->
+      <section id="studentSavedView" class="view">
+        <div class="dash-header">
+          <h2><i class="fas fa-bookmark"></i> Saved Courses</h2>
+        </div>
+        <div id="studentSavedList"></div>
+      </section>
+
+      <!-- STUDENT ANALYTICS -->
+      <section id="studentAnalyticsView" class="view">
+        <div class="dash-header">
+          <h2><i class="fas fa-chart-line"></i> Your Learning Analytics</h2>
+          <div class="actions">
+            <button class="btn btn-outline btn-sm" onclick="renderStudentAnalytics()">
+              <i class="fas fa-rotate"></i> Refresh
+            </button>
+          </div>
+        </div>
+
+        <div id="analyticsContent">
+          <div class="analytics-loading">
+            <div class="pdfv-spinner"></div>
+            <p>Crunching your data…</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- COURSE DETAIL -->
+      <section id="courseDetailView" class="view">
+        <div class="cd-topbar">
+          <button class="back-link" onclick="goBackFromDetail()" aria-label="Go back">
+            <i class="fas fa-arrow-left"></i> Back
+          </button>
+          <nav class="breadcrumb" id="courseBreadcrumb" aria-label="Breadcrumb"></nav>
+        </div>
+        <div id="courseDetailContent"></div>
+      </section>
+
+    </main>
+
+    <footer class="app-footer" id="appFooter" style="display:none;">
+      &copy; 2026 RankerNode
+    </footer>
+  </div>
+
+  <!-- ============ MODALS ============ -->
+
+  <!-- Register Modal -->
+  <div class="modal-overlay" id="registerModal">
+    <div class="modal-box">
+      <h3><i class="fas fa-user-plus"></i> Student Registration</h3>
+      <p class="modal-sub">Create a new student account with OTP verification.</p>
+      <form id="registerForm" onsubmit="registerStudent(event)">
+        <div class="form-group"><label>Full Name *</label><input type="text" id="regFullName" placeholder="e.g. John Doe" required></div>
+        <div class="form-group"><label>Username *</label><input type="text" id="regUsername" placeholder="Choose a username" required></div>
+        <div class="form-group"><label>Email *</label><input type="email" id="regEmail" placeholder="your@email.com" required></div>
+        <div class="form-group">
+          <label>Contact Number *</label>
+          <input type="tel" id="regPhone" placeholder="+91 98765 43210" required>
+          <span class="hint">We'll send an OTP here as well. Include country code for non-Indian numbers.</span>
+        </div>
+        <div class="form-group"><label>Password *</label><input type="password" id="regPassword" placeholder="Choose a password (min 6 chars)" required minlength="6"></div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('registerModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary"><i class="fas fa-paper-plane"></i> Send OTP</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ SHARED OTP MODAL ============ -->
+  <div class="modal-overlay" id="otpVerificationModal">
+    <div class="modal-box" style="max-width:460px;">
+      <div style="text-align:center; margin-bottom:14px;">
+        <div style="display:inline-flex;align-items:center;justify-content:center;
+                    width:64px;height:64px;border-radius:50%;
+                    background:linear-gradient(135deg,var(--brand-600),var(--accent-500));
+                    color:#fff;font-size:26px;
+                    box-shadow:0 10px 26px rgba(99,102,241,.35);">
+          <i class="fas fa-shield-halved"></i>
+        </div>
+      </div>
+      <h3 id="otpModalTitle" style="text-align:center;justify-content:center;">Verify OTP</h3>
+      <p class="modal-sub" id="otpModalSub" style="text-align:center;">Enter the code we sent you.</p>
+
+      <div class="form-group">
+        <label style="text-align:center;display:block;">6-Digit OTP</label>
+        <input type="text" id="otpModalInput" placeholder="• • • • • •"
+               inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+               oninput="this.value = this.value.replace(/[^0-9]/g, '')"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();submitOtpVerification();}"
+               style="text-align:center;font-size:24px;letter-spacing:10px;font-weight:800;
+                      padding:16px;font-family:'Courier New',monospace;border-radius:12px;">
+        <span class="hint" style="text-align:center;display:block;margin-top:8px;">
+          <i class="fas fa-clock"></i> Code expires in 10 minutes.
+        </span>
+        <div id="otpResendRow" style="display:none;text-align:center;margin-top:10px;">
+          <button type="button" class="link-inline" onclick="resendOtpForCurrentContext()" id="otpResendBtn" style="background:none;border:none;cursor:pointer;">
+            <i class="fas fa-rotate-right"></i> Resend OTP
+          </button>
+        </div>
+      </div>
+
+      <div class="modal-actions" style="flex-direction:column-reverse;">
+        <button type="button" class="btn btn-outline btn-block" onclick="cancelOtpVerification()">
+          <i class="fas fa-arrow-left"></i> Cancel
+        </button>
+        <button type="button" class="btn btn-primary btn-block" id="otpModalSubmitBtn" onclick="submitOtpVerification()">
+          <i class="fas fa-check"></i> Verify
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ FORGOT USERNAME MODAL ============ -->
+  <div class="modal-overlay" id="forgotUsernameModal">
+    <div class="modal-box" style="max-width:480px;">
+      <h3><i class="fas fa-user-question"></i> Forgot Username</h3>
+      <p class="modal-sub">Enter the email or contact number linked to your account. We'll send an OTP and then deliver your username to your phone.</p>
+      <form id="forgotUsernameForm" onsubmit="submitForgotUsernameRequest(event)">
+        <div class="form-group"><label>Email</label><input type="email" id="fuEmail" placeholder="your@email.com"></div>
+        <div class="form-group"><label>Contact Number</label><input type="tel" id="fuPhone" placeholder="+91 98765 43210"></div>
+        <span class="hint" style="display:block;margin-bottom:12px;">Provide at least one of the two.</span>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('forgotUsernameModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary"><i class="fas fa-paper-plane"></i> Send OTP</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ FORGOT PASSWORD MODAL ============ -->
+  <div class="modal-overlay" id="forgotPasswordModal">
+    <div class="modal-box" style="max-width:480px;">
+      <h3><i class="fas fa-key"></i> Forgot Password</h3>
+      <p class="modal-sub">Enter the email or contact number linked to your account. We'll send an OTP to verify your identity.</p>
+      <form id="forgotPasswordForm" onsubmit="submitForgotPasswordRequest(event)">
+        <div class="form-group"><label>Email</label><input type="email" id="fpEmail" placeholder="your@email.com"></div>
+        <div class="form-group"><label>Contact Number</label><input type="tel" id="fpPhone" placeholder="+91 98765 43210"></div>
+        <span class="hint" style="display:block;margin-bottom:12px;">Provide at least one of the two.</span>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('forgotPasswordModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary"><i class="fas fa-paper-plane"></i> Send OTP</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ RESET PASSWORD MODAL ============ -->
+  <div class="modal-overlay" id="resetPasswordModal">
+    <div class="modal-box" style="max-width:460px;">
+      <h3><i class="fas fa-lock"></i> Set New Password</h3>
+      <p class="modal-sub">Choose a strong new password. Minimum 6 characters.</p>
+      <form id="resetPasswordForm" onsubmit="submitNewPassword(event)">
+        <div class="form-group">
+          <label>New Password *</label>
+          <input type="password" id="rpNewPassword" placeholder="Enter new password" required minlength="6">
+        </div>
+        <div class="form-group">
+          <label>Confirm Password *</label>
+          <input type="password" id="rpConfirmPassword" placeholder="Re-enter new password" required minlength="6">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('resetPasswordModal')">Cancel</button>
+          <button type="submit" class="btn btn-success" id="rpSubmitBtn">
+            <i class="fas fa-save"></i> Save New Password
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Credentials Card Modal -->
+  <div class="modal-overlay" id="credentialsModal">
+    <div class="modal-box" style="max-width:520px;">
+      <div class="credentials-success-icon">
+        <i class="fas fa-check-circle"></i>
+      </div>
+      <h3 style="text-align:center;">Student Created Successfully!</h3>
+      <p class="modal-sub" style="text-align:center;">Share these credentials with the student. This is the only time the password will be visible.</p>
+
+      <div class="credentials-card" id="credentialsCard"></div>
+
+      <div class="credentials-warning">
+        <i class="fas fa-exclamation-triangle"></i>
+        <span>Save or copy the password now. It is hashed on the server and cannot be retrieved later.</span>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-outline" onclick="copyAllCredentials()">
+          <i class="fas fa-copy"></i> Copy All
+        </button>
+        <button type="button" class="btn btn-primary" onclick="closeModal('credentialsModal')">
+          <i class="fas fa-check"></i> Done
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ GRANT PREMIUM ACCESS MODAL (Admin → Students) ============ -->
+  <div class="modal-overlay" id="grantPremiumModal">
+    <div class="modal-box" style="max-width:520px;">
+      <h3><i class="fas fa-crown"></i> Grant Premium Access</h3>
+      <p class="modal-sub">
+        Unlock every premium course, material and quiz for
+        <strong id="grantPremiumStudentName">this student</strong>.
+      </p>
+
+      <div class="form-group">
+        <label>Access duration</label>
+        <select id="grantPremiumDuration" onchange="onGrantPremiumDurationChange()">
+          <option value="30">30 days</option>
+          <option value="90">90 days</option>
+          <option value="180">180 days</option>
+          <option value="365" selected>1 year (365 days)</option>
+          <option value="custom">Custom…</option>
+        </select>
+      </div>
+
+      <div class="form-group" id="grantPremiumCustomWrap" hidden>
+        <label>Custom duration (days)</label>
+        <input type="number" id="grantPremiumCustomDays" min="1" max="3650" step="1"
+               value="365" oninput="updateGrantPremiumSummary()">
+      </div>
+
+      <div class="form-group">
+        <label>Note <span style="font-weight:400;color:var(--text-tertiary);">(optional — stored in the grant history)</span></label>
+        <input type="text" id="grantPremiumNote" maxlength="140"
+               placeholder="e.g. Scholarship grant, support resolution…">
+      </div>
+
+      <div class="grant-premium-summary" id="grantPremiumSummary"></div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-outline" onclick="closeModal('grantPremiumModal')">
+          Cancel
+        </button>
+        <button type="button" class="btn btn-success" id="grantPremiumSubmitBtn" onclick="submitGrantPremium()">
+          <i class="fas fa-crown"></i> Grant Premium
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ ⭐ SETTINGS MODAL — APPEARANCE ============ -->
+  <div class="modal-overlay" id="settingsModal">
+    <div class="modal-box" style="max-width:520px;">
+      <h3><i class="fas fa-gear"></i> Settings</h3>
+      <p class="modal-sub">Personalise how RankerNode looks on this device. Your choice is remembered.</p>
+
+      <div class="settings-section">
+        <h4><i class="fas fa-palette"></i> Appearance</h4>
+
+        <div class="settings-row settings-row--stacked">
+          <div class="settings-row-text">
+            <strong>Theme</strong>
+            <span id="nightModeHint">The sun/moon switch in the top bar flips Light ↔ dark. Pick which dark style it uses here.</span>
+          </div>
+        </div>
+
+        <!-- Full three-way picker (Light / Dim / Night) -->
+        <div class="theme-choices" id="themeChoices" role="radiogroup" aria-label="Theme">
+          <button type="button" class="theme-choice" data-theme-choice="light" role="radio"
+                  aria-checked="false" onclick="setThemeFromSettings('light')">
+            <i class="fas fa-sun"></i> Light
+          </button>
+          <button type="button" class="theme-choice" data-theme-choice="dim" role="radio"
+                  aria-checked="false" onclick="setThemeFromSettings('dim')">
+            <i class="fas fa-circle-half-stroke"></i> Dim
+          </button>
+          <button type="button" class="theme-choice" data-theme-choice="dark" role="radio"
+                  aria-checked="false" onclick="setThemeFromSettings('dark')">
+            <i class="fas fa-moon"></i> Night
+          </button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h4><i class="fas fa-mobile-screen-button"></i> Reading</h4>
+
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <strong>Always expand biographies</strong>
+            <span>Show full team, alumni and supporter bios without a “Read more” tap.</span>
+          </div>
+          <button type="button" class="switch" id="expandBiosSwitch" role="switch"
+                  aria-checked="false" aria-label="Always expand biographies"
+                  onclick="toggleExpandBios()">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </button>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-primary" onclick="closeModal('settingsModal')">
+          <i class="fas fa-check"></i> Done
+        </button>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ============================================================
+       FULL-PAGE PROCTORED EXAM SHELL
+       Rendered directly into the viewport — no modal, no overlay.
+       ============================================================ -->
+  <div id="quizExamShell" class="quiz-exam-shell" aria-hidden="true"></div>
+
+  <!-- ============================================================
+       PRE-EXAM CONSENT MODAL  (compact · single-column · no overflow)
+       ============================================================ -->
+  <div class="modal-overlay" id="preExamWarningModal">
+    <div class="modal-box pre-exam-modal">
+
+      <!-- ---- Header ---- -->
+      <div class="pre-exam-head">
+        <div class="pre-exam-head-icon">
+          <i class="fas fa-shield-halved"></i>
+        </div>
+        <div class="pre-exam-head-text">
+          <h3><i class="fas fa-triangle-exclamation"></i> Proctored Assessment</h3>
+          <p>Read the rules carefully before you begin.</p>
+        </div>
+      </div>
+
+      <!-- ---- Rules (compact rows) ---- -->
+      <div class="pre-exam-rules" id="preExamRules">
+
+        <div class="pre-exam-rule">
+          <i class="fas fa-expand"></i>
+          <div>
+            <strong>Full-screen required</strong>
+            <span>The exam takes over your entire screen.</span>
+          </div>
+        </div>
+
+        <div class="pre-exam-rule danger" id="preExamForwardOnly" hidden>
+          <i class="fas fa-arrow-right"></i>
+          <div>
+            <strong>Forward-only navigation</strong>
+            <span>You cannot return to a question once you click <em>Next</em>.</span>
+          </div>
+        </div>
+
+        <div class="pre-exam-rule success" id="preExamFlexible" hidden>
+          <i class="fas fa-arrows-left-right"></i>
+          <div>
+            <strong>Free navigation</strong>
+            <span>You may revisit, review, and change any answer before final submission.</span>
+          </div>
+        </div>
+
+        <div class="pre-exam-rule danger">
+          <i class="fas fa-ban"></i>
+          <div>
+            <strong>Tab-switch penalty</strong>
+            <span>Leaving this tab or full-screen counts as a strike. 3 strikes = auto-submit.</span>
+          </div>
+        </div>
+
+        <div class="pre-exam-rule">
+          <i class="fas fa-clipboard-check"></i>
+          <div>
+            <strong>Restricted actions</strong>
+            <span>Right-click, copy, paste and dev-tools are disabled.</span>
+          </div>
+        </div>
+
+        <div class="pre-exam-rule">
+          <i class="fas fa-shuffle"></i>
+          <div>
+            <strong>Shuffled per student</strong>
+            <span>Question order and option order are unique to your attempt.</span>
+          </div>
+        </div>
+
+        <div class="pre-exam-rule">
+          <i class="fas fa-clock"></i>
+          <div>
+            <strong>Server-synced timer</strong>
+            <span>Refreshing the page or changing your device clock will not extend it.</span>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- ---- Consent ---- -->
+      <label class="pre-exam-consent">
+        <input type="checkbox" id="preExamConsentBox" onchange="togglePreExamConsent()">
+        <span id="preExamConsentText">I understand and agree. I cannot return to previous questions once I click <em>Next</em>, and any violation will consume a strike.</span>
+      </label>
+
+      <!-- ---- Actions ---- -->
+      <div class="modal-actions pre-exam-actions">
+        <button type="button" class="btn btn-outline" onclick="cancelPreExam()">
+          <i class="fas fa-arrow-left"></i> Cancel
+        </button>
+        <button type="button" class="btn btn-danger" id="preExamBeginBtn" onclick="beginExamSession()" disabled>
+          <i class="fas fa-shield-halved"></i> Begin Exam
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Violation Warning Modal -->
+
+  <!-- Violation Warning Modal -->
+  <div class="modal-overlay" id="quizViolationModal">
+    <div class="modal-box" style="max-width:520px;">
+      <div style="text-align:center;margin-bottom:16px;">
+        <div style="display:inline-flex;align-items:center;justify-content:center;
+                    width:72px;height:72px;border-radius:50%;
+                    background:linear-gradient(135deg,#f59e0b,#ef4444);
+                    color:#fff;font-size:32px;
+                    box-shadow:0 12px 32px rgba(239,68,68,.4);
+                    animation:pulseGlow 1.4s ease-in-out infinite;">
+          <i class="fas fa-triangle-exclamation"></i>
+        </div>
+      </div>
+      <h3 style="text-align:center;justify-content:center;color:var(--rose-600);">
+        Proctoring Violation Detected
+      </h3>
+      <p class="modal-sub" style="text-align:center;" id="quizViolationText"></p>
+
+      <div class="violation-warning-box" id="quizViolationBox"></div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-primary btn-block" id="quizViolationResumeBtn" onclick="resumeExamAfterViolation()">
+          <i class="fas fa-play"></i> Resume Exam
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Playlist Modal -->
+  <div class="modal-overlay" id="playlistModal">
+    <div class="modal-box" style="max-width:600px;">
+      <h3 id="playlistModalTitle"><i class="fas fa-list"></i> New Playlist</h3>
+      <p class="modal-sub">Group video lectures into a named playlist.</p>
+      <form id="playlistForm" onsubmit="savePlaylistFromModal(event)">
+        <input type="hidden" id="playlistCourseId">
+        <div class="form-group">
+          <label>Playlist Title *</label>
+          <input type="text" id="playlistTitle" placeholder="e.g. Rotational Motion — Lectures" required>
+        </div>
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <textarea id="playlistDescription" rows="2" placeholder="Brief description…"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Videos to include</label>
+          <div class="playlist-checklist" id="playlistVideoChecklist"></div>
+          <span class="hint">Uncheck videos you don't want. You can add more later.</span>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('playlistModal')">Cancel</button>
+          <button type="submit" class="btn btn-success" id="playlistSubmitBtn">
+            <i class="fas fa-plus"></i> Create Playlist
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Global Search Overlay (Cmd/Ctrl + K) -->
+  <div class="global-search-overlay" id="globalSearchOverlay">
+    <div class="global-search-box">
+      <div class="global-search-input-wrap">
+        <i class="fas fa-search"></i>
+        <input type="text" class="global-search-input" id="globalSearchInput"
+               placeholder="Search courses, materials, doubts..." autocomplete="off">
+        <span class="global-search-kbd">ESC</span>
+      </div>
+      <div class="global-search-results" id="globalSearchResults"></div>
+      <div class="global-search-hint">
+        <span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span>
+        <span><kbd>↵</kbd> Open</span>
+        <span><kbd>Esc</kbd> Close</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Send Bulk Email Modal -->
+  <div class="modal-overlay" id="emailStudentsModal">
+    <div class="modal-box email-modal">
+      <div class="email-modal-header">
+        <div class="email-modal-icon"><i class="fas fa-paper-plane"></i></div>
+        <div class="email-modal-heading">
+          <h3>Send Email to Students</h3>
+          <p class="modal-sub" id="emailModalRecipientSummary">Loading recipients…</p>
+        </div>
+        <button type="button" class="email-modal-close" onclick="closeModal('emailStudentsModal')" aria-label="Close">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+
+      <div class="email-recipient-preview" id="emailRecipientPreview"></div>
+
+      <form id="emailStudentsForm" onsubmit="sendBulkEmail(event)">
+        <div class="form-group">
+          <label><i class="fas fa-heading"></i> Subject *</label>
+          <input type="text" id="emailSubject" placeholder="e.g. New lecture uploaded — Rotational Motion" maxlength="200" required>
+        </div>
+
+        <div class="form-group">
+          <label><i class="fas fa-align-left"></i> Message *</label>
+          <textarea id="emailBody" rows="8" placeholder="Type your message here.&#10;&#10;Each student gets a personalized greeting." maxlength="10000" required></textarea>
+          <span class="hint"><i class="fas fa-info-circle"></i> A greeting ("Hi &lt;first name&gt;,") and signature are added automatically.</span>
+        </div>
+
+        <div class="email-modal-info">
+          <i class="fas fa-shield-halved"></i>
+          <span>Emails are sent individually. Students cannot see each other's addresses.</span>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('emailStudentsModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="emailSubmitBtn">
+            <i class="fas fa-paper-plane"></i> <span id="emailSubmitLabel">Send Email</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Contact Team Member Modal (spam-protected relay) -->
+  <div class="modal-overlay" id="contactMemberModal">
+    <div class="modal-box contact-modal">
+      <div class="contact-modal-header">
+        <div class="contact-modal-icon"><i class="fas fa-paper-plane"></i></div>
+        <div class="contact-modal-heading">
+          <h3 id="contactModalTitle">Contact Team Member</h3>
+          <p class="modal-sub" id="contactModalSub">Your message will be relayed privately.</p>
+        </div>
+        <button type="button" class="email-modal-close" onclick="closeModal('contactMemberModal')" aria-label="Close">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+
+      <form id="contactMemberForm" onsubmit="submitContactMessage(event)">
+        <input type="hidden" id="contactToEmail">
+        <input type="hidden" id="contactToName">
+
+        <div class="form-group">
+          <label><i class="fas fa-user"></i> Your Name *</label>
+          <input type="text" id="contactFromName" placeholder="e.g. Rohan Verma" maxlength="80" required>
+        </div>
+        <div class="form-group">
+          <label><i class="fas fa-envelope"></i> Your Email *</label>
+          <input type="email" id="contactFromEmail" placeholder="you@example.com" maxlength="200" required>
+        </div>
+        <div class="form-group">
+          <label><i class="fas fa-heading"></i> Subject *</label>
+          <input type="text" id="contactSubject" placeholder="e.g. Doubt in Lecture 3" maxlength="200" required>
+        </div>
+        <div class="form-group">
+          <label><i class="fas fa-align-left"></i> Message *</label>
+          <textarea id="contactMessage" rows="6" maxlength="5000" placeholder="Type your message here…" required></textarea>
+        </div>
+
+        <div class="email-modal-info">
+          <i class="fas fa-shield-halved"></i>
+          <span>Your message is relayed privately. The recipient's email address is not exposed.</span>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('contactMemberModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="contactSubmitBtn">
+            <i class="fas fa-paper-plane"></i> Send Message
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+    <!-- ============ ALUMNI SUBMIT MODAL ============ -->
+  <div class="modal-overlay" id="alumniSubmitModal">
+    <div class="modal-box" style="max-width:640px;">
+      <div class="modal-icon-header">
+        <div class="modal-icon-tile tone-emerald" style="background:linear-gradient(135deg,#fbbf24,#d97706);color:#422006;">
+          <i class="fas fa-graduation-cap"></i>
+        </div>
+        <div>
+          <h3>Share Your Alumni Story</h3>
+          <p class="modal-sub" style="margin:2px 0 0;">Our admin will review and publish after verification.</p>
+        </div>
+      </div>
+
+      <form id="alumniSubmitForm" onsubmit="submitAlumniForm(event)">
+        <div class="editor-grid-2">
+          <div class="form-group"><label>Full Name *</label><input type="text" id="alumName" maxlength="80" required></div>
+          <div class="form-group"><label>Batch / Year</label><input type="text" id="alumBatch" maxlength="40" placeholder="e.g. 2020–2024"></div>
+          <div class="form-group"><label>Degree</label><input type="text" id="alumDegree" maxlength="120" placeholder="e.g. B.Tech, IIT Bombay (JEE 2024 AIR 512)"></div>
+          <div class="form-group"><label>Current Role</label><input type="text" id="alumRole" maxlength="120" placeholder="e.g. Design Engineer"></div>
+          <div class="form-group"><label>Company</label><input type="text" id="alumCompany" maxlength="120" placeholder="e.g. ISRO"></div>
+          <div class="form-group"><label>Location</label><input type="text" id="alumLocation" maxlength="100" placeholder="e.g. Bengaluru, India"></div>
+          <div class="form-group"><label>Email</label><input type="email" id="alumEmail" maxlength="200" placeholder="you@example.com"></div>
+          <div class="form-group"><label>Phone</label><input type="tel" id="alumPhone" maxlength="40" placeholder="+91 98765 43210"></div>
+        </div>
+        <div class="form-group"><label>LinkedIn / Website</label><input type="url" id="alumLinkedin" maxlength="300" placeholder="https://linkedin.com/in/..."></div>
+        <div class="form-group">
+          <label>Your Journey / Achievement *</label>
+          <textarea id="alumBio" rows="4" maxlength="1500" placeholder="Share briefly what you're working on, key achievements, or advice for current students…" required></textarea>
+          <span class="hint">Max 1500 characters.</span>
+        </div>
+        <div class="form-group">
+          <label>Profile Photo (optional)</label>
+          <div class="profile-photo-row">
+            <div class="profile-preview-empty" id="alumPhotoPreview">
+              <i class="fas fa-user"></i>
+            </div>
+            <div class="thumbnail-actions">
+              <input type="file" id="alumPhotoInput" accept="image/*" style="display:none;" onchange="previewAlumniPhoto(this)">
+              <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('alumPhotoInput').click()">
+                <i class="fas fa-upload"></i> Upload Photo
+              </button>
+              <span class="hint">Square image works best. Max 2 MB.</span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('alumniSubmitModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="alumSubmitBtn">
+            <i class="fas fa-paper-plane"></i> Submit for Review
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ FRIEND SUBMIT MODAL ============ -->
+  <div class="modal-overlay" id="friendSubmitModal">
+    <div class="modal-box" style="max-width:560px;">
+      <div class="modal-icon-header">
+        <div class="modal-icon-tile tone-emerald" style="background:linear-gradient(135deg,#22d3ee,#0891b2);">
+          <i class="fas fa-handshake"></i>
+        </div>
+        <div>
+          <h3>Join as a Supporter</h3>
+          <p class="modal-sub" style="margin:2px 0 0;">Be featured as a friend &amp; supporter after admin verification.</p>
+        </div>
+      </div>
+
+      <form id="friendSubmitForm" onsubmit="submitFriendForm(event)">
+        <div class="form-group"><label>Full Name *</label><input type="text" id="frName" maxlength="80" required></div>
+        <div class="form-group"><label>Role / Title *</label><input type="text" id="frRole" maxlength="120" placeholder="e.g. Mentor, Co-Founder, Supporter" required></div>
+        <div class="form-group"><label>Short Bio</label><textarea id="frBio" rows="3" maxlength="800" placeholder="One or two sentences about you…"></textarea></div>
+        <div class="editor-grid-2">
+          <div class="form-group"><label>Email</label><input type="email" id="frEmail" maxlength="200"></div>
+          <div class="form-group"><label>Phone</label><input type="tel" id="frPhone" maxlength="40"></div>
+        </div>
+        <div class="form-group"><label>LinkedIn / Website</label><input type="url" id="frLinkedin" maxlength="300" placeholder="https://..."></div>
+        <div class="form-group">
+          <label>Photo (optional)</label>
+          <div class="profile-photo-row">
+            <div class="profile-preview-empty" id="frPhotoPreview">
+              <i class="fas fa-user"></i>
+            </div>
+            <div class="thumbnail-actions">
+              <input type="file" id="frPhotoInput" accept="image/*" style="display:none;" onchange="previewFriendPhoto(this)">
+              <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('frPhotoInput').click()">
+                <i class="fas fa-upload"></i> Upload Photo
+              </button>
+              <span class="hint">Square image works best. Max 2 MB.</span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('friendSubmitModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="frSubmitBtn">
+            <i class="fas fa-paper-plane"></i> Submit for Review
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ STUDENT FEEDBACK MODAL ============ -->
+  <div class="modal-overlay" id="feedbackModal">
+    <div class="modal-box" style="max-width:560px;">
+      <div class="modal-icon-header">
+        <div class="modal-icon-tile tone-emerald" style="background:linear-gradient(135deg,#fbbf24,#f59e0b);">
+          <i class="fas fa-star"></i>
+        </div>
+        <div>
+          <h3>Share Your Feedback</h3>
+          <p class="modal-sub" style="margin:2px 0 0;">Your review will be reviewed by the admin before publishing.</p>
+        </div>
+      </div>
+
+      <form id="feedbackForm" onsubmit="submitStudentFeedback(event)">
+        <div class="form-group">
+          <label>Rating *</label>
+          <div class="feedback-stars" id="feedbackStars">
+            <button type="button" data-v="1" onclick="setFeedbackRating(1)"><i class="fas fa-star"></i></button>
+            <button type="button" data-v="2" onclick="setFeedbackRating(2)"><i class="fas fa-star"></i></button>
+            <button type="button" data-v="3" onclick="setFeedbackRating(3)"><i class="fas fa-star"></i></button>
+            <button type="button" data-v="4" onclick="setFeedbackRating(4)"><i class="fas fa-star"></i></button>
+            <button type="button" data-v="5" onclick="setFeedbackRating(5)"><i class="fas fa-star"></i></button>
+          </div>
+          <input type="hidden" id="feedbackRating" value="5">
+        </div>
+
+        <div class="form-group">
+          <label>Title (optional)</label>
+          <input type="text" id="feedbackTitle" maxlength="120" placeholder="e.g. Great course structure!">
+        </div>
+
+        <div class="form-group">
+          <label>Your Feedback *</label>
+          <textarea id="feedbackMessage" rows="5" maxlength="2000" required placeholder="Tell us about your experience…"></textarea>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('feedbackModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="feedbackSubmitBtn">
+            <i class="fas fa-paper-plane"></i> Submit Feedback
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ STUDENT CONTRIBUTION MODAL ============ -->
+  <div class="modal-overlay" id="contributionModal">
+    <div class="modal-box" style="max-width:600px;">
+      <div class="modal-icon-header">
+        <div class="modal-icon-tile tone-emerald">
+          <i class="fas fa-hand-holding-heart"></i>
+        </div>
+        <div>
+          <h3>Contribute Study Material</h3>
+          <p class="modal-sub" style="margin:2px 0 0;">Share a file — the admin will review it before making it available.</p>
+        </div>
+      </div>
+
+      <form id="contributionForm" onsubmit="submitContribution(event)">
+        <div class="form-group">
+          <label>Title *</label>
+          <input type="text" id="contribTitle" maxlength="160" required placeholder="e.g. Unit-3 Fluid Mechanics Notes">
+        </div>
+
+        <div class="form-group">
+          <label>Subject / Topic</label>
+          <input type="text" id="contribSubject" maxlength="120" placeholder="e.g. Physics">
+        </div>
+
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <textarea id="contribDescription" rows="3" maxlength="1000" placeholder="Short description of what's inside…"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>File * (max 50 MB)</label>
+          <input type="file" id="contribFile" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.jpg,.jpeg,.png" required>
+          <span class="hint">Accepted: PDF, DOC/DOCX, PPT/PPTX, XLS/XLSX, TXT, ZIP, and images.</span>
+        </div>
+
+        <div class="email-modal-info">
+          <i class="fas fa-shield-halved"></i>
+          <span>Your contribution is uploaded securely and only visible to the admin until approved.</span>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('contributionModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="contribSubmitBtn">
+            <i class="fas fa-upload"></i> Upload Contribution
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- ============ MOBILE BOTTOM NAVIGATION ============ -->
+  <nav class="mobile-bottom-nav" id="mobileBottomNav" aria-label="Primary mobile navigation" style="display:none;">
+    <a href="#" class="mbn-item" data-nav="home" onclick="event.preventDefault();mobileNavGo('home')">
+      <span class="mbn-icon"><i class="fas fa-house"></i></span>
+      <span class="mbn-label">Home</span>
+    </a>
+    <a href="#" class="mbn-item" data-nav="courses" onclick="event.preventDefault();mobileNavGo('courses')">
+      <span class="mbn-icon"><i class="fas fa-graduation-cap"></i></span>
+      <span class="mbn-label">Courses</span>
+    </a>
+    <a href="#" class="mbn-item mbn-item-ai" data-nav="ai" onclick="event.preventDefault();mobileNavGo('ai')">
+      <span class="mbn-icon"><i class="fas fa-robot"></i></span>
+      <span class="mbn-label">AI</span>
+    </a>
+    <a href="#" class="mbn-item" data-nav="saved" onclick="event.preventDefault();mobileNavGo('saved')">
+      <span class="mbn-icon">
+        <i class="fas fa-bookmark"></i>
+        <span class="mbn-badge" id="mbnSavedBadge" style="display:none;">0</span>
+      </span>
+      <span class="mbn-label">Saved</span>
+    </a>
+    <a href="#" class="mbn-item" data-nav="analytics" onclick="event.preventDefault();mobileNavGo('analytics')">
+      <span class="mbn-icon"><i class="fas fa-chart-line"></i></span>
+      <span class="mbn-label">Stats</span>
+    </a>
+  </nav>
+
+<!-- ============ CANCEL SUBSCRIPTION — OTP VERIFICATION MODAL ============ -->
+<div class="modal-overlay" id="cancelSubscriptionModal">
+  <div class="modal-box" style="max-width:480px;">
+    <div style="text-align:center; margin-bottom:14px;">
+      <div style="
+        display:inline-flex; align-items:center; justify-content:center;
+        width:64px; height:64px; border-radius:50%;
+        background:linear-gradient(135deg, var(--rose-500), var(--rose-600));
+        color:#fff; font-size:28px;
+        box-shadow:0 10px 26px rgba(239,68,68,.35);">
+        <i class="fas fa-shield-halved"></i>
+      </div>
+    </div>
+
+    <h3 style="text-align:center; justify-content:center;">
+      <i class="fas fa-triangle-exclamation" style="color:var(--rose-500);"></i>
+      Confirm Subscription Cancellation
+    </h3>
+
+    <p class="modal-sub" style="text-align:center; margin-bottom:22px;">
+      We've emailed a 6-digit verification code to
+      <strong id="cancelOtpEmailMask" style="color:var(--brand-600);">your registered email</strong>.
+      Enter it below to confirm. <br>
+      <span style="font-size:12px; color:var(--text-tertiary);">
+        Your subscription stays active until you enter the correct code.
+      </span>
+    </p>
+
+    <div class="form-group">
+      <label style="text-align:center; display:block; margin-bottom:10px;">Verification Code</label>
+      <input type="text"
+             id="cancelOtpInput"
+             placeholder="• • • • • •"
+             inputmode="numeric"
+             autocomplete="one-time-code"
+             maxlength="6"
+             oninput="this.value = this.value.replace(/[^0-9]/g, '')"
+             onkeydown="if(event.key === 'Enter'){ event.preventDefault(); submitCancelOtp(); }"
+             style="text-align:center; font-size:24px; letter-spacing:10px; font-weight:800;
+                    padding:16px; font-family:'Courier New',monospace; border-radius:12px;">
+      <span class="hint" style="text-align:center; display:block; margin-top:8px;">
+        <i class="fas fa-clock"></i> Code expires in 10 minutes.
+      </span>
+    </div>
+
+    <div class="modal-actions" style="flex-direction:column-reverse;">
+      <button type="button" class="btn btn-outline btn-block" onclick="closeCancelSubscriptionModal()">
+        <i class="fas fa-arrow-left"></i> Keep My Subscription
+      </button>
+      <button type="button" class="btn btn-danger btn-block" id="cancelOtpSubmitBtn" onclick="submitCancelOtp()">
+        <i class="fas fa-shield-halved"></i> Verify & Cancel
+      </button>
+    </div>
+  </div>
+</div>
+  <!-- ============================================================
+       LAZY LOADERS — Heavy libs load ONLY when needed
+       ============================================================ -->
+  <script>
+    /* Razorpay — loads when user clicks Buy/Subscribe */
+    window.loadRazorpay = function () {
+      if (window.Razorpay) return Promise.resolve();
+      if (window.__razorpayLoaderPromise) return window.__razorpayLoaderPromise;
+
+      window.__razorpayLoaderPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+        s.async = true;
+        s.onload = () => {
+          setTimeout(() => {
+            if (window.Razorpay) resolve();
+            else {
+              window.__razorpayLoaderPromise = null;
+              reject(new Error('Razorpay SDK loaded but failed to initialise.'));
+            }
+          }, 50);
+        };
+        s.onerror = () => {
+          window.__razorpayLoaderPromise = null;
+          reject(new Error('Could not load Razorpay checkout. Check your internet connection.'));
+        };
+        document.head.appendChild(s);
+      });
+
+      return window.__razorpayLoaderPromise;
+    };
+
+    /* Chart.js — loads when Analytics tab opens */
+    window.loadChartJS = function () {
+      return new Promise((resolve, reject) => {
+        if (window.Chart) return resolve();
+        const s = document.createElement('script');
+        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    };
+
+    /* PDF.js — loads when user opens a PDF (or hovers a card).
+       ------------------------------------------------------------
+       Self-hosted from /vendor/pdfjs/, same origin as the app.
+       On a campus / corporate proxy this is dramatically faster
+       than the CDN because:
+         • No third-party DNS lookup (cdnjs.cloudflare.com is
+           often rate-limited or throttled on campus networks).
+         • No CORS preflight — same-origin requests skip it.
+         • The TCP connection is already warm from the app itself.
+       Both files are served with a 1-year immutable cache, so
+       they are downloaded once per device and reused forever. */
+    const PDFJS_LIB_URL    = '/vendor/pdfjs/pdf.min.js';
+    const PDFJS_WORKER_URL = '/vendor/pdfjs/pdf.worker.min.js';
+
+    window.loadPDFJS = function () {
+      return new Promise((resolve, reject) => {
+        if (window.pdfjsLib) {
+          if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+          }
+          return resolve();
+        }
+        const s = document.createElement('script');
+        s.src = PDFJS_LIB_URL;
+        s.onload = () => {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+          resolve();
+        };
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    };
+    /* MathJax — loads ONLY when a quiz / AI answer needs it */
+    window.loadMathJax = function () {
+      return new Promise((resolve, reject) => {
+
+        // The ONLY reliable "is MathJax fully loaded?" check is
+        // MathJax.typesetPromise — it's defined by the actual library
+        // script AFTER it initialises, and does NOT exist on the inline
+        // config object we place in <head>.
+        const isLoaded = () =>
+          window.MathJax && typeof window.MathJax.typesetPromise === 'function';
+
+        if (isLoaded()) return resolve();
+
+        // Reuse an in-flight load if one is already running
+        if (window.__mathjaxLoaderPromise) {
+          return window.__mathjaxLoaderPromise.then(resolve, reject);
+        }
+
+        window.__mathjaxLoaderPromise = new Promise((res, rej) => {
+          const s = document.createElement('script');
+          s.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
+          s.async = true;
+
+          s.onload = () => {
+            // Script tag loaded — but MathJax may still be initialising.
+            // Poll until typesetPromise exists (usually <200 ms).
+            const waitReady = () => {
+              if (isLoaded()) res();
+              else setTimeout(waitReady, 50);
+            };
+            waitReady();
+          };
+
+          s.onerror = (err) => {
+            window.__mathjaxLoaderPromise = null;
+            rej(err);
+          };
+
+          document.head.appendChild(s);
+        });
+
+        window.__mathjaxLoaderPromise.then(resolve, reject);
+      });
+    };
+  </script>
+
+  <!-- Core app scripts — always loaded, deferred -->
+  <!-- ⚡ Version query busts HTTP cache on every deploy.
+       Just bump the number (v=29, v=30...) to force fresh files. -->
+ 	<script src="media-viewer.js?v=138" defer></script>
+  <script src="content-shield.js?v=138" defer></script>
+  <script src="login-popup.js?v=1" defer></script>
+  <script src="document-viewer.js?v=138" defer></script>
+  <script src="app.js?v=138" defer></script>
+  <!-- Service worker registration -->
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      // updateViaCache:'none' forces the browser to fetch the SW script
+      // from the network on every update check — critical for iOS/Safari
+      // which otherwise uses an HTTP-cached copy.
+      navigator.serviceWorker.register('/sw.js?v=138', { updateViaCache: 'none' })
+        .then(reg => {
+          console.log('[SW] registered:', reg.scope);
+
+          // Kick an immediate update check on every page load
+          reg.update().catch(() => {});
+
+          // ── Force any waiting SW to activate right away ──
+          // Chrome/Edge honour postMessage; Safari/iOS additionally
+          // needs the statechange listener below.
+          const promoteWaiting = (worker) => {
+            if (!worker) return;
+            if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+              worker.postMessage({ type: 'SKIP_WAITING' });
+            }
+          };
+          promoteWaiting(reg.waiting);
+          reg.addEventListener('updatefound', () => {
+            const nw = reg.installing;
+            if (!nw) return;
+            nw.addEventListener('statechange', () => promoteWaiting(nw));
+          });
+
+          // ── Periodic SW re-check (covers long-lived PWAs on iOS/Mac/Win) ──
+          // Without this, an installed app that never navigates would never
+          // look for an update. Runs every 5 minutes; cheap and safe.
+          setInterval(() => reg.update().catch(() => {}), 5 * 60 * 1000);
+        })
+        .catch(err => console.warn('[SW] register failed:', err));
+    });
+
+    // Auto-reload this tab when a new Service Worker activates.
+    // Guarded so a fresh deploy never interrupts an exam / form.
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      if (!event.data || event.data.type !== 'SW_UPDATED') return;
+      const busy =
+        document.querySelector('.modal-overlay.active') ||
+        document.querySelector('#quizExamShell[aria-hidden="false"]') ||
+        document.querySelector('#videoPlayerModal.active') ||
+        document.querySelector('#pdfViewerModal.active');
+      if (busy) {
+        console.log('[SW] new version ready — will reload when you finish');
+        return;
+      }
+      console.log('[SW] new version activated — reloading');
+      location.reload();
+    });
+  }
+</script>
+</body>
+</html>

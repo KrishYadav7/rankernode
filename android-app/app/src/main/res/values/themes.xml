@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- No action bar, no browser chrome — the website fills the screen. -->
+    <style name="Theme.AltitudeAcademy" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@drawable/splash</item>
+        <item name="android:statusBarColor">@color/brand_dark</item>
+        <item name="android:navigationBarColor">@color/brand_dark</item>
+        <item name="android:colorPrimary">@color/brand_dark</item>
+        <item name="android:colorAccent">#4F46E5</item>
+    </style>
+</resources>

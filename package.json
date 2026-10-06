@@ -1,0 +1,36 @@
+{
+  "name": "rankernode",
+  "version": "1.0.0",
+  "description": "RankerNode — Learn. Practice. Rank. Chapter-wise JEE, NEET & Class 11–12 preparation platform.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node scripts/test-auth-core.js && node scripts/test-security-helpers.js && node scripts/test-certificate.js && node scripts/test-bulk-guard.js && node scripts/test-office-render.js && node scripts/test-ai-helpers.js && node scripts/test-popup-sanitizer.js",
+    "smoke": "bash scripts/smoke-test.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/genai": "^2.24.0",
+    "bcrypt": "^6.0.0",
+    "cloudinary": "^2.11.0",
+    "compression": "^1.8.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.1.0",
+    "imapflow": "^2.0.2",
+    "jsonwebtoken": "^9.0.3",
+    "mailparser": "^3.9.25",
+    "mongoose": "^9.9.5",
+    "multer": "^2.4.0",
+    "nodemailer": "^10.0.3",
+    "pdf-lib": "^1.17.1",
+    "razorpay": "^2.9.8",
+    "resend": "^3.2.0",
+    "sharp": "^0.33.5"
+  }
+}
