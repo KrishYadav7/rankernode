@@ -1527,7 +1527,10 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
-app.post('/api/upload/init', requireUser, (req, res) => {
+app.post('/api/upload/init',
+  requireUser,
+  express.json({ limit: '1mb' }),
+  (req, res) => {
   try {
     const { fileName, fileSize, fileType } = req.body || {};
     if (!fileName || !fileSize) {
@@ -2661,6 +2664,26 @@ async function resolveSessionUser(token) {
     result = { user: null, code: 'SUSPENDED', message: 'This account has been suspended. Please contact the admin.' };
   } else {
     const current = u.activeSession && u.activeSession.sessionId;
+
+    /* Admin safety net — if a fresh/migrated admin document has
+       never carried a session, bootstrap one on the fly instead
+       of returning 401 on the very first admin request. */
+    const isAdminRole = String(u.role || '').trim().toLowerCase() === 'admin';
+    if (!current && isAdminRole) {
+      const bootstrapId = crypto.randomBytes(24).toString('hex');
+      try {
+        await User.updateOne({ _id: u._id }, { $set: {
+          activeSession: { sessionId: bootstrapId, deviceInfo: 'bootstrap',
+                           loginAt: new Date(), lastSeenAt: new Date() }
+        } });
+        console.log(`[auth] bootstrapped admin session for ${u.username}`);
+        u.activeSession = { sessionId: bootstrapId };
+        return { user: u, code: 'OK' };
+      } catch (e) {
+        console.warn('[auth] admin bootstrap failed:', e.message);
+      }
+    }
+
     if (!current) {
       result = { user: null, code: 'SESSION_ENDED', message: 'You have been signed out. Please log in again.' };
     } else if (current !== decoded.sessionId) {
@@ -6318,20 +6341,76 @@ function _cleanTracks(v) {
 function _validChapterId(course, id) {
   const s = String(id == null ? '' : id);
   if (!s || !mongoose.Types.ObjectId.isValid(s)) return '';
-  return course.chapters && course.chapters.id(s) ? s : '';
+  if (!course || !course.chapters) return '';
+  if (typeof course.chapters.id !== 'function') return '';
+  try { return course.chapters.id(s) ? s : ''; } catch (e) { return ''; }
+}
+/* Sanitises an incoming course body so an old or partially-broken
+   client payload can never trigger a Mongoose cast error. Called
+   from POST /api/courses before building the Course document. */
+function _normaliseCourseBody(b) {
+  b = Object.assign({}, b || {});
+  if (typeof b.name !== 'string') b.name = '';
+  if (typeof b.code !== 'string') b.code = '';
+  if (!Array.isArray(b.tracks))   b.tracks  = [];
+  if (typeof b.subject !== 'string') b.subject = '';
+  if (b.certificate && typeof b.certificate !== 'object') delete b.certificate;
+  if (b.difficulty && !['Beginner','Intermediate','Advanced'].includes(b.difficulty)) {
+    b.difficulty = 'Intermediate';
+  }
+  return b;
 }
 
 app.post('/api/courses', requireAdminAuth, async (req, res) => {
   try {
     const body = Object.assign({}, req.body || {});
+
+    // ---- Server-side validation (defence in depth) ----
+    body.name = String(body.name || '').trim().slice(0, 200);
+    body.code = String(body.code || '').trim().slice(0, 60);
+    if (!body.name) return res.status(400).json({ success: false, message: 'Course name is required.' });
+    if (!body.code) return res.status(400).json({ success: false, message: 'Course code is required.' });
+
     body.tracks  = _cleanTracks(body.tracks);
     body.subject = _slugKey(body.subject);
+
+    // Normalise types so a bad client payload can never cause a Mongoose cast error
+    body.featured  = body.featured === true || body.featured === 'true';
+    body.isPremium = body.isPremium === true || body.isPremium === 'true';
+    body.price     = Number.isFinite(Number(body.price))   ? Math.max(0, Number(body.price))   : 0;
+    body.credits   = Number.isFinite(Number(body.credits)) ? Math.max(0, Number(body.credits)) : 0;
+    if (!Array.isArray(body.learningOutcomes)) {
+      body.learningOutcomes = typeof body.learningOutcomes === 'string'
+        ? body.learningOutcomes.split('\n').map(s => s.trim()).filter(Boolean)
+        : [];
+    }
+    if (!['published', 'draft', 'archived'].includes(body.status)) body.status = 'published';
+
+    // Chapters, materials, doubts, announcements and playlists are managed
+    // by their own routes and must not be set during creation.
     delete body.chapters;
+    delete body.materials;
+    delete body.doubts;
+    delete body.announcements;
+    delete body.playlists;
+
     const newCourse = new Course(body);
     await newCourse.save();
     cacheClear('courses:');
+    console.log(`[POST /api/courses] ✅ "${body.name}" (${body.code}) created by ${req.adminUser.username}`);
     res.json({ success: true, message: 'Course created successfully!', course: newCourse });
-  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
+  } catch (e) {
+    console.error('[POST /api/courses] ❌', e.message);
+    console.error('[POST /api/courses] body:', JSON.stringify(req.body || {}).slice(0, 600));
+    if (e && e.stack) console.error(e.stack);
+    let friendly = (e && e.message) || 'Server error';
+    if (e && e.name === 'ValidationError') {
+      friendly = Object.values(e.errors || {}).map(x => x.message).join(' · ') || friendly;
+    } else if (e && e.code === 11000) {
+      friendly = 'A course with this code already exists.';
+    }
+    res.status(500).json({ success: false, message: 'Could not create course: ' + friendly });
+  }
 });
 
 app.put('/api/courses/:id', requireAdminAuth, async (req, res) => {
@@ -6341,11 +6420,29 @@ app.put('/api/courses/:id', requireAdminAuth, async (req, res) => {
     allowed.forEach(f => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
     if (req.body.tracks !== undefined)  update.tracks  = _cleanTracks(req.body.tracks);
     if (req.body.subject !== undefined) update.subject = _slugKey(req.body.subject);
+
+    if (update.price !== undefined) {
+      update.price = Number.isFinite(Number(update.price)) ? Math.max(0, Number(update.price)) : 0;
+    }
+    if (update.featured  !== undefined) update.featured  = update.featured  === true || update.featured  === 'true';
+    if (update.isPremium !== undefined) update.isPremium = update.isPremium === true || update.isPremium === 'true';
+    if (update.credits   !== undefined) update.credits   = Number.isFinite(Number(update.credits)) ? Math.max(0, Number(update.credits)) : 0;
+    if (update.status !== undefined && !['published','draft','archived'].includes(update.status)) delete update.status;
+
     const updated = await Course.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
     if (!updated) return res.status(404).json({ success: false, message: 'Course not found' });
     cacheClear('courses:');
     res.json({ success: true, message: 'Course updated successfully!', course: updated });
-  } catch (e) { res.status(500).json({ success: false, message: 'Error updating course: ' + e.message }); }
+  } catch (e) {
+    console.error('[PUT /api/courses/:id] ❌', e.message);
+    let friendly = (e && e.message) || 'Server error';
+    if (e && e.name === 'ValidationError') {
+      friendly = Object.values(e.errors || {}).map(x => x.message).join(' · ') || friendly;
+    } else if (e && e.code === 11000) {
+      friendly = 'Another course already uses this code.';
+    }
+    res.status(500).json({ success: false, message: 'Could not update course: ' + friendly });
+  }
 });
 
 app.delete('/api/courses/:id', requireAdminAuth, async (req, res) => {
@@ -6361,19 +6458,32 @@ app.delete('/api/courses/:id', requireAdminAuth, async (req, res) => {
    ============================================================ */
 app.post('/api/courses/:courseId/materials', requireAdminAuth, async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
+      return res.status(400).json({ success: false, message: 'Invalid course id.' });
+    }
     const course = await Course.findById(req.params.courseId);
-    if (!course) return res.status(404).json({ message: 'Course not found' });
+    if (!course) return res.status(404).json({ success: false, message: 'Course not found' });
+
     const matBody = Object.assign({}, req.body || {});
     matBody.chapterId = _validChapterId(course, matBody.chapterId);
+
+    // Normalise numeric / boolean fields so a bad client payload cannot
+    // throw a Mongoose cast error.
+    matBody.isPremium      = matBody.isPremium === true || matBody.isPremium === 'true';
+    matBody.price          = Number.isFinite(Number(matBody.price))          ? Math.max(0, Number(matBody.price))          : 0;
+    matBody.previewPercent = Number.isFinite(Number(matBody.previewPercent)) ? Math.max(0, Math.min(100, Number(matBody.previewPercent))) : 0;
+
     course.materials.push(matBody);
     await course.save();
     cacheClear('courses:');
     res.json({ success: true, message: 'Material added successfully!', course });
   } catch (e) {
-    console.error('[materials/POST] ❌ Error:', e.message);
-    console.error('[materials/POST] Stack:', e.stack);
-    console.error('[materials/POST] Body:', JSON.stringify(req.body).slice(0, 500));
-    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+    console.error('[materials/POST] ❌', e.message);
+    let friendly = (e && e.message) || 'Server error';
+    if (e && e.name === 'ValidationError') {
+      friendly = Object.values(e.errors || {}).map(x => x.message).join(' · ') || friendly;
+    }
+    res.status(500).json({ success: false, message: 'Could not add material: ' + friendly });
   }
 });
 
@@ -6660,21 +6770,40 @@ function _sortedChapters(course) {
 
 app.post('/api/courses/:courseId/chapters', requireAdminAuth, async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) return res.status(400).json({ success: false, message: 'Invalid course id.' });
+    if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
+      return res.status(400).json({ success: false, message: 'Invalid course id.' });
+    }
     const title = _cleanStr((req.body || {}).title, 140);
     if (!title) return res.status(400).json({ success: false, message: 'Chapter title is required.' });
+
     const course = await Course.findById(req.params.courseId);
     if (!course) return res.status(404).json({ success: false, message: 'Course not found.' });
-    if ((course.chapters || []).length >= 200) return res.status(400).json({ success: false, message: 'A course can have up to 200 chapters.' });
-    const maxOrder = (course.chapters || []).reduce((m, c) => Math.max(m, c.order || 0), 0);
-    course.chapters.push({ title, description: _cleanStr((req.body || {}).description, 600), order: maxOrder + 1 });
+
+    if (!Array.isArray(course.chapters)) course.chapters = [];
+    if (course.chapters.length >= 200) {
+      return res.status(400).json({ success: false, message: 'A course can have up to 200 chapters.' });
+    }
+    const maxOrder = course.chapters.reduce((m, c) => Math.max(m, c.order || 0), 0);
+    course.chapters.push({
+      title,
+      description: _cleanStr((req.body || {}).description, 600),
+      order: maxOrder + 1
+    });
     await course.save();
     cacheClear('courses:');
     const ch = course.chapters[course.chapters.length - 1];
-    res.json({ success: true, chapter: _publicChapter(ch), chapters: _sortedChapters(course).map(_publicChapter) });
+    res.json({
+      success: true,
+      chapter: _publicChapter(ch),
+      chapters: _sortedChapters(course).map(_publicChapter)
+    });
   } catch (e) {
-    console.error('[chapters POST]', e);
-    res.status(500).json({ success: false, message: 'Server error.' });
+    console.error('[chapters POST] ❌', e.message);
+    let friendly = (e && e.message) || 'Server error';
+    if (e && e.name === 'ValidationError') {
+      friendly = Object.values(e.errors || {}).map(x => x.message).join(' · ') || friendly;
+    }
+    res.status(500).json({ success: false, message: 'Could not add chapter: ' + friendly });
   }
 });
 
@@ -13628,14 +13757,17 @@ app.post('/api/admin/login-popup/image', requireAdminAuth, (req, res) => {
 });
 app.get('/popup-media/:file', async (req, res) => {
   const f = String(req.params.file || '');
-  if (!/^pp-[a-z0-9]+-[a-f0-9]{10}\.(webp|png|jpg|gif)$/.test(f)) return res.status(404).end();
+  if (!/^pp-[a-z0-9]+-[a-f0-9]{10,32}\.(webp|png|jpg|jpeg|gif)$/.test(f)) {
+    return res.status(400).end();
+  }
   const fp = path.join(POPUP_MEDIA_DIR, f);
   if (fs.existsSync(fp)) {
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     return res.sendFile(fp);
   }
-  const cloud = readCloudSidecar('popup/' + f);          // disk wiped → Cloudinary backup
+  const cloud = readCloudSidecar('popup/' + f);
   if (cloud && /^https:\/\//.test(cloud)) return res.redirect(302, cloud);
+  res.setHeader('Cache-Control', 'no-store');
   res.status(404).end();
 });
 

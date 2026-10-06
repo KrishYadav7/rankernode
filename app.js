@@ -3681,7 +3681,7 @@ async function handleLogin(e) {
           adminTab = 'overview';
           studentNav = 'home';
           try { history.replaceState(null, '', '#/admin/overview'); }
-          catch (e) { location.hash = '#/admin/overview'; }
+          catch (e) { try { location.hash = '#/admin/overview'; } catch (_) {} }
         } else {
           /* ⭐ RankerNode — new students (no category yet) and
              landing-page category links go straight to Courses, where
@@ -3691,7 +3691,7 @@ async function handleLogin(e) {
           adminTab = 'overview';
           const h = goCourses ? '#/courses' : '#/home';
           try { history.replaceState(null, '', h); }
-          catch (e) { location.hash = h; }
+          catch (e) { try { location.hash = h; } catch (_) {} }
         }
 
         showToast(data.message || 'Login successful!', 'success');
@@ -4350,41 +4350,46 @@ async function saveNewCoursePage() {
   };
 
   try {
-    const res = await fetch('/api/courses', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const data = await fetchJSON('/api/courses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    const data = await res.json();
-    
-    if (data.success) {
+
+    if (data && data.success) {
       showToast('🎉 Course created successfully!', 'success');
       addingCourse = false;
       await fetchCoursesFromDB();
-      
-      // If the course was created successfully, try to open the editor.
-      // If the editor fails to open, fall back to the courses list.
+
       if (data.course && data.course._id) {
         /* Chapters chosen under "Add … chapters automatically" */
         const planTitles = acNewCoursePlanTitles();
         if (planTitles.length) {
           try {
             const r = await fetch(`${API_BASE}/courses/${data.course._id}/chapters/bulk`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ titles: planTitles })
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ titles: planTitles })
             });
             const d = await r.json();
-            if (d && d.success) { showToast(`${d.added || 0} chapters added.`, 'success'); await fetchCoursesFromDB(true); }
-          } catch (e) { showToast('Course created, but chapters could not be added — add them in the Chapters tab.', 'error'); }
+            if (d && d.success) {
+              showToast(`${d.added || 0} chapters added.`, 'success');
+              await fetchCoursesFromDB(true);
+            }
+          } catch (e) {
+            showToast('Course created, but chapters could not be added — add them in the Chapters tab.', 'error');
+          }
         }
+        _pendingEditorTab = 'chapters';    // ask the editor to open on Chapters
         openCourseEditor(data.course._id);
-        editingTab = 'chapters';            // next step: add chapters
       } else {
         switchAdminTab('courses');
       }
     } else {
-      showToast(data.message || 'Failed to create course.', 'error');
+      showToast((data && data.message) || 'Failed to create course.', 'error');
     }
-  } catch {
-    showToast('Server error.', 'error');
+  } catch (err) {
+    console.error('[saveNewCoursePage]', err);
+    showToast(err.message || 'Could not reach the server. Check your connection.', 'error');
   }
 }
 
@@ -7421,9 +7426,11 @@ async function toggleOwnerVisibility(newVisible) {
 /* ============================================================
    COURSE EDITOR
    ============================================================ */
+let _pendingEditorTab = null;
 function openCourseEditor(courseId) {
   editingCourseId = courseId;
-  editingTab = 'details';
+  editingTab = _pendingEditorTab || 'details';
+  _pendingEditorTab = null;
   currentCourseId = null;
   window.currentSelectedCourseId = null;
   pushHash(`#/admin/edit/${courseId}`);
@@ -8190,12 +8197,12 @@ async function saveCourseDetails(courseId) {
     }
   };
   try {
-    const res = await fetch(`/api/courses/${courseId}`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    const data = await fetchJSON(`/api/courses/${courseId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    const data = await res.json();
-    if (data.success) {
+    if (data && data.success) {
       showToast('✅ Saved!', 'success');
 
       /* ⚡ Instant local merge — no round trip. */
@@ -8233,9 +8240,12 @@ async function saveCourseDetails(courseId) {
         console.warn('[saveCourseDetails] background refetch failed:', err)
       );
     } else {
-      showToast(data.message || 'Failed.', 'error');
+      showToast((data && data.message) || 'Failed to save.', 'error');
     }
-  } catch { showToast('Server error.', 'error'); }
+  } catch (err) {
+    console.error('[saveCourseDetails]', err);
+    showToast(err.message || 'Server error.', 'error');
+  }
 }
 
 async function handleThumbnailUpload(input) {
