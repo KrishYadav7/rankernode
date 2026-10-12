@@ -67,6 +67,14 @@ const BRANDING_ASSET_MAP = {
   logo:           { publicPath: '/logo.svg',             defaultFile: 'logo.svg'             }
 };
 
+/* Revision of the BUILT-IN icon files (favicon.svg, favicon-*.png, icon-*.png …).
+   Bump it whenever those files change: it is folded into every ?v= the
+   client and manifest use, so browsers drop their cached copies. */
+const BRAND_ASSET_REV = 162;
+function brandingVersion(s) {
+  return BRAND_ASSET_REV + "." + ((s && s.branding && s.branding.version) || 1);
+}
+
 /* PNG dimensions the favicon generator must produce. */
 const FAVICON_SIZES = [16, 32, 48, 96, 180, 192, 256, 384, 512];
 
@@ -98,7 +106,7 @@ async function serveBrandableAsset(res, assetKey) {
         const fp = path.join(BRANDING_DIR, fname);
         if (fs.existsSync(fp)) {
           const st = fs.statSync(fp);
-          const currentVersion  = String((s.branding && s.branding.version) || 1);
+          const currentVersion  = brandingVersion(s);
           const req             = res.req;
           const requestedVersion = (req && req.query) ? String(req.query.v || '') : '';
 
@@ -1981,6 +1989,11 @@ app.get('/favicon.svg', async (req, res) => {
   if (await serveBrandableAsset(res, 'faviconSvg')) return;
   sendCached(res, 'favicon.svg', 300);
 });
+/* Browsers and crawlers request /favicon.ico on their own, with no ?v= */
+app.get('/favicon.ico', (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.sendFile(path.join(__dirname, 'favicon.ico'));
+});
 /* ============================================================
    DYNAMIC MANIFEST — versioned icon URLs
    ------------------------------------------------------------
@@ -1995,7 +2008,7 @@ app.get('/favicon.svg', async (req, res) => {
 app.get('/manifest.json', async (req, res) => {
   try {
     const s = await getGlobalSettings();
-    const version = (s && s.branding && s.branding.version) || 1;
+    const version = brandingVersion(s);
 
     const raw = fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8');
     const manifest = JSON.parse(raw);
@@ -10685,7 +10698,7 @@ app.get('/api/admin/branding', requireAdminAuth, async (req, res) => {
 
     res.json({
       success: true,
-      version: b.version || 1,
+      version: brandingVersion(s),
       favicon: {
         source:    pick(b.faviconSource),
         generated: {
@@ -10720,12 +10733,12 @@ app.get('/api/branding-status', async (req, res) => {
     const b = (s && s.branding) || {};
     res.json({
       success: true,
-      version:    b.version || 1,
+      version:    brandingVersion(s),
       hasLogo:    !!(b.logo      && b.logo.url),
       hasFavicon: !!(b.favicon16 && b.favicon16.url)   // ⭐ new
     });
   } catch (e) {
-    res.json({ success: false, version: 1, hasLogo: false, hasFavicon: false });
+    res.json({ success: false, version: brandingVersion(null), hasLogo: false, hasFavicon: false });
   }
 });
 
@@ -10943,7 +10956,7 @@ app.post(
       res.json({
         success: true,
         message: `Generated ${Object.keys(generated).length} favicon variants.`,
-        version: s.branding.version
+        version: brandingVersion(s)
       });
     } catch (e) {
       console.error('[branding/favicon]', e);
@@ -11018,7 +11031,7 @@ app.post(
       res.json({
         success: true,
         message: 'Logo updated.',
-        version: s.branding.version
+        version: brandingVersion(s)
       });
     } catch (e) {
       console.error('[branding/logo]', e);
@@ -11065,7 +11078,7 @@ app.post('/api/admin/branding/reset', requireAdminAuth, async (req, res) => {
     res.json({
       success: true,
       message: 'All custom branding reverted to defaults.',
-      version: s.branding.version
+      version: brandingVersion(s)
     });
   } catch (e) {
     console.error('[branding/reset]', e);
