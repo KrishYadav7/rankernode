@@ -18,15 +18,15 @@
       } catch (e) {}
     })();
   </script>
-<link rel="manifest" href="manifest.json?v=160">
+<link rel="manifest" href="manifest.json?v=161">
   <!-- Logo / Favicon -->
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=138">
-  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=138">
-  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=138">
-  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png?v=138">
-  <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png?v=138">
-  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=138">
-  <link rel="shortcut icon" href="/favicon-32.png?v=138">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=161">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=161">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=161">
+  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png?v=161">
+  <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png?v=161">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=161">
+  <link rel="shortcut icon" href="/favicon-32.png?v=161">
   <title>RankerNode – Learn. Practice. Rank.</title>
 
   <!-- Critical preconnects (only 3 — extra ones waste time) -->
@@ -47,9 +47,9 @@
 
   <!-- Google Fonts — non-blocking -->
   <link rel="preload" as="style"
-        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Sora:wght@700&display=swap"
         onload="this.onload=null;this.rel='stylesheet'">
-  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"></noscript>
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Sora:wght@700&display=swap"></noscript>
 
   <!-- Font Awesome — non-blocking (was the #1 first-paint killer) -->
   <link rel="preload" as="style"
@@ -58,7 +58,7 @@
   <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"></noscript>
 
   <!-- App stylesheet — blocking (must be, small) -->
-  <link rel="stylesheet" href="styles.css?v=145">
+  <link rel="stylesheet" href="styles.css?v=146">
 
 
   <!-- Inline critical fallback so icons don't flash before FA loads -->
@@ -131,15 +131,10 @@
       <!-- UPDATED: Added onclick and cursor style to make the logo act as a Home button -->
       <div class="brand" onclick="navigateStudent('home')" style="cursor:pointer;">
         <div class="brand-icon" aria-hidden="true">
-          <svg viewBox="0 0 512 512" width="100%" height="100%" focusable="false">
-            <path fill="#0EA5E9" d="M232 448 L352 236 L472 448 Z"/>
-            <path fill="#4F46E5" d="M40 448 L216 150 L392 448 Z"/>
-            <path fill="#FFFFFF" d="M216 150 L264 231 L240 218 L216 242 L192 218 L168 231 Z"/>
-            <path fill="none" stroke="#F59E0B" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" d="M164 104 L216 56 L268 104"/>
-          </svg>
+          <svg viewBox="0 0 100 100" width="100%" height="100%" focusable="false"><g fill="none" stroke="#0F1535" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 84 L50 16 L86 84"/><path d="M14 84 L50 58 L86 84"/><path d="M50 16 L50 58"/></g><circle cx="14" cy="84" r="9" fill="#0F1535"/><circle cx="86" cy="84" r="9" fill="#0F1535"/><circle cx="50" cy="58" r="9" fill="#0F1535"/><circle cx="50" cy="16" r="12" fill="#F2551B"/></svg>
         </div>
         <div class="brand-text">
-          <h1>RankerNode</h1>
+          <h1>Ranker<span class="bn-accent">Node</span></h1>
           <span>Learn. Practice. Rank.</span>
         </div>
       </div>
@@ -252,9 +247,9 @@
               <circle class="lg-sat" cx="375" cy="200" r="5" fill="currentColor"/>
             </svg>
             <div class="lg-brand-top">
-              <div class="login-icon lg-mark" aria-hidden="true"><svg viewBox="0 0 512 512" width="100%" height="100%" focusable="false"><path fill="#0EA5E9" d="M232 448 L352 236 L472 448 Z"/><path fill="#4F46E5" d="M40 448 L216 150 L392 448 Z"/><path fill="#FFFFFF" d="M216 150 L264 231 L240 218 L216 242 L192 218 L168 231 Z"/><path fill="none" stroke="#F59E0B" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" d="M164 104 L216 56 L268 104"/></svg></div>
+              <div class="login-icon lg-mark" aria-hidden="true"><svg viewBox="0 0 100 100" width="100%" height="100%" focusable="false"><g fill="none" stroke="#0F1535" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 84 L50 16 L86 84"/><path d="M14 84 L50 58 L86 84"/><path d="M50 16 L50 58"/></g><circle cx="14" cy="84" r="9" fill="#0F1535"/><circle cx="86" cy="84" r="9" fill="#0F1535"/><circle cx="50" cy="58" r="9" fill="#0F1535"/><circle cx="50" cy="16" r="12" fill="#F2551B"/></svg></div>
               <div>
-                <strong class="lg-brand-name">RankerNode</strong>
+                <strong class="lg-brand-name">Ranker<span class="bn-accent">Node</span></strong>
                 <span class="lg-brand-tag">Learn. Practice. Rank.</span>
               </div>
             </div>

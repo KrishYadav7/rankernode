@@ -12652,6 +12652,21 @@ html {
   border-color: rgba(255, 255, 255, .15) !important;
   box-shadow: 0 4px 14px rgba(0, 0, 0, .5) !important;
 }
+/* 2026-10-12 — "Node Peak" wordmark: Sora 700, "Node" in brand orange.
+   Overrides the generic `.brand-text span` tagline rules. */
+.brand-text h1,
+.lg-brand-name {
+  font-family: 'Sora', 'Inter', system-ui, sans-serif !important;
+  letter-spacing: -.4px !important;
+}
+.brand-text h1 .bn-accent,
+.lg-brand-name .bn-accent {
+  display: inline !important;
+  font: inherit !important;
+  letter-spacing: inherit !important;
+  color: #F2551B !important;
+  overflow: visible !important;
+}
 /* ============================================================
    76. UNIVERSAL DOCUMENT VIEWER
    ------------------------------------------------------------
