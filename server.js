@@ -590,7 +590,8 @@ app.use((req, res, next) => {
     const duration = Date.now() - start;
     // ⚡ Only flag genuinely slow requests. 2 s is the sweet spot —
     //    anything under that is normal on a shared VPS.
-    if (duration > 2000) {
+    /* live streams (SSE) stay open for minutes by design — not slow */
+    if (duration > 2000 && !/\/stream(\?|$)/.test(req.path || '')) {
       console.warn(`[SLOW] ${req.method} ${req.url} - ${duration}ms`);
     }
   });
@@ -1190,6 +1191,7 @@ function _renderErrorPayload(e) {
 app.get('/api/courses/:courseId/materials/:materialId/render', attachUserFromToken, async (req, res) => {
   try {
     res.setHeader('Cache-Control', 'no-store, private');
+    if (_visitorWithoutAccount(req)) return _sendSignupRequired(res);
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
       return res.status(400).json({ success: false, message: 'Invalid course ID.' });
     }
@@ -1318,7 +1320,10 @@ app.get('/uploads/:filename', attachUserFromToken, async (req, res) => {
      Overhead per range request: ~2 ms (HMAC verify only)
      vs. ~50 ms before (JWT decode + DB lookup + access eval).
      ============================================================ */
-  const signedToken = req.query.st;
+  /* The token may come in the query (?st=) or — so the file's URL stays
+     the same across token renewals and the browser can reuse its cached
+     copy — in the X-Aero-St header. */
+  const signedToken = req.query.st || req.get('x-aero-st');
   const signedUser  = req.query.su;
 
   if (signedToken && signedUser &&
@@ -1333,7 +1338,12 @@ app.get('/uploads/:filename', attachUserFromToken, async (req, res) => {
   /* Files fetched / decoded for the in-app viewer (ro-…) have no course
      record to check against, so they are reachable ONLY through the
      signed URL issued by /render (or by an admin). */
-  if (DERIVED_OFFICE_RE.test(filename) && !_isAdminUser(req.authUser)) {
+  if ((DERIVED_OFFICE_RE.test(filename) || DERIVED_PDF_RE.test(filename)) && !_isAdminUser(req.authUser)) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(403).json({ success: false, message: 'This link has expired. Please open the file again from the course page.' });
+  }
+  /* ⚡ Fast-view PDF copies — same rule: signed URL (or admin) only */
+  if ((FASTVIEW_ANY_RE.test(filename) || POSTER_RE.test(filename)) && !_isAdminUser(req.authUser)) {
     res.setHeader('Cache-Control', 'no-store');
     return res.status(403).json({ success: false, message: 'This link has expired. Please open the file again from the course page.' });
   }
@@ -1349,9 +1359,12 @@ app.get('/uploads/:filename', attachUserFromToken, async (req, res) => {
       /* Rendered copies inherit the access rules of their original file */
       const lookupName = originalNameForRender(filename) || filename;
       const escaped = lookupName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      /* ⚡ Only the fields the access check below reads. Selecting all of
+         `materials` pulled every material's quiz and legacy base64
+         `fileData` (megabytes) on each lookup and kept it in the cache. */
       owner = await Course.findOne({
         'materials.url': { $regex: '/uploads/' + escaped + '$' }
-      }).select('isPremium price materials').lean();
+      }).select('isPremium price materials._id materials.url materials.isPremium materials.previewPercent').lean();
 
       cacheSet(ownerCacheKey, owner || false, 5 * 60 * 1000);
     } catch (e) {
@@ -1437,6 +1450,7 @@ async function handleSingleUpload(req, res) {
       setTimeout(() => {
         linearizePdf(diskPath)
           .then(() => generatePreviewPdf(diskName, 10))
+          .then(() => { fastViewFor(diskName); })
           .catch(() => {});
       }, 500);
     }
@@ -1684,6 +1698,7 @@ app.post('/api/upload/complete', requireUser, async (req, res) => {
       setTimeout(() => {
         linearizePdf(finalPath)
           .then(() => generatePreviewPdf(diskName, 10))
+          .then(() => { fastViewFor(diskName); })
           .catch(() => {});
       }, 500);
     }
@@ -1761,7 +1776,7 @@ app.use((err, req, res, next) => {
    the background) instead of gzip-on-every-request: ~20 % fewer
    bytes on slow connections and no per-request CPU.
    ============================================================ */
-const VERSIONED_ASSETS = ['app.js', 'styles.css', 'media-viewer.js', 'document-viewer.js', 'content-shield.js', 'login-popup.js'];
+const VERSIONED_ASSETS = ['app.js', 'styles.css', 'media-viewer.js', 'document-viewer.js', 'content-shield.js', 'login-popup.js', 'notes.js', 'notes.css', 'tex-render.js', 'learning.js'];
 const _assetHashCache = new Map();   // file → { key, hash }
 function assetHash(file) {
   try {
@@ -1889,7 +1904,7 @@ function sendImmutableAsset(res, filename) {
 }
 /* Warm the compressed copies right after boot so the first visitor is fast too. */
 setTimeout(() => {
-  ['app.js', 'styles.css', 'media-viewer.js', 'document-viewer.js', 'content-shield.js', 'login-popup.js',
+  ['app.js', 'styles.css', 'media-viewer.js', 'document-viewer.js', 'content-shield.js', 'login-popup.js', 'notes.js', 'notes.css', 'tex-render.js', 'learning.js',
    'vendor/pdfjs/pdf.min.js', 'vendor/pdfjs/pdf.worker.min.js'].forEach(f => {
     try {
       const fp = path.join(__dirname, f);
@@ -1904,6 +1919,13 @@ app.get('/media-viewer.js',    (req, res) => sendImmutableAsset(res, 'media-view
 app.get('/document-viewer.js', (req, res) => sendImmutableAsset(res, 'document-viewer.js'));
 app.get('/content-shield.js', (req, res) => sendImmutableAsset(res, 'content-shield.js'));
 app.get('/login-popup.js',    (req, res) => sendImmutableAsset(res, 'login-popup.js'));
+/* ⭐ Notes — loaded only when a student opens "My Notes" */
+app.get('/notes.js',          (req, res) => sendImmutableAsset(res, 'notes.js'));
+app.get('/notes.css',         (req, res) => sendImmutableAsset(res, 'notes.css'));
+/* ⭐ LaTeX renderer for quizzes (2026-10-10) */
+app.get('/tex-render.js',     (req, res) => sendImmutableAsset(res, 'tex-render.js'));
+/* ⭐ Practice, question bank, test series… (2026-10-11) */
+app.get('/learning.js',       (req, res) => sendImmutableAsset(res, 'learning.js'));
 app.get('/passport.jpg',    (req, res) => sendCached(res, 'passport.jpg', 604800));
 
 /* ⭐ PDF.js — self-hosted so campus / corporate proxies that
@@ -2352,6 +2374,8 @@ function classifyMutation(method, path) {
   if (/^\/subscribe\//.test(path)) return null;
 
   // Admin content mutations → broadcast
+  if (method === 'PUT' && /^\/admin\/courses\/order\/?$/.test(path)) return 'courses:order';
+  if (method === 'PUT' && /^\/courses\/[^/]+\/materials\/reorder\/?$/.test(path)) return 'courses:material-order';
   if (method === 'POST' && /^\/courses\/?$/.test(path)) return 'courses:created';
   if (method === 'PUT' && /^\/courses\/[^/]+$/.test(path)) return 'courses:updated';
   if (method === 'DELETE' && /^\/courses\/[^/]+$/.test(path)) return 'courses:deleted';
@@ -2386,6 +2410,10 @@ function classifyMutation(method, path) {
   if (method === 'POST' && /^\/admin\/students\/import-csv\/?$/.test(path))
     return 'users:created';
 
+  // ⭐ Professor applications / course requests / admin decisions
+  if (method === 'POST' && /^\/professor\/(register|course-requests)\/?$/.test(path)) return 'professors:changed';
+  if (/^\/admin\/professor/.test(path)) return 'professors:changed';
+
   // Admin deletes a student (DELETE /api/admin/students/:userId)
   if (method === 'DELETE' && /^\/admin\/students\/[^/]+$/.test(path))
     return 'users:deleted';
@@ -2401,9 +2429,12 @@ app.use('/api/', (req, res, next) => {
   const originalJson = res.json.bind(res);
   res.json = function (body) {
     try {
+      /* ⚡ any change to reviews drops the cached public review list */
+      if (/^\/(admin\/)?feedback/.test(req.path) && res.statusCode < 400) cacheClear('feedback:');
       if (res.statusCode >= 200 && res.statusCode < 300 &&
           body && body.success !== false) {
         const scope = classifyMutation(req.method, req.path);
+        if (scope && String(scope).indexOf('users:') === 0) cacheClear('stats:students');
         if (scope) {
           broadcastContentChange(scope, { path: req.path, method: req.method });
         }
@@ -2559,6 +2590,68 @@ async function requireAdminAuth(req, res, next) {
   req.authUserId = String(r.user._id);
   next();
 }
+
+/* ============================================================
+   ⭐ PROFESSOR ROLE — permission gates (2026-10-07)
+   ------------------------------------------------------------
+   requireProfessor     an approved professor (pending / rejected /
+                        revoked tokens are already refused by
+                        resolveSessionUser).
+   requireCourseEditor  the admin, OR an approved professor whose
+                        approved courses include this course
+                        (:courseId or :id). Sets req.editorRole to
+                        'admin' | 'professor' so each route can apply
+                        the professor limits (no deleting, no prices).
+   Every DELETE route stays requireAdminAuth — professors can never
+   reach them.
+   ============================================================ */
+function _isProfessorUser(u) {
+  return !!u && String(u.role || '').trim().toLowerCase() === 'professor';
+}
+async function requireProfessor(req, res, next) {
+  const token = _extractToken(req, false);
+  if (!token) return res.status(401).json({ success: false, code: 'NO_TOKEN', message: 'Please log in to continue.' });
+  const r = await resolveSessionUser(token);
+  if (!r.user) {
+    return res.status(r.code === 'AUTH_UNAVAILABLE' ? 503 : 401).json({ success: false, code: r.code, message: r.message });
+  }
+  if (!_isProfessorUser(r.user)) return res.status(403).json({ success: false, message: 'Professor accounts only.' });
+  req.authUser = r.user;
+  req.authUserId = String(r.user._id);
+  next();
+}
+async function requireCourseEditor(req, res, next) {
+  const token = _extractToken(req, true);
+  if (!token) return res.status(401).json({ success: false, code: 'NO_TOKEN', message: 'Authentication required.' });
+  const r = await resolveSessionUser(token);
+  if (!r.user) {
+    return res.status(r.code === 'AUTH_UNAVAILABLE' ? 503 : 401).json({ success: false, code: r.code, message: r.message });
+  }
+  req.authUser = r.user;
+  req.authUserId = String(r.user._id);
+  if (_isAdminUser(r.user)) { req.adminUser = r.user; req.editorRole = 'admin'; return next(); }
+  if (_isProfessorUser(r.user)) {
+    const courseId = String(req.params.courseId || req.params.id || '');
+    const mine = ((r.user.professor && r.user.professor.courses) || []).map(String);
+    if (courseId && mine.includes(courseId)) { req.editorRole = 'professor'; return next(); }
+    return res.status(403).json({ success: false, code: 'NOT_YOUR_COURSE', message: 'You do not have access to this course.' });
+  }
+  return res.status(403).json({ success: false, message: 'Admin access only.' });
+}
+function _editorStamp(req) {
+  const u = req.authUser || {};
+  return { id: String(u._id || ''), name: String(u.fullName || u.username || ''), role: req.editorRole || 'admin', at: new Date() };
+}
+/* Course ids a professor token may see (null for everyone else) */
+async function _professorScope(req) {
+  try {
+    const token = _extractToken(req, false);
+    if (!token) return null;
+    const r = await resolveSessionUser(token);
+    if (r.user && _isProfessorUser(r.user)) return new Set(((r.user.professor && r.user.professor.courses) || []).map(String));
+  } catch (_) {}
+  return null;
+}
 /* ============================================================
    AUTH — optional token attach (v2 — CACHED)
    ------------------------------------------------------------
@@ -2623,7 +2716,96 @@ function _clearAuthUserCache() { _authUserCache.clear(); }
    Results are cached per token for 30 s; logout / suspend /
    force-logout / purchases call _clearAuthUserCache().
    ============================================================ */
-const AUTH_USER_FIELDS = 'role username fullName email purchases subscription activeSession suspended';
+const AUTH_USER_FIELDS = 'role username fullName email purchases subscription activeSession sessions suspended professor.status professor.courses';
+
+/* ============================================================
+   ⭐ ADMIN MULTI-DEVICE SESSIONS (2026-10-08)
+   ------------------------------------------------------------
+   • Admin: up to ADMIN_MAX_SESSIONS (default 3) devices at once.
+     Session ids live in user.sessions[]; activeSession mirrors the
+     newest one (and a pre-upgrade admin token stored only there
+     keeps working until it expires).
+   • Student / professor: unchanged — single device, activeSession.
+   ============================================================ */
+const ADMIN_MAX_SESSIONS = Math.max(1, Math.min(10, parseInt((typeof process !== 'undefined' && process.env.ADMIN_MAX_SESSIONS) || '3', 10) || 3));
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;   // = JWT expiresIn '1d'
+
+function _isAdminRole(u) {
+  return !!u && String(u.role || '').trim().toLowerCase() === 'admin';
+}
+/* Every session id this account currently accepts. */
+function _validSessionIds(u) {
+  const ids = [];
+  if (u && u.activeSession && u.activeSession.sessionId) ids.push(String(u.activeSession.sessionId));
+  if (_isAdminRole(u) && Array.isArray(u.sessions)) {
+    for (const s of u.sessions) if (s && s.sessionId) ids.push(String(s.sessionId));
+  }
+  return ids;
+}
+/* Verdict for a token's sessionId → null when valid, else { code, message } */
+function _sessionVerdict(u, tokenSessionId) {
+  const ids = _validSessionIds(u);
+  if (!ids.length) {
+    return { code: 'SESSION_ENDED', message: 'You have been signed out. Please log in again.' };
+  }
+  if (!tokenSessionId || !ids.includes(String(tokenSessionId))) {
+    return _isAdminRole(u)
+      ? { code: 'SESSION_REPLACED', message: `This device was signed out — it was removed from the admin's signed-in devices, or the account was signed in on more than ${ADMIN_MAX_SESSIONS} devices.` }
+      : { code: 'SESSION_REPLACED', message: 'You were signed out because this account was signed in on another device.' };
+  }
+  return null;
+}
+function _shortDevice(ua) {
+  ua = String(ua || '');
+  let os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iPod/i.test(ua) ? 'iOS' : /Windows/i.test(ua) ? 'Windows'
+         : /Mac OS X|Macintosh/i.test(ua) ? 'macOS' : /Linux/i.test(ua) ? 'Linux' : 'Unknown OS';
+  let br = /RankerNode|; wv\)/i.test(ua) ? 'RankerNode app' : /Edg\//i.test(ua) ? 'Edge' : /OPR\//i.test(ua) ? 'Opera'
+         : /Firefox\//i.test(ua) ? 'Firefox' : /Chrome\//i.test(ua) ? 'Chrome' : /Safari\//i.test(ua) ? 'Safari' : 'Browser';
+  return br + ' on ' + os;
+}
+
+/* Creates a new session for `user` after a successful login and returns
+   { sessionId, evicted }. Admin → added to the device list (oldest is
+   signed out beyond the limit). Everyone else → replaces activeSession. */
+async function _createLoginSession(user, req, extraSet) {
+  const sessionId  = crypto.randomBytes(24).toString('hex');
+  const deviceInfo = String((req && req.headers && req.headers['user-agent']) || 'Unknown device').slice(0, 200);
+  const ip         = String((req && (req.ip || req.headers['x-forwarded-for'])) || '').slice(0, 64);
+  const now        = new Date();
+  const set        = Object.assign({}, extraSet || {});
+  let evicted      = 0;
+
+  set.activeSession = { sessionId, deviceInfo, loginAt: now, lastSeenAt: now };
+
+  if (_isAdminRole(user)) {
+    const fresh = await User.findById(user._id).select('sessions activeSession').lean();
+    const cutoff = now.getTime() - SESSION_TTL_MS;
+    let list = ((fresh && fresh.sessions) || [])
+      .filter(s => s && s.sessionId && new Date(s.loginAt || 0).getTime() > cutoff);
+    /* carry over a pre-upgrade single session so it counts toward the limit */
+    const legacy = fresh && fresh.activeSession;
+    if (legacy && legacy.sessionId && new Date(legacy.loginAt || 0).getTime() > cutoff &&
+        !list.some(s => s.sessionId === legacy.sessionId)) {
+      list.push({ sessionId: legacy.sessionId, deviceInfo: legacy.deviceInfo || '', ip: '',
+                  loginAt: legacy.loginAt, lastSeenAt: legacy.lastSeenAt || legacy.loginAt });
+    }
+    list.push({ sessionId, deviceInfo, ip, loginAt: now, lastSeenAt: now });
+    if (list.length > ADMIN_MAX_SESSIONS) {
+      /* keep the most recently used devices — the new one is always kept */
+      list.sort((a, b) => new Date(b.lastSeenAt || b.loginAt || 0) - new Date(a.lastSeenAt || a.loginAt || 0));
+      const keep = list.filter(s => s.sessionId === sessionId)
+        .concat(list.filter(s => s.sessionId !== sessionId).slice(0, ADMIN_MAX_SESSIONS - 1));
+      evicted = list.length - keep.length;
+      list = keep;
+    }
+    set.sessions = list;
+  }
+
+  const upd = await User.updateOne({ _id: user._id }, { $set: set });
+  if (!upd || !(upd.matchedCount > 0)) throw new Error('session write did not match the account');
+  _clearAuthUserCache();
+  return { sessionId, evicted };
+}
 
 function _extractToken(req, allowLegacyQueryParam) {
   const auth = req.headers.authorization || '';
@@ -2662,35 +2844,11 @@ async function resolveSessionUser(token) {
     result = { user: null, code: 'USER_NOT_FOUND', message: 'Account no longer exists.' };
   } else if (u.suspended && u.suspended.active) {
     result = { user: null, code: 'SUSPENDED', message: 'This account has been suspended. Please contact the admin.' };
+  } else if (String(u.role || '').toLowerCase() === 'professor' && !(u.professor && u.professor.status === 'approved')) {
+    result = { user: null, code: 'PROFESSOR_NOT_APPROVED', message: 'Your professor account is not active. Please contact the admin.' };
   } else {
-    const current = u.activeSession && u.activeSession.sessionId;
-
-    /* Admin safety net — if a fresh/migrated admin document has
-       never carried a session, bootstrap one on the fly instead
-       of returning 401 on the very first admin request. */
-    const isAdminRole = String(u.role || '').trim().toLowerCase() === 'admin';
-    if (!current && isAdminRole) {
-      const bootstrapId = crypto.randomBytes(24).toString('hex');
-      try {
-        await User.updateOne({ _id: u._id }, { $set: {
-          activeSession: { sessionId: bootstrapId, deviceInfo: 'bootstrap',
-                           loginAt: new Date(), lastSeenAt: new Date() }
-        } });
-        console.log(`[auth] bootstrapped admin session for ${u.username}`);
-        u.activeSession = { sessionId: bootstrapId };
-        return { user: u, code: 'OK' };
-      } catch (e) {
-        console.warn('[auth] admin bootstrap failed:', e.message);
-      }
-    }
-
-    if (!current) {
-      result = { user: null, code: 'SESSION_ENDED', message: 'You have been signed out. Please log in again.' };
-    } else if (current !== decoded.sessionId) {
-      result = { user: null, code: 'SESSION_REPLACED', message: 'You were signed out because this account was signed in on another device.' };
-    } else {
-      result = { user: u, code: 'OK' };
-    }
+    const bad = _sessionVerdict(u, decoded.sessionId);
+    result = bad ? { user: null, code: bad.code, message: bad.message } : { user: u, code: 'OK' };
   }
   _setCachedAuthUser(token, result);
   return result;
@@ -2698,6 +2856,20 @@ async function resolveSessionUser(token) {
 
 /* Optional auth — attaches req.authUser when the token is valid,
    otherwise the request proceeds as a guest (premium gates then deny). */
+/* ⭐ 2026-10-06 — visitors browsing the public catalog (no account, no
+   token at all) may see course and lesson titles, but not open lessons.
+   Requests that carry a token are left exactly as before. */
+function _visitorWithoutAccount(req) {
+  return !req.authUser && !_extractToken(req, false);
+}
+function _sendSignupRequired(res) {
+  res.setHeader('Cache-Control', 'no-store, private');
+  return res.status(401).json({
+    success: false, code: 'login-required', requiresLogin: true,
+    message: 'Please register or sign in to open this lesson.'
+  });
+}
+
 async function attachUserFromToken(req, res, next) {
   try {
     const token = _extractToken(req, false);
@@ -2802,6 +2974,15 @@ function evaluateMaterialAccess(user, course, material) {
   /* ---- Admins always get full access ---- */
   if (String((user && user.role) || '').trim().toLowerCase() === 'admin') {
     return { allowed: true, canPreview: false, previewPercent: 0 };
+  }
+
+  /* ---- ⭐ Professors: full access to the courses the admin approved for
+          them, nothing at all anywhere else ---- */
+  if (String((user && user.role) || '').trim().toLowerCase() === 'professor') {
+    const ok = !!(course && user.professor && user.professor.status === 'approved' &&
+                  (user.professor.courses || []).map(String).includes(String(course._id)));
+    return ok ? { allowed: true, canPreview: false, previewPercent: 0 }
+              : { allowed: false, canPreview: false, previewPercent: 0, reason: 'not-assigned' };
   }
 
   const purchases    = Array.isArray(user.purchases) ? user.purchases : [];
@@ -3146,7 +3327,8 @@ const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 
 async function sendSMS(to, body) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
-    console.warn('[sms] Twilio not configured — SMS skipped for', to);
+    /* log once, and never write students' phone numbers into the logs */
+    if (!sendSMS._warned) { sendSMS._warned = true; console.warn('[sms] Twilio not configured — SMS is off (email OTPs still work)'); }
     return { success: false, reason: 'not-configured' };
   }
   if (!to) return { success: false, reason: 'no-recipient' };
@@ -3232,28 +3414,45 @@ mongoose.connection.on('disconnected', () => {
    ============================================================ */
 (async () => {
   try {
-    /* Courses — matches the primary list sort exactly */
-    await Course.collection.createIndex({ featured: -1, createdAt: -1 });
-    await Course.collection.createIndex({ status: 1 });
-    /* Used by /uploads/:filename to reverse-lookup the owning course */
-    await Course.collection.createIndex({ 'materials._id': 1 });
-    /* Used by the paywall + material lookup */
-    await Course.collection.createIndex({ 'materials.url': 1 }, { sparse: true });
+    /* ⭐ 2026-10-12 — wait for the connection: with bufferCommands off,
+       createIndex() before it is up failed ("Cannot call createIndex()
+       before initial connection"), so these indexes were never made */
+    if (mongoose.connection.readyState !== 1) {
+      await new Promise((resolve) => mongoose.connection.once('connected', resolve));
+    }
+    /* each index on its own: one conflict must not stop the rest */
+    const want = [
+      /* Courses — matches the primary list sort exactly */
+      [Course, { featured: -1, createdAt: -1 }],
+      [Course, { status: 1 }],
+      /* Used by /uploads/:filename to reverse-lookup the owning course */
+      [Course, { 'materials._id': 1 }],
+      /* Used by the paywall + material lookup (same options as the existing index) */
+      [Course, { 'materials.url': 1 }],
+      /* Users — login (username lookup), forgot-password (email), referrals */
+      [User, { role: 1, createdAt: -1 }],
+      [User, { referralCode: 1 }, { sparse: true }],
+      [User, { referredBy: 1 }, { sparse: true }],
+      [User, { email: 1 }, { sparse: true }],
+      /* Activity — live admin dashboard sorts by lastSeenAt */
+      [User, { 'activeSession.lastSeenAt': -1 }, { sparse: true }],
+      /* Contributions / feedback admin lists */
+      [Contribution, { submittedAt: -1 }],
+      [Feedback, { submittedAt: -1 }]
+    ];
+    let failed = 0;
+    for (const [M, keys, opts] of want) {
+      try { await M.collection.createIndex(keys, opts || {}); }
+      catch (e) {
+        /* same keys already indexed with other options → that index serves the query */
+        if (!/same name|already exists|IndexOptionsConflict|IndexKeySpecsConflict/i.test(e.message)) {
+          failed++;
+          console.warn('[mongo] index', JSON.stringify(keys), 'not created:', e.message);
+        }
+      }
+    }
 
-    /* Users — login (username lookup), forgot-password (email), referrals */
-    await User.collection.createIndex({ role: 1, createdAt: -1 });
-    await User.collection.createIndex({ referralCode: 1 }, { sparse: true });
-    await User.collection.createIndex({ referredBy: 1 }, { sparse: true });
-    await User.collection.createIndex({ email: 1 }, { sparse: true });
-
-    /* Activity — live admin dashboard sorts by lastSeenAt */
-    await User.collection.createIndex({ 'activeSession.lastSeenAt': -1 }, { sparse: true });
-
-    /* Contributions / feedback admin lists */
-    await Contribution.collection.createIndex({ submittedAt: -1 });
-    await Feedback.collection.createIndex({ submittedAt: -1 });
-
-    console.log('[mongo] ✅ Indexes ensured');
+    console.log(failed ? `[mongo] ⚠️ Indexes ensured (${failed} failed)` : '[mongo] ✅ Indexes ensured');
   } catch (e) {
     console.warn('[mongo] Index creation warning (non-fatal):', e.message);
   }
@@ -3381,7 +3580,15 @@ const quizSessionSchema = new mongoose.Schema({
   autoSubmitted:   { type: Boolean, default: false },
 
   /* Time spent (seconds) on each ORIGINAL question index */
-  timeSpentPerQuestion: { type: mongoose.Schema.Types.Mixed, default: {} }
+  timeSpentPerQuestion: { type: mongoose.Schema.Types.Mixed, default: {} },
+
+  /* ⭐ 2026-10-10: answers autosaved during the attempt. If the final
+     submit arrives late (network down at time-up) or never arrives (tab
+     closed), the attempt is graded from these instead of being lost. */
+  savedAnswers:    { type: mongoose.Schema.Types.Mixed, default: null },
+  savedAt:         { type: Date, default: null },
+  /* proctoring log — survives a refresh, so reloading no longer resets strikes */
+  proctor:         { type: mongoose.Schema.Types.Mixed, default: null }
 }, { timestamps: true });
 
 quizSessionSchema.index({ userId: 1, courseId: 1, materialId: 1 }, { unique: true });
@@ -3640,7 +3847,7 @@ async function otpSet(key, data, ttlMs) {
         expiresAt: new Date(Date.now() + ttlMs),
         attempts: data.attempts || 0
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
     return true;
   } catch (e) {
@@ -3876,7 +4083,34 @@ function serializeUser(user) {
     referralStats: user.referralStats || {
       totalReferred: 0, totalSubscribed: 0, rewardsEarned: 0,
       rewardedFor: 0, lastRewardAt: null
-    }
+    },
+    /* ⭐ professor accounts only */
+    professor: String(user.role || '').toLowerCase() === 'professor' ? serializeProfessor(user) : undefined
+  };
+}
+
+function serializeProfessor(user) {
+  const p = (user && user.professor) || {};
+  return {
+    status:          p.status || 'pending',
+    designation:     p.designation || '',
+    department:      p.department || '',
+    institution:     p.institution || '',
+    qualification:   p.qualification || '',
+    specialization:  p.specialization || '',
+    experienceYears: p.experienceYears || 0,
+    employeeId:      p.employeeId || '',
+    profileUrl:      p.profileUrl || '',
+    bio:             p.bio || '',
+    appliedAt:       p.appliedAt || null,
+    reviewedAt:      p.reviewedAt || null,
+    reviewNote:      p.reviewNote || '',
+    courses:         Array.isArray(p.courses) ? p.courses.map(String) : [],
+    requests:        (p.requests || []).map(r => ({
+      _id: String(r._id), courseName: r.courseName || '', courseCode: r.courseCode || '',
+      message: r.message || '', status: r.status || 'pending', courseId: r.courseId || null,
+      requestedAt: r.requestedAt || null, reviewedAt: r.reviewedAt || null, reviewNote: r.reviewNote || ''
+    }))
   };
 }
 
@@ -4151,13 +4385,18 @@ function _buildZipBuffer(entries) {
      • It still uses HMAC-SHA256 with the same secret.
    ============================================================ */
 const SIGNED_URL_TTL_MS    = 24 * 60 * 60 * 1000;   // valid for up to 24h
-const SIGNED_URL_QUANTUM_MS = 60 * 60 * 1000;       // quantize to the hour
+/* ⚡ 2026-10-05: quantum 1h → 6h. The signed URL (and so the browser's
+   cached copy of the PDF) now stays the same for 6 hours instead of 1,
+   so re-opening a document is served from the browser cache far more
+   often. Tokens still expire 24–30 h after issue; tokens issued with the
+   old 1 h quantum stay valid (verify only checks the expiry + HMAC). */
+const SIGNED_URL_QUANTUM_MS = 6 * 60 * 60 * 1000;   // quantize to 6 hours
 
 function signUploadToken(filename, userId) {
   const target = Date.now() + SIGNED_URL_TTL_MS;
-  /* Round UP to the next whole hour. Repeated calls within the
-     same wall-clock hour return the same `expires`, hence the
-     same signature, hence the same URL. */
+  /* Round UP to the next quantum boundary. Repeated calls within the
+     same 6-hour window return the same `expires`, hence the same
+     signature, hence the same URL. */
   const expires = Math.ceil(target / SIGNED_URL_QUANTUM_MS) * SIGNED_URL_QUANTUM_MS;
   const payload = `${filename}:${userId}:${expires}`;
   const sig = crypto
@@ -4241,6 +4480,12 @@ async function serveUploadFile(filename, req, res) {
   if (process.env.USE_NGINX_ACCEL === 'true') {
     res.setHeader('X-Accel-Redirect', '/protected-uploads/' + filename);
     res.setHeader('Accept-Ranges', 'bytes');
+    /* ⚡ Let the student's browser keep the file: nginx passes this header
+       through, so a re-opened PDF / video comes from the device's cache. */
+    res.setHeader('Cache-Control',
+      ['.pdf', '.mp4', '.webm', '.mov', '.mp3'].includes(ext)
+        ? 'private, max-age=2592000, immutable'
+        : 'private, max-age=3600');
     res.setHeader('Content-Length', String(stat.size)); // ← now safe
     if (MIME_MAP[ext]) {
       res.setHeader('Content-Type', MIME_MAP[ext]);
@@ -4318,9 +4563,13 @@ async function linearizePdf(diskPath) {
     /* FIX 1: Single-extension output name (Hostinger blocks "*.pdf.lin") */
     const outPath = diskPath.replace(/\.pdf$/i, '') + '-linearized.pdf';
 
+    /* ⚡ 2026-10-12: packed into object streams but no longer linearized —
+       PDF.js reads every page's dictionary before page 1, and linearizing
+       scatters them through the file (one round trip each on a phone).
+       Packed, they sit together near the start. See fastViewNameFor(). */
     execFile(
       'qpdf',
-      ['--linearize', '--object-streams=generate', diskPath, outPath],
+      ['--object-streams=generate', diskPath, outPath],
       { timeout: 60000, maxBuffer: 8 * 1024 * 1024 },
       (err, _stdout, stderr) => {
         /* FIX 2: Allow exit code 3 (success-with-warnings) */
@@ -4342,7 +4591,7 @@ async function linearizePdf(diskPath) {
           }
           fs.renameSync(outPath, diskPath);
           console.log(
-            '[linearize] ✅ Linearized:',
+            '[linearize] ✅ Packed for fast opening:',
             path.basename(diskPath),
             `(${Math.round(st.size / 1024)} KB)`,
             exitCode === 3 ? '(with warnings)' : ''
@@ -4361,7 +4610,26 @@ async function linearizePdf(diskPath) {
 /* ============================================================
    ADMIN 2FA — pending login store
    ============================================================ */
-const adminLoginStore = new Map(); // pendingId → { userId, otp, expiresAt, attempts }
+const adminLoginStore = new Map(); // pendingId → { userId, role, otp, expiresAt, attempts }
+
+/* Login-OTP email for admin + professor accounts (2026-10-08) */
+function _loginOtpMail(user, role, otp, to, resent) {
+  const who   = (user && (user.fullName || user.username)) || 'there';
+  const label = role === 'professor' ? 'Professor' : 'Admin';
+  const esc   = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  return {
+    to,
+    subject: `RankerNode — ${label} login code${resent ? ' (resent)' : ''}: ${otp}`,
+    text: `Hi ${who},\n\nYour ${label.toLowerCase()} login code is: ${otp}\n\nIt is valid for 10 minutes. Do not share it with anyone.\n\nIf you did not try to sign in, change your password right away.\n\n— RankerNode`,
+    html: `<div style="font-family:Inter,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;max-width:520px;margin:0 auto;padding:28px 22px;color:#14161c;line-height:1.6;background:#ffffff;">
+      <div style="font-size:13px;font-weight:700;letter-spacing:.6px;color:#6366f1;text-transform:uppercase;">RankerNode · ${label} sign-in</div>
+      <h2 style="font-size:20px;margin:10px 0 6px;">Hi ${esc(who)},</h2>
+      <p style="margin:0 0 18px;color:#4b5060;">Use this code to finish signing in. It expires in <strong>10 minutes</strong>.</p>
+      <div style="font-size:32px;font-weight:800;letter-spacing:10px;text-align:center;padding:16px;border-radius:12px;background:#f3f4ff;border:1px solid #dfe1ff;color:#1e1b4b;">${esc(otp)}</div>
+      <p style="margin:18px 0 0;font-size:13px;color:#8b8d98;">Never share this code. If you did not try to sign in, change your password right away.</p>
+    </div>`
+  };
+}
 
 /* ============================================================
    ADMIN SECURITY ALERT — emailed on any credential change
@@ -4595,26 +4863,63 @@ app.post('/api/login', async (req, res) => {
       });
     }
 
-    // ---------- Role check — LENIENT (warn only, never block) ----------
-    // The frontend auto-flips the role toggle when the username contains "admin".
-    // Trust the DB role instead of the UI tab to avoid locking out real students.
-    if (roleFromClient && user.role !== roleFromClient) {
-      console.warn(
-        `[login] ⚠️ role tab mismatch: DB="${user.role}" UI="${roleFromClient}" — proceeding with DB role.`
-      );
+    // ---------- ⭐ STRICT role tab (2026-10-09) ----------
+    // The account may only sign in from its own tab on the login page:
+    // a student from "Student", a professor from "Professor", the admin
+    // from "Admin". Checked after the password, so the account type is
+    // only revealed to someone who already knows the password.
+    {
+      const LOGIN_TABS = ['student', 'professor', 'admin'];
+      const tab = LOGIN_TABS.includes(String(roleFromClient || '').trim().toLowerCase())
+        ? String(roleFromClient).trim().toLowerCase() : 'student';
+      /* legacy / odd roles ('user', '', 'Student'…) count as students */
+      const rawRole = String(user.role || '').trim().toLowerCase();
+      const dbRole = rawRole === 'admin' || rawRole === 'professor' ? rawRole : 'student';
+      if (tab !== dbRole) {
+        const label = { student: 'Student', professor: 'Professor', admin: 'Admin' };
+        console.log(`[login] ⛔ "${user.username}" (${dbRole}) tried the ${tab} tab`);
+        return res.status(403).json({
+          success: false,
+          code: 'WRONG_LOGIN_TAB',
+          accountRole: label[dbRole] ? dbRole : 'student',
+          message: `These details belong to ${dbRole === 'admin' ? 'an' : 'a'} ${label[dbRole] || 'different'} account. Select the ${label[dbRole] || 'correct'} tab to sign in.`
+        });
+      }
     }
 
-    // ---------- Admin 2FA path ----------
-    if (String(user.role || '').trim().toLowerCase() === 'admin') {
-      const otpDestination = (user.email || process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    // ---------- ⭐ Professors: only approved accounts may sign in ----------
+    if (String(user.role || '').toLowerCase() === 'professor') {
+      const ps = (user.professor && user.professor.status) || 'pending';
+      if (ps !== 'approved') {
+        const msg = ps === 'rejected'
+          ? 'Your professor application was not approved.' + (user.professor.reviewNote ? ' Reason: ' + user.professor.reviewNote : '') + ' Please contact the admin.'
+          : ps === 'revoked'
+            ? 'Your professor access has been withdrawn by the admin.' + (user.professor.reviewNote ? ' Reason: ' + user.professor.reviewNote : '')
+            : 'Your professor account is waiting for admin approval. You will receive an email as soon as it is approved.';
+        console.log(`[login] ⏳ professor "${user.username}" not approved (status=${ps})`);
+        return res.status(403).json({ success: false, code: 'PROFESSOR_' + ps.toUpperCase(), professorStatus: ps, message: msg });
+      }
+    }
+
+    // (old lenient role-tab warning removed — the strict check above handles it)
+
+    // ---------- Email-OTP 2FA path: admin + professor (2026-10-08) ----------
+    const _otpRole = String(user.role || '').trim().toLowerCase();
+    if (_otpRole === 'admin' || _otpRole === 'professor') {
+      const isProfLogin = _otpRole === 'professor';
+      const otpDestination = (isProfLogin
+        ? (user.email || '')
+        : (user.email || process.env.ADMIN_EMAIL || '')).trim().toLowerCase();
       if (!otpDestination) {
         return res.status(400).json({
           success: false,
-          message: 'Admin has no email configured. Contact support.'
+          message: isProfLogin
+            ? 'No email address is registered for this professor account. Please contact the admin.'
+            : 'Admin has no email configured. Contact support.'
         });
       }
 
-      if (!user.email && process.env.ADMIN_EMAIL) {
+      if (!isProfLogin && !user.email && process.env.ADMIN_EMAIL) {
         try {
           user.email = otpDestination;
           await user.save();
@@ -4630,9 +4935,12 @@ app.post('/api/login', async (req, res) => {
       const pendingId = crypto.randomBytes(24).toString('hex');
       adminLoginStore.set(pendingId, {
         userId: user._id.toString(),
+        role: _otpRole,
         otp,
         expiresAt: Date.now() + 10 * 60 * 1000,
-        attempts: 0
+        attempts: 0,
+        resends: 0,
+        sentAt: Date.now()
       });
       setTimeout(() => adminLoginStore.delete(pendingId), 10 * 60 * 1000);
 
@@ -4640,13 +4948,9 @@ app.post('/api/login', async (req, res) => {
 
       try {
         await withTimeout(
-          transporter.sendMail({
-            to: otpDestination,
-            subject: 'RankerNode — Admin Login OTP',
-            text: `Hi ${user.fullName || user.username},\n\nYour admin login OTP is: ${otp}\n\nValid for 10 minutes. Do not share.\n\nIf this wasn't you, ignore this email.`
-          }),
+          transporter.sendMail(_loginOtpMail(user, _otpRole, otp, otpDestination, false)),
           30000,
-          'Admin 2FA OTP send'
+          (isProfLogin ? 'Professor' : 'Admin') + ' 2FA OTP send'
         );
       } catch (emailErr) {
         console.error('[login-2fa] ❌ OTP send failed for', otpDestination, '·', emailErr.message);
@@ -4665,10 +4969,11 @@ app.post('/api/login', async (req, res) => {
         });
       }
 
-      console.log('[login-2fa] OTP sent to', otpDestination);
+      console.log(`[login-2fa] OTP sent to ${otpDestination} (${_otpRole})`);
       return res.json({
         success: true,
         requires2FA: true,
+        otpRole: _otpRole,
         pendingToken,
         maskedEmail: maskEmail(otpDestination),
         message: 'Password verified. Enter the OTP sent to your email.'
@@ -4841,44 +5146,30 @@ app.post('/api/admin/login/verify-otp', async (req, res) => {
     adminLoginStore.delete(decoded.pendingId);
 
     const user = await User.findById(record.userId);
-    if (!user || String(user.role || '').trim().toLowerCase() !== 'admin') {
-      return res.status(401).json({ success: false, message: 'Admin account not found.' });
+    const role = String((user && user.role) || '').trim().toLowerCase();
+    if (!user || (role !== 'admin' && role !== 'professor') || (record.role && record.role !== role)) {
+      return res.status(401).json({ success: false, message: 'Account not found. Please log in again.' });
+    }
+    /* the account may have changed during the 10 minutes the code was valid */
+    if (user.suspended && user.suspended.active) {
+      return res.status(403).json({ success: false, code: 'SUSPENDED', message: 'This account has been suspended. Please contact the admin.' });
+    }
+    if (role === 'professor' && !(user.professor && user.professor.status === 'approved')) {
+      return res.status(403).json({ success: false, code: 'PROFESSOR_NOT_APPROVED', message: 'Your professor account is not active. Please contact the admin.' });
     }
 
-    // Single-device session — atomic write (see /api/login for rationale)
-    const sessionId  = crypto.randomBytes(24).toString('hex');
-    const deviceInfo = String(req.headers['user-agent'] || 'Unknown device').slice(0, 200);
-    const now        = new Date();
-
-    let sessionOk = false;
+    /* Admin → joins the device list (max ADMIN_MAX_SESSIONS);
+       professor → single device, like students. */
+    let sessionId, evicted = 0;
     try {
-      const upd = await User.updateOne(
-        { _id: user._id },
-        {
-          $set: {
-            activeSession: { sessionId, deviceInfo, loginAt: now, lastSeenAt: now }
-          }
-        }
-      );
-      sessionOk = !!(upd && (upd.matchedCount || 0) > 0);
-
-      if (sessionOk) {
-        const verify = await User.findById(user._id).select('activeSession').lean();
-        sessionOk = !!(verify &&
-                       verify.activeSession &&
-                       verify.activeSession.sessionId === sessionId);
-      }
+      ({ sessionId, evicted } = await _createLoginSession(user, req));
     } catch (sessErr) {
-      console.error('[login-2fa/verify] ❌ could not persist activeSession:', sessErr);
+      console.error('[login-2fa/verify] ❌ could not persist session:', sessErr);
       return res.status(500).json({ success: false, message: 'Could not establish session.' });
     }
 
-    if (!sessionOk) {
-      return res.status(500).json({ success: false, message: 'Could not establish session.' });
-    }
-
-    console.log(`[login-2fa] 🔐 session issued · user=${user.username} · sid=${sessionId.slice(0,8)}…`);
-    _clearAuthUserCache();
+    console.log(`[login-2fa] 🔐 session issued · ${role}=${user.username} · sid=${sessionId.slice(0,8)}…` +
+                (evicted ? ` · signed out ${evicted} older device(s)` : ''));
 
     const token = jwt.sign(
       { id: user._id, role: user.role, sessionId },
@@ -4886,12 +5177,14 @@ app.post('/api/admin/login/verify-otp', async (req, res) => {
       { expiresIn: '1d' }
     );
 
-    console.log('[login-2fa] ✅ Admin login success:', user.username);
+    console.log(`[login-2fa] ✅ ${role} login success:`, user.username);
     return res.json({
       success: true,
       message: 'Login successful!',
       token,
-      user: serializeUser(user)
+      user: serializeUser(user),
+      maxSessions: role === 'admin' ? ADMIN_MAX_SESSIONS : 1,
+      evictedDevices: evicted
     });
 
   } catch (e) {
@@ -4937,7 +5230,7 @@ app.get('/api/auth/session-check', async (req, res) => {
     }
 
     const user = await User.findById(decoded.id)
-      .select('activeSession role username suspended')
+      .select('activeSession sessions role username suspended')
       .lean();
 
     if (!user) {
@@ -4956,41 +5249,33 @@ app.get('/api/auth/session-check', async (req, res) => {
       });
     }
 
-    const currentSessionId = user.activeSession && user.activeSession.sessionId;
-
-    /* ⭐ 2026-10-04: an empty activeSession means the user logged out (or an
-       admin forced a sign-out). That token must not be accepted any more. */
-    if (!currentSessionId) {
-      return res.status(401).json({
-        success: false,
-        code: 'SESSION_ENDED',
-        message: 'You have been signed out. Please log in again.'
-      });
-    }
-
-    if (currentSessionId !== decoded.sessionId) {
-      console.log(
-        `[session-check] ⚠️  session replaced · user=${user.username}` +
-        ` · token=${String(decoded.sessionId).slice(0,8)}…` +
-        ` · current=${String(currentSessionId).slice(0,8)}…`
-      );
-      return res.status(401).json({
-        success: false,
-        code: 'SESSION_REPLACED',
-        message: 'You were signed out because this account was just signed in on another device.'
-      });
+    /* ⭐ 2026-10-08: one verdict for every role (admin = up to
+       ADMIN_MAX_SESSIONS devices, everyone else = one device). */
+    const bad = _sessionVerdict(user, decoded.sessionId);
+    if (bad) {
+      if (bad.code === 'SESSION_REPLACED') {
+        console.log(`[session-check] ⚠️  session replaced · user=${user.username} · token=${String(decoded.sessionId).slice(0,8)}…`);
+      }
+      return res.status(401).json({ success: false, code: bad.code, message: bad.message });
     }
 
     // Fire-and-forget lastSeen update (throttled to at most 1 write / 5 min)
     const now = Date.now();
-    const lastSeen = user.activeSession.lastSeenAt
-      ? new Date(user.activeSession.lastSeenAt).getTime()
-      : 0;
-    if (now - lastSeen > 5 * 60 * 1000) {
-      User.updateOne(
-        { _id: user._id },
-        { $set: { 'activeSession.lastSeenAt': new Date() } }
-      ).catch(() => {});
+    const THROTTLE = 5 * 60 * 1000;
+    const act = user.activeSession || {};
+    if (act.sessionId === decoded.sessionId) {
+      const lastSeen = act.lastSeenAt ? new Date(act.lastSeenAt).getTime() : 0;
+      if (now - lastSeen > THROTTLE) {
+        User.updateOne({ _id: user._id }, { $set: { 'activeSession.lastSeenAt': new Date() } }).catch(() => {});
+      }
+    }
+    if (_isAdminRole(user) && Array.isArray(user.sessions)) {
+      const mine = user.sessions.find(s => s && s.sessionId === decoded.sessionId);
+      const lastSeen = mine && mine.lastSeenAt ? new Date(mine.lastSeenAt).getTime() : 0;
+      if (mine && now - lastSeen > THROTTLE) {
+        User.updateOne({ _id: user._id, 'sessions.sessionId': decoded.sessionId },
+                       { $set: { 'sessions.$.lastSeenAt': new Date() } }).catch(() => {});
+      }
     }
 
     res.json({ success: true, valid: true });
@@ -5019,13 +5304,25 @@ app.post('/api/auth/logout', async (req, res) => {
       return res.json({ success: true, message: 'Session already expired.' });
     }
 
-    const user = await User.findById(decoded.id).select('activeSession');
-    if (user && user.activeSession && user.activeSession.sessionId === decoded.sessionId) {
-      user.activeSession.sessionId = null;
-      user.activeSession.loginAt = null;
-      user.activeSession.lastSeenAt = null;
-      await user.save();
-      _clearAuthUserCache();
+    const user = await User.findById(decoded.id).select('activeSession sessions role').lean();
+    if (user && decoded.sessionId) {
+      const sid = String(decoded.sessionId);
+      const remaining = (_isAdminRole(user) && Array.isArray(user.sessions))
+        ? user.sessions.filter(s => s && s.sessionId && s.sessionId !== sid)
+        : [];
+      const set = {};
+      if (_isAdminRole(user) && remaining.length !== (user.sessions || []).length) set.sessions = remaining;
+      if (user.activeSession && user.activeSession.sessionId === sid) {
+        /* admin: the newest remaining device becomes the mirrored one */
+        const next = remaining.slice().sort((a, b) => new Date(b.loginAt || 0) - new Date(a.loginAt || 0))[0];
+        set.activeSession = next
+          ? { sessionId: next.sessionId, deviceInfo: next.deviceInfo || '', loginAt: next.loginAt, lastSeenAt: next.lastSeenAt }
+          : { sessionId: null, deviceInfo: (user.activeSession.deviceInfo || ''), loginAt: null, lastSeenAt: null };
+      }
+      if (Object.keys(set).length) {
+        await User.updateOne({ _id: user._id }, { $set: set });
+        _clearAuthUserCache();
+      }
     }
 
     res.json({ success: true, message: 'Logged out.' });
@@ -5033,6 +5330,82 @@ app.post('/api/auth/logout', async (req, res) => {
     console.error('[auth/logout]', e);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
+});
+
+/* ============================================================
+   ⭐ ADMIN — signed-in devices (2026-10-08)
+   GET  /api/admin/sessions              list (max ADMIN_MAX_SESSIONS)
+   POST /api/admin/sessions/:sid/revoke  sign one device out
+   POST /api/admin/sessions/revoke-others  keep only this device
+   ============================================================ */
+function _tokenSessionId(req) {
+  try {
+    const t = _extractToken(req, false);
+    const d = t ? jwt.verify(t, JWT_SECRET, JWT_VERIFY_OPTS) : null;
+    return d && d.sessionId ? String(d.sessionId) : null;
+  } catch (_) { return null; }
+}
+async function _adminSessionList(userId) {
+  const u = await User.findById(userId).select('sessions activeSession role').lean();
+  if (!u) return [];
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  const list = (u.sessions || []).filter(s => s && s.sessionId && new Date(s.loginAt || 0).getTime() > cutoff);
+  const a = u.activeSession;
+  if (a && a.sessionId && !list.some(s => s.sessionId === a.sessionId)) {
+    list.push({ sessionId: a.sessionId, deviceInfo: a.deviceInfo || '', ip: '', loginAt: a.loginAt, lastSeenAt: a.lastSeenAt });
+  }
+  return list;
+}
+app.get('/api/admin/sessions', requireAdminAuth, async (req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    const mine = _tokenSessionId(req);
+    const list = await _adminSessionList(req.adminUser._id);
+    list.sort((a, b) => new Date(b.lastSeenAt || b.loginAt || 0) - new Date(a.lastSeenAt || a.loginAt || 0));
+    res.json({
+      success: true,
+      max: ADMIN_MAX_SESSIONS,
+      sessions: list.map(s => ({
+        id: crypto.createHash('sha256').update(String(s.sessionId)).digest('hex').slice(0, 16),
+        device: _shortDevice(s.deviceInfo),
+        ip: s.ip || '',
+        loginAt: s.loginAt || null,
+        lastSeenAt: s.lastSeenAt || s.loginAt || null,
+        current: s.sessionId === mine
+      }))
+    });
+  } catch (e) {
+    console.error('[admin/sessions]', e);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+async function _adminRevokeSessions(req, res, keepFn) {
+  try {
+    const mine = _tokenSessionId(req);
+    const list = await _adminSessionList(req.adminUser._id);
+    const keep = list.filter(s => keepFn(s, mine));
+    if (keep.length === list.length) return res.status(404).json({ success: false, message: 'Device not found — it may already be signed out.' });
+    const current = keep.find(s => s.sessionId === mine) || keep[0] || null;
+    await User.updateOne({ _id: req.adminUser._id }, { $set: {
+      sessions: keep,
+      activeSession: current
+        ? { sessionId: current.sessionId, deviceInfo: current.deviceInfo || '', loginAt: current.loginAt, lastSeenAt: current.lastSeenAt }
+        : { sessionId: null, deviceInfo: '', loginAt: null, lastSeenAt: null }
+    } });
+    _clearAuthUserCache();
+    console.log(`[admin/sessions] 🔌 ${req.adminUser.username} signed out ${list.length - keep.length} device(s)`);
+    res.json({ success: true, removed: list.length - keep.length });
+  } catch (e) {
+    console.error('[admin/sessions/revoke]', e);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+}
+const _sidHash = (sid) => crypto.createHash('sha256').update(String(sid)).digest('hex').slice(0, 16);
+app.post('/api/admin/sessions/revoke-others', requireAdminAuth, (req, res) =>
+  _adminRevokeSessions(req, res, (s, mine) => s.sessionId === mine));
+app.post('/api/admin/sessions/:id/revoke', requireAdminAuth, (req, res) => {
+  const target = String(req.params.id || '');
+  return _adminRevokeSessions(req, res, (s, mine) => s.sessionId === mine || _sidHash(s.sessionId) !== target);
 });
 
 /* ============================================================
@@ -5055,31 +5428,42 @@ app.post('/api/admin/login/resend-otp', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Session expired. Please log in again.' });
     }
 
+    /* ⭐ 2026-10-08: at most 5 resends per sign-in, 30 s apart — otherwise
+       "resend" would hand out unlimited fresh guessing attempts. */
+    if ((oldRecord.resends || 0) >= 5) {
+      return res.status(429).json({ success: false, message: 'Too many codes requested. Please sign in again.' });
+    }
+    const _waitMs = 30000 - (Date.now() - (oldRecord.sentAt || 0));
+    if (_waitMs > 0) {
+      return res.status(429).json({ success: false, retryAfter: Math.ceil(_waitMs / 1000), message: `Please wait ${Math.ceil(_waitMs / 1000)} s before asking for a new code.` });
+    }
+
     const user = await User.findById(oldRecord.userId);
-    if (!user) return res.status(404).json({ success: false, message: 'Admin account not found.' });
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
 
     // Generate new OTP + new pendingId (single-use)
     const newOtp = crypto.randomInt(100000, 1000000).toString();
     const newPendingId = crypto.randomBytes(24).toString('hex');
     adminLoginStore.set(newPendingId, {
       userId: user._id.toString(),
+      role: oldRecord.role || String(user.role || '').trim().toLowerCase(),
       otp: newOtp,
       expiresAt: Date.now() + 10 * 60 * 1000,
-      attempts: 0
+      attempts: 0,
+      resends: (oldRecord.resends || 0) + 1,
+      sentAt: Date.now()
     });
     adminLoginStore.delete(decoded.pendingId);  // invalidate the old one
     setTimeout(() => adminLoginStore.delete(newPendingId), 10 * 60 * 1000);
 
     const newPendingToken = jwt.sign({ pendingId: newPendingId }, JWT_SECRET, { expiresIn: '10m' });
 
+    const _resendRole = oldRecord.role || String(user.role || '').trim().toLowerCase();
+    const _resendTo = _resendRole === 'professor' ? user.email : (user.email || process.env.ADMIN_EMAIL);
     await withTimeout(
-      transporter.sendMail({
-        to: user.email || process.env.ADMIN_EMAIL,
-        subject: 'RankerNode — Admin Login OTP (resent)',
-        text: `Hi ${user.fullName || user.username},\n\nYour new admin login OTP is: ${newOtp}\n\nValid for 10 minutes. Do not share.`
-      }),
+      transporter.sendMail(_loginOtpMail(user, _resendRole, newOtp, _resendTo, true)),
       30000,
-      'Admin 2FA resend'
+      'Login 2FA resend'
     );
 
     res.json({ success: true, message: 'New OTP sent to your email.', pendingToken: newPendingToken });
@@ -5218,7 +5602,7 @@ app.post('/api/send-otp', async (req, res) => {
     sendSMS(cleanPhone, `RankerNode: Your registration OTP is ${otp}. Valid for 10 min. Do not share.`)
       .catch(() => {});
 
-    res.json({ success: true, message: 'OTP sent to your email and phone.' });
+    res.json({ success: true, message: (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_PHONE_NUMBER) ? 'OTP sent to your email and phone.' : 'OTP sent to your email.' });
   } catch (e) {
     console.error('[send-otp] Error:', e.message);
     res.status(500).json({ success: false, message: 'Error sending OTP: ' + e.message });
@@ -5620,7 +6004,9 @@ app.post('/api/forgot-password/reset', async (req, res) => {
     user.password = await bcrypt.hash(newPassword, 10);
     /* ⭐ A password reset ends every existing session (stolen tokens die too). */
     if (user.activeSession) user.activeSession.sessionId = null;
+    user.sessions = [];   // ⭐ admin: every device is signed out
     await user.save();
+    _clearAuthUserCache();
 
     // Notify admins that their password was reset via recovery
     if (user.role === 'admin') {
@@ -5700,6 +6086,7 @@ app.post('/api/admin/reset-password/:userId', requireAdminAuth, async (req, res)
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     user.password = await bcrypt.hash(String(newPassword), 10);
     if (user.activeSession) user.activeSession.sessionId = null;   // ⭐ old sessions end
+    user.sessions = [];
     await user.save();
     _clearAuthUserCache();
     res.json({ success: true, message: 'Password reset successfully.', password: newPassword });
@@ -5972,7 +6359,7 @@ app.put('/api/professors/:id/visibility', requireAdminAuth, async (req, res) => 
     const updated = await Professor.findByIdAndUpdate(
       req.params.id,
       { $set: { visible } },
-      { new: true }
+      { returnDocument: 'after' }
     );
 
     if (!updated) {
@@ -6002,6 +6389,38 @@ app.put('/api/professors/:id/visibility', requireAdminAuth, async (req, res) => 
 /* Course list — LIGHTWEIGHT VERSION
    Strips: fileData (base64), quiz questions
    Keeps: quizCount (computed), basic metadata, playlists, announcements */
+/* The slim course-list projection (shared by the public list and the
+   professor's own list). */
+const COURSE_LIST_PROJECT_STAGE = {
+    $project: {
+      name: 1, code: 1, semester: 1, instructor: 1, description: 1,
+      category: 1, difficulty: 1, duration: 1, credits: 1, language: 1,
+      learningOutcomes: 1, thumbnail: 1, status: 1, featured: 1,
+      isPremium: 1, price: 1, announcements: 1, playlists: 1,
+      certificate: 1, sortOrder: 1,
+      tracks: 1, subject: 1, chapters: 1,
+      createdAt: 1, updatedAt: 1,
+      doubtsCount: { $size: { $ifNull: ['$doubts', []] } },
+      materials: {
+        $map: {
+          input: { $ifNull: ['$materials', []] },
+          as: 'm',
+          in: {
+            _id: '$$m._id', title: '$$m.title', type: '$$m.type',
+            description: '$$m.description', url: '$$m.url',
+            fileName: '$$m.fileName', isPremium: '$$m.isPremium',
+            price: '$$m.price',
+            previewPercent: '$$m.previewPercent',
+            estimatedTime: '$$m.estimatedTime',
+            tags: '$$m.tags', examConfig: '$$m.examConfig',
+            chapterId: '$$m.chapterId',
+            quizCount: { $size: { $ifNull: ['$$m.quiz', []] } }
+          }
+        }
+      }
+    }
+  };
+
 app.get('/api/courses', async (req, res) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page) || 1);
@@ -6009,7 +6428,15 @@ app.get('/api/courses', async (req, res) => {
     const skip  = (page - 1) * limit;
 
     const cacheKey = `courses:list:${page}:${limit}`;
+    /* ⭐ A professor sees only the courses approved for them */
+    const profScope = await _professorScope(req);
+    const sendScoped = (payload) => {
+      res.setHeader('Cache-Control', 'private, no-store');
+      const courses = (payload.courses || []).filter(c => profScope.has(String(c._id)));
+      return res.json(Object.assign({}, payload, { courses, pagination: { page: 1, limit, total: courses.length, totalPages: 1, hasMore: false } }));
+    };
     const cached = cacheGet(cacheKey);
+    if (cached && profScope) return sendScoped(cached);
     if (cached) {
       res.setHeader('X-Cache', 'HIT');
       // ⚡ Let the browser reuse this for 30s → instant repeat navigations.
@@ -6020,38 +6447,15 @@ app.get('/api/courses', async (req, res) => {
 
     const [courses, total] = await Promise.all([
       Course.aggregate([
-        { $sort: { featured: -1, createdAt: -1 } },
+        /* ⭐ 2026-10-05: the admin's course order. The slim $project runs
+           FIRST so the sort only ever handles small documents (never the
+           materials' base64 data), then the admin order is applied —
+           courses without a position first (featured, then name), then
+           by position. The app sorts the same way on screen. */
+        COURSE_LIST_PROJECT_STAGE,
+        { $sort: { sortOrder: 1, featured: -1, name: 1, _id: 1 } },
         { $skip: skip },
-        { $limit: limit },
-        {
-          $project: {
-            name: 1, code: 1, semester: 1, instructor: 1, description: 1,
-            category: 1, difficulty: 1, duration: 1, credits: 1, language: 1,
-            learningOutcomes: 1, thumbnail: 1, status: 1, featured: 1,
-            isPremium: 1, price: 1, announcements: 1, playlists: 1,
-            tracks: 1, subject: 1, chapters: 1,
-            certificate: 1,
-            createdAt: 1, updatedAt: 1,
-            doubtsCount: { $size: { $ifNull: ['$doubts', []] } },
-            materials: {
-              $map: {
-                input: { $ifNull: ['$materials', []] },
-                as: 'm',
-                in: {
-                  _id: '$$m._id', title: '$$m.title', type: '$$m.type',
-                  description: '$$m.description', url: '$$m.url',
-                  fileName: '$$m.fileName', isPremium: '$$m.isPremium',
-                  price: '$$m.price',
-                  previewPercent: '$$m.previewPercent',
-                  estimatedTime: '$$m.estimatedTime',
-                  tags: '$$m.tags', examConfig: '$$m.examConfig',
-                  chapterId: '$$m.chapterId',
-                  quizCount: { $size: { $ifNull: ['$$m.quiz', []] } }
-                }
-              }
-            }
-          }
-        }
+        { $limit: limit }
       ]),
       Course.countDocuments()
     ]);
@@ -6067,6 +6471,7 @@ app.get('/api/courses', async (req, res) => {
     };
 
     cacheSet(cacheKey, payload, 60000);
+    if (profScope) return sendScoped(payload);
     res.setHeader('X-Cache', 'MISS');
     // ⚡ Browser-side 30s cache — repeat visits need zero network round trip.
     res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=180');
@@ -6077,19 +6482,613 @@ app.get('/api/courses', async (req, res) => {
   }
 });
 
+/* ============================================================
+   ⚡ PDF OPEN — fast lookups (2026-10-05)
+   ------------------------------------------------------------
+   _loadCourseWithOneMaterial: returns { _id, isPremium, price,
+   materials: [that one material] } — the same shape the /file
+   route used before, but MongoDB filters the array, so the other
+   materials' quizzes and legacy base64 PDFs are no longer read
+   into Node on every open. Falls back to the old full query if
+   the aggregation ever fails.
+   ============================================================ */
+async function _loadCourseWithOneMaterial(courseId, materialId) {
+  const mid = String(materialId || '');
+  try {
+    const rows = await Course.aggregate([
+      { $match: { _id: new mongoose.Types.ObjectId(String(courseId)) } },
+      { $project: {
+          isPremium: 1,
+          price: 1,
+          materials: {
+            $filter: {
+              input: { $ifNull: ['$materials', []] },
+              as: 'm',
+              cond: { $eq: [{ $toString: '$$m._id' }, mid] }
+            }
+          }
+      } },
+      { $limit: 1 }
+    ]);
+    return rows[0] || null;
+  } catch (e) {
+    console.warn('[file] slim lookup failed, using full lookup:', e.message);
+    return Course.findById(courseId).select('isPremium price materials').lean();
+  }
+}
+
+const _uploadRestores = new Map();          // filename → Promise<boolean>
+const UPLOAD_RESTORE_WAIT_MS = 20000;
+const UPLOAD_RESTORE_MAX_PARALLEL = 2;
+async function _restoreUploadFromBackup(fn, cloudUrl) {
+  try {
+    if (!/^[A-Za-z0-9._-]+$/.test(fn)) return false;
+    const src = /^https:\/\//i.test(String(cloudUrl || '')) ? String(cloudUrl) : readCloudSidecar(fn);
+    if (!src || !/^https:\/\//i.test(src)) return false;
+    let job = _uploadRestores.get(fn);
+    if (!job) {
+      if (_uploadRestores.size >= UPLOAD_RESTORE_MAX_PARALLEL) return false;
+      console.log('[uploads] ☁️  restoring missing file from backup:', fn);
+      job = _ensureLocalOriginal(fn, src)
+        .then(p => !!p)
+        .catch(() => false)
+        .finally(() => _uploadRestores.delete(fn));
+      _uploadRestores.set(fn, job);
+    }
+    let timer;
+    const timeout = new Promise(r => { timer = setTimeout(() => r(false), UPLOAD_RESTORE_WAIT_MS); });
+    const ok = await Promise.race([job, timeout]);
+    clearTimeout(timer);
+    return ok === true && fs.existsSync(path.join(UPLOAD_DIR, fn));
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ============================================================
+   ⚡ FAST-VIEW COPIES OF PDFs (2026-10-05)
+   ------------------------------------------------------------
+   Why large PDFs opened slowly: before PDF.js shows anything it
+   reads the dictionary of EVERY page (to check the page count).
+   In most PDFs — Word/scanner exports, and also the files our own
+   "linearize" step produced — those small dictionaries are spread
+   through the whole file, so the browser effectively had to
+   download the entire PDF before page 1 appeared (20 MB ≈ 20 s+
+   on a phone).
+
+   Fix: a re-packed copy, made once per file with qpdf
+   (--object-streams=generate), stores all those dictionaries
+   together in a few compressed blocks. Same pages, same bytes for
+   images and text — only the internal layout changes. PDF.js then
+   needs a few small range requests for page 1 (measured: 19 s →
+   0.7 s on 20 Mbit/s, 62 s → 2.7 s on a slow 5 Mbit/s link).
+
+   Safety:
+     • The ORIGINAL file is never modified — the copy is a new file
+       next to it (<name>_fastview.pdf), so no cached URL changes.
+     • The copy is served ONLY through a signed URL issued by
+       /file?meta=1 to users with full access (or to admins);
+       anything else gets 403.
+     • Built in the background, one at a time, only when the disk
+       has plenty of free space; any failure → the original is used.
+     • The copy is ignored automatically if the original is newer.
+   ============================================================ */
+/* ⚡ FAST-VIEW v2 (2026-10-07)
+   The fast-view copy is now built in two steps, in a separate low-
+   priority process so the web server never stalls:
+     1. pdf-optimizer.js shrinks page images that are far larger than
+        any screen can show (typical for scanned / photographed notes:
+        12-megapixel JPEG per page → ~4 MP, ≈ 60 % smaller file),
+     2. qpdf linearizes it ("web-optimized": page 1 at the front of the
+        file) and packs objects — when qpdf is installed.
+   Either step alone still produces a useful copy. The original upload
+   is never changed. v1 copies (…_fastview.pdf) are replaced by v2
+   copies (…_fastview2.pdf) automatically on the next open. */
+const FASTVIEW_ANY_RE         = /_fastview\d*(?:_tmp[a-f0-9]{6})?\.pdf$/i;
+const FASTVIEW_MIN_BYTES      = 1024 * 1024;               // smaller PDFs load in one request anyway
+const FASTVIEW_MAX_BYTES      = 500 * 1024 * 1024;
+const FASTVIEW_OPTIMIZE_MAX_BYTES = 150 * 1024 * 1024;     // image step: bounded memory
+const FASTVIEW_MIN_FREE_BYTES = 3 * 1024 * 1024 * 1024;    // keep ≥ 3 GB free on the disk
+const FASTVIEW_PREV_KEEP_MS   = 3 * 60 * 60 * 1000;        // a replaced v3 copy stays readable this long
+const _fastViewQueue  = [];
+const _fastViewQueued = new Set();
+const _fastViewSkip   = new Map();       // filename → original mtime that could not be improved
+let   _fastViewBusy   = false;
+let   _fastViewNoQpdf = false;           // qpdf missing → image step only
+
+/* ⭐ 2026-10-12 — v3: page pictures are kept at ~290 dpi / quality 85 (v2 kept
+   ~200 dpi / 80, which made small handwriting and fine print soft once a
+   student zoomed in on a laptop). v2 copies are rebuilt as v3 and removed. */
+/* ⭐ 2026-10-12 — v4: same pictures as v3, but NOT linearized. Before showing
+   anything PDF.js reads the dictionary of every page; linearizing puts each
+   page's dictionary next to that page's pictures, scattered through the file,
+   so a phone paid one round trip per page before page 1 (measured on a 6-page,
+   8 MB file at 300 ms / 3 Mbit: 12.9 s → 6.3 s to page 1). Packed into object
+   streams without linearizing, all of them sit together near the start. v4 is
+   made from an existing v3 copy with qpdf alone (the images are already done). */
+function fastViewNameFor(fn) { return String(fn).replace(/\.pdf$/i, '_fastview4.pdf'); }
+function _prevFastViewNameFor(fn) { return String(fn).replace(/\.pdf$/i, '_fastview3.pdf'); }
+function _oldFastViewNamesFor(fn) { return ['_fastview.pdf', '_fastview2.pdf', '_fastview3.pdf'].map(sfx => String(fn).replace(/\.pdf$/i, sfx)); }
+
+/* The fast copy's filename when an up-to-date one exists; otherwise
+   null (and a copy is queued so the next open is fast). */
+function fastViewFor(fn) {
+  try {
+    fn = String(fn || '');
+    if (!/^[A-Za-z0-9._-]+\.pdf$/i.test(fn) || FASTVIEW_ANY_RE.test(fn)) return null;
+    posterInfoFor(fn);                       // queues the instant posters if missing
+    const st = fs.statSync(path.join(UPLOAD_DIR, fn));
+    if (!st.isFile() || st.size < FASTVIEW_MIN_BYTES || st.size > FASTVIEW_MAX_BYTES) return null;
+    const fv = fastViewNameFor(fn);
+    let fst = null;
+    try { fst = fs.statSync(path.join(UPLOAD_DIR, fv)); } catch (_) {}
+    if (fst && fst.isFile() && fst.size > 1024 && fst.mtimeMs >= st.mtimeMs) {
+      /* a v3 copy left behind by a restart before its delayed clean-up */
+      if (Date.now() - fst.mtimeMs > FASTVIEW_PREV_KEEP_MS) fs.promises.rm(path.join(UPLOAD_DIR, _prevFastViewNameFor(fn)), { force: true }).catch(() => {});
+      return fv;
+    }
+    _queueFastView(fn, st.mtimeMs);
+    /* until the new copy is ready, the previous one is still far better than the original */
+    const prev = _prevFastViewNameFor(fn);
+    try { const pst = fs.statSync(path.join(UPLOAD_DIR, prev)); if (pst.isFile() && pst.size > 1024 && pst.mtimeMs >= st.mtimeMs) return prev; } catch (_) {}
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _queueFastView(fn, mtimeMs) {
+  if (_fastViewQueued.has(fn) || _fastViewSkip.get(fn) === mtimeMs) return;
+  if (_fastViewQueue.length >= 500) return;
+  _fastViewQueued.add(fn);
+  _fastViewQueue.push(fn);
+  if (!_fastViewBusy) {
+    _fastViewBusy = true;
+    setImmediate(_runFastViewQueue);
+  }
+}
+
+async function _runFastViewQueue() {
+  try {
+    while (_fastViewQueue.length || _posterQueue.length) {
+      /* posters first — they take ~2 s and make the next open instant */
+      if (_posterQueue.length) {
+        const fn = _posterQueue.shift();
+        try { await _buildPosters(fn); }
+        catch (e) { console.warn('[posters]', fn, '·', e.message); }
+        finally { _posterQueued.delete(fn); }
+        continue;
+      }
+      const fn = _fastViewQueue.shift();
+      try { await _buildFastView(fn); }
+      catch (e) { console.warn('[fastview]', fn, '·', e.message); }
+      finally { _fastViewQueued.delete(fn); }
+    }
+  } finally {
+    _fastViewBusy = false;
+  }
+}
+
+/* ============================================================
+   ⚡ INSTANT POSTERS (2026-10-07)
+   ------------------------------------------------------------
+   <name>_poster1..3.jpg + <name>_posterinfo.json next to each PDF:
+   light pictures of the first pages that the reader shows the moment
+   it opens, while the real pages are prepared behind them. Built once
+   per file in the background (pdf-optimizer.js; pages that are not a
+   single scanned picture are drawn with pdftoppm when installed).
+   Served only through /api/…/poster/:n with the normal access check.
+   ============================================================ */
+const POSTER_RE = /_poster(?:\d+\.jpg|info\.json)$/i;
+const POSTER_PAGES = 3;
+const _posterQueue  = [];
+const _posterQueued = new Set();
+const _posterTried  = new Map();     // filename → source mtime already attempted
+const _posterInfoCache = new Map();  // filename → { mtimeMs, info }
+let   _noPdftoppm = false;
+function posterPrefixFor(fn) { return String(fn).replace(/\.pdf$/i, '') + '_poster'; }
+
+function posterInfoFor(fn) {
+  try {
+    fn = String(fn || '');
+    if (!/^[A-Za-z0-9._-]+\.pdf$/i.test(fn) || FASTVIEW_ANY_RE.test(fn)) return null;
+    const st = fs.statSync(path.join(UPLOAD_DIR, fn));
+    const ip = path.join(UPLOAD_DIR, posterPrefixFor(fn) + 'info.json');
+    let ist = null;
+    try { ist = fs.statSync(ip); } catch (_) {}
+    if (!ist || ist.mtimeMs < st.mtimeMs) { _queuePosters(fn, st.mtimeMs); return null; }
+    const c = _posterInfoCache.get(fn);
+    if (c && c.mtimeMs === ist.mtimeMs) return c.info;
+    const info = JSON.parse(fs.readFileSync(ip, 'utf8'));
+    _posterInfoCache.set(fn, { mtimeMs: ist.mtimeMs, info });
+    if (_posterInfoCache.size > 2000) _posterInfoCache.clear();
+    return info;
+  } catch (_) { return null; }
+}
+
+function _queuePosters(fn, mtimeMs) {
+  if (_posterQueued.has(fn) || _posterTried.get(fn) === mtimeMs) return;
+  if (_posterQueue.length >= 500) return;
+  _posterQueued.add(fn);
+  _posterQueue.push(fn);
+  if (!_fastViewBusy) { _fastViewBusy = true; setImmediate(_runFastViewQueue); }
+}
+
+function _runPdftoppm(src, n, outRoot) {
+  return new Promise((resolve) => {
+    if (_noPdftoppm) return resolve(false);
+    execFile('pdftoppm', ['-f', String(n), '-l', String(n), '-singlefile', '-jpeg', '-jpegopt', 'quality=72',
+                          '-scale-to-x', '1000', '-scale-to-y', '-1', src, outRoot],
+      { timeout: 60000 }, (err) => {
+        if (err && err.code === 'ENOENT') {
+          _noPdftoppm = true;
+          console.warn('[posters] pdftoppm is not installed — instant previews are made for scanned PDFs only (sudo apt install poppler-utils adds all PDFs).');
+        }
+        resolve(!err);
+      });
+  });
+}
+
+async function _buildPosters(fn) {
+  const src = path.join(UPLOAD_DIR, fn);
+  const st = await fs.promises.stat(src);
+  _posterTried.set(fn, st.mtimeMs);
+  const prefix = path.join(UPLOAD_DIR, posterPrefixFor(fn));
+  /* the fast copy (smaller pictures) is quicker to read when it exists */
+  let from = src;
+  try {
+    const fst = await fs.promises.stat(path.join(UPLOAD_DIR, fastViewNameFor(fn)));
+    if (fst.mtimeMs >= st.mtimeMs) from = path.join(UPLOAD_DIR, fastViewNameFor(fn));
+  } catch (_) {}
+  const t0 = Date.now();
+  let info = null;
+  if (st.size <= FASTVIEW_OPTIMIZE_MAX_BYTES) {
+    const r = await _runPdfOptimizer(from, prefix, ['--posters']);
+    if (r && typeof r.numPages === 'number') info = r;
+  }
+  if (!info) info = { numPages: 0, pages: {}, made: [], missing: [1, 2, 3] };
+  for (const n of (info.missing || []).slice()) {
+    if (info.numPages && n > info.numPages) continue;
+    if (await _runPdftoppm(from, n, prefix + n)) {
+      try { await fs.promises.access(prefix + n + '.jpg'); info.made.push(n); info.missing = info.missing.filter(x => x !== n); } catch (_) {}
+    }
+  }
+  info.made.sort((a, b) => a - b);
+  await fs.promises.writeFile(prefix + 'info.json', JSON.stringify(info));
+  _posterInfoCache.delete(fn);
+  if (info.made.length) console.log(`[posters] 🖼  ${fn}: page(s) ${info.made.join(', ')} ready · ${Date.now() - t0} ms`);
+}
+
+/* GET /api/courses/:courseId/materials/:materialId/poster/:n
+   → JPEG of page n (1–3) for readers with full access. 404 (not cached)
+   while the posters are still being made — the reader simply skips them. */
+app.get('/api/courses/:courseId/materials/:materialId/poster/:n', attachUserFromToken, async (req, res) => {
+  const none = (code) => { res.setHeader('Cache-Control', 'no-store'); return res.status(code).end(); };
+  try {
+    if (!req.authUser) return none(401);
+    const n = parseInt(req.params.n, 10);
+    if (!(n >= 1 && n <= POSTER_PAGES)) return none(404);
+    if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) return none(400);
+    const course = await _loadCourseWithOneMaterial(req.params.courseId, req.params.materialId);
+    const mat = course && (course.materials || []).find(m => String(m._id) === String(req.params.materialId));
+    if (!mat) return none(404);
+    const access = evaluateMaterialAccess(req.authUser, course, mat);
+    if (!access.allowed) return none(403);
+    const g = checkBulkAccess(req.authUser, mat._id);
+    if (g.paused) return none(429);
+    const rawUrl = String(mat.url || '');
+    if (!rawUrl.startsWith('/uploads/')) return none(404);
+    const fn = path.basename(rawUrl.split('?')[0]);
+    if (!/^[A-Za-z0-9._-]+\.pdf$/i.test(fn)) return none(404);
+    const info = posterInfoFor(fn);
+    if (!info || !(info.made || []).includes(n)) return none(404);
+    const pg = (info.pages && info.pages[n]) || {};
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    res.setHeader('X-Pdf-Pages', String(info.numPages || 0));
+    res.setHeader('X-Page-W', String(pg.w || 0));
+    res.setHeader('X-Page-H', String(pg.h || 0));
+    res.setHeader('Content-Type', 'image/jpeg');
+    return res.sendFile(path.join(UPLOAD_DIR, posterPrefixFor(fn) + n + '.jpg'), { dotfiles: 'deny' }, (err) => {
+      if (err && !res.headersSent) none(404);
+    });
+  } catch (e) {
+    return none(500);
+  }
+});
+
+/* Image step in a child process (nice +10, 1 GB heap, 5 min cap). */
+function _runPdfOptimizer(src, out, extraArgs) {
+  return new Promise((resolve) => {
+    let child, outText = '';
+    try {
+      child = require('child_process').spawn(process.execPath,
+        ['--max-old-space-size=1024', path.join(__dirname, 'pdf-optimizer.js')].concat(extraArgs || [], [src, out]),
+        { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    } catch (e) { return resolve({ changed: false, reason: e.message }); }
+    try { require('os').setPriority(child.pid, 10); } catch (_) {}
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} }, 5 * 60 * 1000);
+    child.stdout.on('data', (d) => { if (outText.length < 4096) outText += d; });
+    child.on('error', () => {});
+    child.on('close', () => {
+      clearTimeout(timer);
+      try { resolve(JSON.parse(outText.trim().split('\n').pop())); }
+      catch (_) { resolve({ changed: false, reason: 'optimizer exited' }); }
+    });
+  });
+}
+
+function _runQpdf(args) {
+  return new Promise((resolve) => {
+    execFile('qpdf', args, { timeout: 180000, maxBuffer: 4 * 1024 * 1024 }, (err, _o, stderr) => {
+      if (!err) return resolve(true);
+      if (err.code === 'ENOENT') {
+        if (!_fastViewNoQpdf) console.warn('[fastview] qpdf is not installed — fast copies get the image step only (sudo apt install qpdf adds "page 1 first" ordering).');
+        _fastViewNoQpdf = true;
+        return resolve(false);
+      }
+      if (err.code === 3) return resolve(true);            // success with warnings
+      console.warn('[fastview] qpdf:', String(stderr || err.message || '').trim().split('\n')[0]);
+      resolve(false);
+    });
+  });
+}
+
+async function _isGoodPdf(fp) {
+  try {
+    const st = await fs.promises.stat(fp);
+    if (st.size < 1024) return false;
+    const head = Buffer.alloc(5);
+    const fh = await fs.promises.open(fp, 'r');
+    try { await fh.read(head, 0, 5, 0); } finally { await fh.close(); }
+    return head.toString('latin1') === '%PDF-';
+  } catch (_) { return false; }
+}
+
+async function _buildFastView(fn) {
+  const src = path.join(UPLOAD_DIR, fn);
+  const out = path.join(UPLOAD_DIR, fastViewNameFor(fn));
+  const st  = await fs.promises.stat(src);
+  try {
+    const o = await fs.promises.stat(out);
+    if (o.mtimeMs >= st.mtimeMs) return;                   // already up to date
+  } catch (_) {}
+
+  /* Disk guard — never let the copies fill the disk. */
+  if (typeof fs.promises.statfs === 'function') {
+    const sf = await fs.promises.statfs(UPLOAD_DIR);
+    const free = Number(sf.bavail) * Number(sf.bsize);
+    if (!(free > FASTVIEW_MIN_FREE_BYTES && free > st.size * 10)) {
+      _fastViewSkip.set(fn, st.mtimeMs);
+      console.warn('[fastview] skipped (low disk space):', fn);
+      return;
+    }
+  }
+
+  const tag = '_tmp' + crypto.randomBytes(3).toString('hex');
+  const base = out.replace(/\.pdf$/i, '');
+  const tmpOpt = base + tag + '.pdf';
+  const tmpLin = base + '_tmp' + crypto.randomBytes(3).toString('hex') + '.pdf';
+  const t0 = Date.now();
+  try {
+    /* 1) shrink oversized page images — or start from the v3 copy, whose images are already done */
+    let input = src, note = [];
+    const prev = path.join(UPLOAD_DIR, _prevFastViewNameFor(fn));
+    let prevOk = false;
+    try { prevOk = (await fs.promises.stat(prev)).mtimeMs >= st.mtimeMs && await _isGoodPdf(prev); } catch (_) {}
+    if (prevOk && !_fastViewNoQpdf) {
+      input = prev;
+      note.push('from v3');
+    } else if (st.size <= FASTVIEW_OPTIMIZE_MAX_BYTES) {
+      const r = await _runPdfOptimizer(src, tmpOpt);
+      if (r && r.changed && await _isGoodPdf(tmpOpt)) {
+        input = tmpOpt;
+        note.push(`images ${r.resized}/${r.images} resized`);
+      }
+    }
+    /* 2) pack every page dictionary into object streams near the start (NOT linearized — see fastViewNameFor) */
+    let result = null;
+    if (!_fastViewNoQpdf && await _runQpdf(['--object-streams=generate', '--stream-data=preserve', input, tmpLin]) &&
+        await _isGoodPdf(tmpLin)) {
+      result = tmpLin;
+      note.push('packed');
+    } else if (input !== src && input !== prev) {
+      result = input;
+    }
+    if (!result) { _fastViewSkip.set(fn, st.mtimeMs); return; }
+
+    const st2 = await fs.promises.stat(src);
+    if (st2.mtimeMs !== st.mtimeMs) { _fastViewSkip.set(fn, st.mtimeMs); return; }   // replaced meanwhile
+    await fs.promises.rename(result, out);
+    const tst = await fs.promises.stat(out);
+    console.log(`[fastview] ⚡ ${fn} → ${path.basename(out)} · ${Math.round(st.size / 1048576 * 10) / 10} MB → ` +
+                `${Math.round(tst.size / 1048576 * 10) / 10} MB · ${note.join(', ')} · ${Date.now() - t0} ms`);
+    /* older copies are no longer used — v3 only after a while, a student may be
+       reading it right now (its pages arrive in pieces, on demand) */
+    _oldFastViewNamesFor(fn).forEach(n => {
+      const drop = () => fs.promises.rm(path.join(UPLOAD_DIR, n), { force: true }).catch(() => {});
+      if (n === path.basename(_prevFastViewNameFor(fn))) setTimeout(drop, FASTVIEW_PREV_KEEP_MS).unref(); else drop();
+    });
+  } finally {
+    fs.promises.rm(tmpOpt, { force: true }).catch(() => {});
+    fs.promises.rm(tmpLin, { force: true }).catch(() => {});
+  }
+}
+
+/* ⚡ After start-up, prepare fast copies of the PDFs that already exist,
+   one at a time in the background — so the first student to open an
+   old file does not get the slow version. */
+setTimeout(async () => {
+  try {
+    const rows = await Course.aggregate([
+      { $project: { urls: { $map: { input: { $ifNull: ['$materials', []] }, as: 'm', in: '$$m.url' } } } }
+    ]);
+    let n = 0;
+    for (const r of rows) for (const u of (r.urls || [])) {
+      const url = String(u || '');
+      if (!url.startsWith('/uploads/')) continue;
+      const fn = path.basename(url.split('?')[0]);
+      if (!/\.pdf$/i.test(fn)) continue;
+      if (fastViewFor(fn) === null) n++;
+    }
+    if (n) console.log(`[fastview] preparing fast copies of ${n} existing PDF(s) in the background`);
+  } catch (e) { console.warn('[fastview] start-up sweep failed:', e.message); }
+}, 60000).unref();
+
+/* ============================================================
+   ⚡ SSD MIRROR FOR PDFs THAT LIVE ELSEWHERE (2026-10-07)
+   ------------------------------------------------------------
+   rp-<hmac>.pdf — a private local copy of a PDF material whose
+   content is an external https link or a legacy base64 copy in
+   the database. Unguessable name, served only through a signed
+   URL (or to admins), exactly like the ro-… office copies.
+   ============================================================ */
+const DERIVED_PDF_RE = /^rp-[a-f0-9]{24}\.pdf$/;
+const PDF_MIRROR_MAX_PARALLEL = 2;
+const PDF_MIRROR_RETRY_MS = 60 * 60 * 1000;
+const _pdfMirrorJobs = new Map();          // name → Promise
+const _pdfMirrorFailed = new Map();        // name → time of last failure
+
+function _derivedPdfName(seed) {
+  return 'rp-' + crypto.createHmac('sha256', String(JWT_SECRET)).update('pdf-src:' + seed).digest('hex').slice(0, 24) + '.pdf';
+}
+function _looksPdfName(s) { return /\.pdf$/i.test(String(s || '').split('?')[0].split('#')[0]); }
+
+function _localPdfSourceOf(mat) {
+  if (!mat) return null;
+  const rawUrl = String(mat.url || '').trim();
+  if (rawUrl.startsWith('/uploads/')) return null;                 // already on the SSD
+  if (/^https:\/\//i.test(rawUrl)) {
+    if (!_looksPdfName(rawUrl) && !_looksPdfName(mat.fileName)) return null;
+    return { kind: 'remote', name: _derivedPdfName('url:' + rawUrl), url: rawUrl };
+  }
+  const fd = typeof mat.fileData === 'string' ? mat.fileData : '';
+  if (fd.length > 100 && (_looksPdfName(mat.fileName) || fd.startsWith('data:application/pdf'))) {
+    return { kind: 'inline', name: _derivedPdfName('inline:' + String(mat._id) + ':' + fd.length), fileData: fd };
+  }
+  const cu = String(mat.cloudUrl || '').trim();
+  if (!rawUrl && /^https:\/\//i.test(cu) && (_looksPdfName(cu) || _looksPdfName(mat.fileName))) {
+    return { kind: 'remote', name: _derivedPdfName('url:' + cu), url: cu };
+  }
+  return null;
+}
+
+async function _isPdfFile(fp) {
+  try {
+    const fh = await fs.promises.open(fp, 'r');
+    try {
+      const b = Buffer.alloc(1024);
+      const { bytesRead } = await fh.read(b, 0, 1024, 0);
+      return b.slice(0, bytesRead).toString('latin1').includes('%PDF-');
+    } finally { await fh.close(); }
+  } catch (_) { return false; }
+}
+
+async function _diskHasRoomFor(bytes) {
+  try {
+    if (typeof fs.promises.statfs !== 'function') return true;
+    const sf = await fs.promises.statfs(UPLOAD_DIR);
+    const free = Number(sf.bavail) * Number(sf.bsize);
+    return free > 2 * 1024 * 1024 * 1024 && free > (bytes || 0) * 5;
+  } catch (_) { return true; }
+}
+
+/* true  → the local copy is ready on disk now
+   false → not (yet): a background copy may have been started */
+async function _ensureLocalPdf(src) {
+  const fp = path.join(UPLOAD_DIR, src.name);
+  try { const st = await fs.promises.stat(fp); if (st.isFile() && st.size > 0) return true; } catch (_) {}
+
+  if (src.kind === 'inline') {
+    const fd = src.fileData;
+    const b64 = fd.startsWith('data:') ? fd.slice(fd.indexOf(',') + 1) : fd;
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length < 64 || !buf.slice(0, 1024).toString('latin1').includes('%PDF-')) return false;
+    if (!(await _diskHasRoomFor(buf.length))) return false;
+    const tmp = fp + '.tmp' + crypto.randomBytes(3).toString('hex');
+    await fs.promises.writeFile(tmp, buf);
+    await fs.promises.rename(tmp, fp);
+    console.log(`[pdf-mirror] 💾 database copy → SSD: ${src.name} (${Math.round(buf.length / 1024)} KB)`);
+    return true;
+  }
+
+  /* remote → copy in the background; this open keeps using the link */
+  const failedAt = _pdfMirrorFailed.get(src.name);
+  if (failedAt && Date.now() - failedAt < PDF_MIRROR_RETRY_MS) return false;
+  if (_pdfMirrorJobs.has(src.name) || _pdfMirrorJobs.size >= PDF_MIRROR_MAX_PARALLEL) return false;
+  if (!(await _diskHasRoomFor(0))) return false;
+  const job = (async () => {
+    let ok = false;
+    try { ok = await _downloadTo(src.url, fp); } catch (_) { ok = false; }
+    if (ok && !(await _isPdfFile(fp))) {
+      ok = false;
+      await fs.promises.rm(fp, { force: true }).catch(() => {});
+    }
+    if (ok) {
+      console.log('[pdf-mirror] ☁️ → 💾 external PDF copied to SSD:', src.name);
+      setTimeout(() => { try { fastViewFor(src.name); } catch (_) {} }, 1000);
+    } else {
+      _pdfMirrorFailed.set(src.name, Date.now());
+      console.warn('[pdf-mirror] could not copy', src.url.slice(0, 120));
+    }
+  })().finally(() => _pdfMirrorJobs.delete(src.name));
+  _pdfMirrorJobs.set(src.name, job);
+  return false;
+}
+
+/* Where does each material's file live? Logged once after start-up and
+   available to admins at GET /api/admin/storage-report. */
+async function buildStorageReport() {
+  const rows = await Course.aggregate([
+    { $project: { name: 1, materials: { $map: { input: { $ifNull: ['$materials', []] }, as: 'm', in: {
+        _id: '$$m._id', title: '$$m.title', type: '$$m.type', url: '$$m.url', cloudUrl: '$$m.cloudUrl', fileName: '$$m.fileName',
+        hasData: { $and: [{ $eq: [{ $type: '$$m.fileData' }, 'string'] }, { $gt: ['$$m.fileData', ''] }] }
+    } } } } }
+  ]);
+  const r = { onDisk: 0, missingOnDisk: 0, external: 0, externalMirrored: 0, database: 0, databaseMirrored: 0, noFile: 0, examples: [] };
+  for (const c of rows) for (const m of (c.materials || [])) {
+    const url = String(m.url || '').trim();
+    const note = (kind) => { if (r.examples.length < 25) r.examples.push({ course: c.name, material: m.title, kind }); };
+    if (url.startsWith('/uploads/')) {
+      const fn = path.basename(url.split('?')[0]);
+      if (/^[A-Za-z0-9._-]+$/.test(fn) && fs.existsSync(path.join(UPLOAD_DIR, fn))) r.onDisk++;
+      else { r.missingOnDisk++; note('missing on disk (restored from backup on first open)'); }
+    } else if (/^https?:\/\//i.test(url) || (!url && /^https?:\/\//i.test(String(m.cloudUrl || '')))) {
+      if (/youtube\.com|youtu\.be|vimeo\.com/i.test(url)) continue;     // streamed videos — not files
+      const src = _localPdfSourceOf({ url: url || '', cloudUrl: m.cloudUrl, fileName: m.fileName });
+      if (src && fs.existsSync(path.join(UPLOAD_DIR, src.name))) r.externalMirrored++;
+      else { r.external++; note(src ? 'external PDF link (copied to SSD on first open)' : 'external link'); }
+    } else if (m.hasData) {
+      r.database++; note('stored in the database (copied to SSD on first open)');
+    } else {
+      r.noFile++;
+    }
+  }
+  return r;
+}
+app.get('/api/admin/storage-report', requireAdminAuth, async (req, res) => {
+  try { res.json({ success: true, report: await buildStorageReport() }); }
+  catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
+});
+setTimeout(() => {
+  buildStorageReport().then(r => {
+    console.log(`[storage] files: ${r.onDisk} on SSD · ${r.missingOnDisk} missing on disk · ` +
+                `${r.external} external links (+${r.externalMirrored} already copied) · ` +
+                `${r.database} in database · ${r.noFile} without a file`);
+  }).catch(e => console.warn('[storage] report failed:', e.message));
+}, 20000).unref();
+
 /* ---- On-demand full material fetch (quiz questions) ---- */
 /* ---- On-demand file fetch (PDF base64) — PREMIUM PROTECTED ---- */
 app.get('/api/courses/:courseId/materials/:materialId/file',
   attachUserFromToken,
   async (req, res) => {
     try {
+      if (_visitorWithoutAccount(req)) return _sendSignupRequired(res);
       if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
         return res.status(400).json({ success: false, message: 'Invalid course ID.' });
       }
 
-      const course = await Course.findById(req.params.courseId)
-        .select('isPremium price materials')
-        .lean();
+      const course = await _loadCourseWithOneMaterial(req.params.courseId, req.params.materialId);
       if (!course) return res.status(404).json({ success: false, message: 'Course not found' });
 
       const mat = (course.materials || []).find(m => String(m._id) === String(req.params.materialId));
@@ -6130,6 +7129,7 @@ app.get('/api/courses/:courseId/materials/:materialId/file',
         let diskFileExists = false;
         let fileUrl = rawUrl;
         let signedUrlIssued = false;
+        let fastView = false;
 
         if (rawUrl.startsWith('/uploads/')) {
           const fn = path.basename(rawUrl);
@@ -6140,17 +7140,29 @@ app.get('/api/courses/:courseId/materials/:materialId/file',
           if (resolved.startsWith(uploadRoot + path.sep)) {
             try { diskFileExists = fs.existsSync(resolved); }
             catch (e) { diskFileExists = false; }
+
+            /* ⚡ The file is missing on disk (e.g. the uploads folder was
+               reset) but a Cloudinary backup exists → put it back once,
+               then serve it normally. Only for students who may read the
+               whole file; bounded in time, never blocks longer than ~20 s. */
+            if (!diskFileExists && access.allowed && !isOfficeFile(fn)) {
+              diskFileExists = await _restoreUploadFromBackup(fn, mat.cloudUrl);
+            }
           }
 
           /* ⭐ Issue a signed URL when full access is granted.
                 This eliminates per-range-request auth overhead. */
           if (diskFileExists && access.allowed && req.authUser && !isOfficeFile(fn)) {
             try {
-              const tok = signUploadToken(fn, String(req.authUser._id));
-              fileUrl = `/uploads/${encodeURIComponent(fn)}` +
+              /* ⚡ Serve the fast-view copy of a large PDF when it is ready */
+              const fv = /\.pdf$/i.test(fn) ? fastViewFor(fn) : null;
+              const serveName = fv || fn;
+              const tok = signUploadToken(serveName, String(req.authUser._id));
+              fileUrl = `/uploads/${encodeURIComponent(serveName)}` +
                         `?su=${encodeURIComponent(String(req.authUser._id))}` +
                         `&st=${encodeURIComponent(tok)}`;
               signedUrlIssued = true;
+              fastView = !!fv;
             } catch (e) {
               console.warn('[file-meta] signed URL build failed:', e.message);
               fileUrl = rawUrl;
@@ -6158,13 +7170,58 @@ app.get('/api/courses/:courseId/materials/:materialId/file',
           }
         }
 
+        /* ⚡ SSD MIRROR (2026-10-07) — PDFs that are NOT in the uploads
+           folder (an external https link such as Cloudinary, or a legacy
+           copy stored inside the database) get a private copy on the
+           server's disk. From then on they are served from the SSD like
+           every other upload: byte ranges, fast-view, browser caching.
+           Database copies are written instantly; external links are
+           fetched in the background on the first open (that open still
+           uses the link), so no student ever waits for the copy. */
+        let servedFrom = rawUrl.startsWith('/uploads/') ? (diskFileExists ? 'disk' : 'missing') : (rawUrl ? 'external' : 'database');
+        if (!signedUrlIssued && !rawUrl.startsWith('/uploads/') && access.allowed && req.authUser && !_officeSrc) {
+          const src = _localPdfSourceOf(mat);
+          if (src) {
+            try {
+              if (await _ensureLocalPdf(src)) {
+                const fv = fastViewFor(src.name);
+                const serveName = fv || src.name;
+                const tok = signUploadToken(serveName, String(req.authUser._id));
+                fileUrl = `/uploads/${encodeURIComponent(serveName)}` +
+                          `?su=${encodeURIComponent(String(req.authUser._id))}` +
+                          `&st=${encodeURIComponent(tok)}`;
+                signedUrlIssued = true;
+                diskFileExists = true;
+                fastView = !!fv;
+                servedFrom = 'disk-mirror';
+              }
+            } catch (e) {
+              console.warn('[pdf-mirror]', e.message);
+            }
+          }
+        }
+        res.setHeader('X-Aero-Served-From', servedFrom);
+
+        /* Size of the file the reader will load — large files are read
+           in pieces (only the pages needed) instead of one long download */
+        let fileSize = 0;
+        try {
+          const mm = /^\/uploads\/([^?#]+)/.exec(String(fileUrl || ''));
+          if (mm && diskFileExists) fileSize = (await fs.promises.stat(path.join(UPLOAD_DIR, path.basename(decodeURIComponent(mm[1]))))).size;
+        } catch (_) {}
+
         return res.json({
           success:        true,
           meta:           true,
+          servedFrom,
+          fileSize,
+          /* the client may send the token as a header (stable, cacheable URL) */
+          sigHeader:      true,
           fileName:       mat.fileName || '',
           fileUrl,
           originalUrl:    rawUrl,
           signedUrl:      signedUrlIssued,
+          fastView,
           diskFileExists,
           hasInlineData:  !!mat.fileData,
           hasFullAccess:  !!access.allowed,
@@ -6208,6 +7265,7 @@ app.get('/api/courses/:courseId/materials/:materialId/full-quiz',
   attachUserFromToken,
   async (req, res) => {
     try {
+      if (_visitorWithoutAccount(req)) return _sendSignupRequired(res);
       if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
         return res.status(400).json({ success: false, message: 'Invalid course ID.' });
       }
@@ -6232,10 +7290,29 @@ app.get('/api/courses/:courseId/materials/:materialId/full-quiz',
         });
       }
 
+      /* ⭐ 2026-10-10: the answer key goes ONLY to the people who write the
+         paper (admins, professors assigned to this course). Students used
+         to receive every correct option, integer answer, range and matrix
+         key here — readable in the browser's network tab before starting.
+         They get the answers after submitting, from the graded result. */
+      const u = req.authUser;
+      const role = String((u && u.role) || '').toLowerCase();
+      const isEditor = role === 'admin' || (role === 'professor' && u.professor && u.professor.status === 'approved' &&
+        (u.professor.courses || []).map(String).includes(String(req.params.courseId)));
+      const quiz = (mat.quiz || []).map(q => {
+        if (isEditor) return q;
+        const c = Object.assign({}, q);
+        delete c.correctIndexes; delete c.correctIndex; delete c.integerAnswer; delete c.integerTolerance;
+        delete c.rangeMin; delete c.rangeMax; delete c.explanation;
+        if (Array.isArray(c.matrixRows)) c.matrixRows = c.matrixRows.map(r => ({ text: (r && r.text) || '' }));
+        return c;
+      });
+      res.setHeader('Cache-Control', 'private, no-store');
       res.json({
         success: true,
-        quiz: mat.quiz || [],
-        examConfig: mat.examConfig || {}
+        quiz,
+        examConfig: mat.examConfig || {},
+        answerKey: isEditor
       });
     } catch (e) {
       res.status(500).json({ success: false, message: 'Server error: ' + e.message });
@@ -6247,6 +7324,12 @@ app.get('/api/courses/:id', async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Invalid course ID' });
+    }
+    /* ⭐ courses not approved for a professor do not exist for them */
+    const profScope = await _professorScope(req);
+    if (profScope) {
+      res.setHeader('Cache-Control', 'private, no-store');
+      if (!profScope.has(String(req.params.id))) return res.status(404).json({ success: false, message: 'Course not found' });
     }
 
     /* Server-side cache — 60 s. Auto-invalidated by cacheClear('courses:'). */
@@ -6265,7 +7348,7 @@ app.get('/api/courses/:id', async (req, res) => {
           name: 1, code: 1, semester: 1, instructor: 1, description: 1,
           category: 1, difficulty: 1, duration: 1, credits: 1, language: 1,
           learningOutcomes: 1, thumbnail: 1, status: 1, featured: 1,
-          isPremium: 1, price: 1, announcements: 1, playlists: 1,
+          isPremium: 1, price: 1, announcements: 1, playlists: 1, sortOrder: 1,
             tracks: 1, subject: 1, chapters: 1,
           /* ⭐ Doubts are public to every student — strip askers' emails. */
           doubts: {
@@ -6274,7 +7357,8 @@ app.get('/api/courses/:id', async (req, res) => {
               as: 'd',
               in: {
                 _id: '$$d._id', studentName: '$$d.studentName', studentUsername: '$$d.studentUsername',
-                question: '$$d.question', answer: '$$d.answer', date: '$$d.date', replies: '$$d.replies'
+                question: '$$d.question', answer: '$$d.answer', date: '$$d.date', replies: '$$d.replies',
+                materialId: '$$d.materialId', materialTitle: '$$d.materialTitle', upvotes: '$$d.upvotes', answeredBy: '$$d.answeredBy', answeredAt: '$$d.answeredAt'
               }
             }
           },
@@ -6473,13 +7557,21 @@ app.post('/api/courses', requireAdminAuth, async (req, res) => {
 });
 
 
-app.put('/api/courses/:id', requireAdminAuth, async (req, res) => {
+app.put('/api/courses/:id', requireCourseEditor, async (req, res) => {
   try {
-    const allowed = ['name','code','semester','instructor','description','category','difficulty','duration','learningOutcomes','thumbnail','status','featured','isPremium','price','certificate'];
+    /* ⭐ Professors may improve the teaching fields only — never the name,
+       code, status, visibility, price or certificate rules, and they
+       cannot clear the thumbnail (that would be removing content). */
+    const allowed = req.editorRole === 'professor'
+      ? ['description', 'learningOutcomes', 'duration', 'difficulty', 'thumbnail']
+      : ['name','code','semester','instructor','description','category','difficulty','duration','learningOutcomes','thumbnail','status','featured','isPremium','price','certificate'];
     const update = {};
     allowed.forEach(f => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
-    if (req.body.tracks !== undefined)  update.tracks  = _cleanTracks(req.body.tracks);
-    if (req.body.subject !== undefined) update.subject = _slugKey(req.body.subject);
+    /* categories and subject decide where students find the course — the admin's call */
+    if (req.editorRole !== 'professor') {
+      if (req.body.tracks !== undefined)  update.tracks  = _cleanTracks(req.body.tracks);
+      if (req.body.subject !== undefined) update.subject = _slugKey(req.body.subject);
+    }
 
     if (update.price !== undefined) {
       update.price = Number.isFinite(Number(update.price)) ? Math.max(0, Number(update.price)) : 0;
@@ -6489,7 +7581,12 @@ app.put('/api/courses/:id', requireAdminAuth, async (req, res) => {
     if (update.credits   !== undefined) update.credits   = Number.isFinite(Number(update.credits)) ? Math.max(0, Number(update.credits)) : 0;
     if (update.status !== undefined && !['published','draft','archived'].includes(update.status)) delete update.status;
 
-    const updated = await Course.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
+    if (req.editorRole === 'professor') {
+      if ('thumbnail' in update && !String(update.thumbnail || '').trim()) delete update.thumbnail;
+      if (!Object.keys(update).length) return res.status(400).json({ success: false, message: 'Nothing to update.' });
+      console.log(`[prof] ✏️  ${req.authUser.username} edited course ${req.params.id} (${Object.keys(update).join(', ')})`);
+    }
+    const updated = await Course.findByIdAndUpdate(req.params.id, { $set: update }, { returnDocument: 'after' });
     if (!updated) return res.status(404).json({ success: false, message: 'Course not found' });
     cacheClear('courses:');
     res.json({ success: true, message: 'Course updated successfully!', course: updated });
@@ -6514,26 +7611,76 @@ app.delete('/api/courses/:id', requireAdminAuth, async (req, res) => {
 });
 
 /* ============================================================
+   ⭐ COURSE ORDER (2026-10-05)
+   ------------------------------------------------------------
+   PUT /api/admin/courses/order   { order: [courseId, …] }
+   The admin's full list, top to bottom. Each course gets
+   sortOrder 10, 20, 30, … (only that field changes — updatedAt
+   is left alone). Courses missing from the list keep their
+   current value. Students' open pages re-sort live through the
+   'courses:order' sync event (classifyMutation).
+   ============================================================ */
+app.put('/api/admin/courses/order', requireAdminAuth, async (req, res) => {
+  try {
+    const raw = req.body && req.body.order;
+    if (!Array.isArray(raw) || !raw.length || raw.length > 5000) {
+      return res.status(400).json({ success: false, message: 'Send the course order as a list of course ids.' });
+    }
+    const ids = raw.map(x => String(x || '').trim());
+    if (ids.some(id => !/^[a-f0-9]{24}$/i.test(id)) || new Set(ids).size !== ids.length) {
+      return res.status(400).json({ success: false, message: 'The course list contains an invalid or repeated id.' });
+    }
+    const ops = ids.map((id, i) => ({
+      updateOne: {
+        filter: { _id: new mongoose.Types.ObjectId(id) },
+        update: { $set: { sortOrder: (i + 1) * 10 } },
+        timestamps: false
+      }
+    }));
+    const r = await Course.bulkWrite(ops, { ordered: false, timestamps: false });
+    cacheClear('courses:');
+    res.json({
+      success: true,
+      matched: (r && (r.matchedCount ?? r.nMatched)) || 0,
+      order: ids.map((id, i) => ({ id, sortOrder: (i + 1) * 10 }))
+    });
+  } catch (e) {
+    console.error('[admin/courses/order]', e);
+    res.status(500).json({ success: false, message: 'Could not save the course order. Please try again.' });
+  }
+});
+
+/* ============================================================
    MATERIALS
    ============================================================ */
-app.post('/api/courses/:courseId/materials', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/materials', requireCourseEditor, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
       return res.status(400).json({ success: false, message: 'Invalid course id.' });
     }
     const course = await Course.findById(req.params.courseId);
     if (!course) return res.status(404).json({ success: false, message: 'Course not found' });
-
-    const matBody = Object.assign({}, req.body || {});
-    matBody.chapterId = _validChapterId(course, matBody.chapterId);
+    let body = Object.assign({}, req.body || {});
+    if (req.editorRole === 'professor') {
+      /* ⭐ Professors add content; pricing stays with the admin */
+      const keep = ['title', 'type', 'description', 'url', 'cloudUrl', 'fileName', 'fileData', 'cloudinaryPublicId', 'estimatedTime', 'tags', 'examConfig', 'chapterId'];
+      const clean = {};
+      keep.forEach(k => { if (body[k] !== undefined) clean[k] = body[k]; });
+      clean.isPremium = false; clean.price = 0; clean.previewPercent = 0;
+      if (!String(clean.title || '').trim()) return res.status(400).json({ success: false, message: 'Title is required.' });
+      body = clean;
+      console.log(`[prof] ➕ ${req.authUser.username} added "${String(clean.title).slice(0, 80)}" to course ${req.params.courseId}`);
+    }
+    body.chapterId = _validChapterId(course, body.chapterId);
 
     // Normalise numeric / boolean fields so a bad client payload cannot
     // throw a Mongoose cast error.
-    matBody.isPremium      = matBody.isPremium === true || matBody.isPremium === 'true';
-    matBody.price          = Number.isFinite(Number(matBody.price))          ? Math.max(0, Number(matBody.price))          : 0;
-    matBody.previewPercent = Number.isFinite(Number(matBody.previewPercent)) ? Math.max(0, Math.min(100, Number(matBody.previewPercent))) : 0;
+    body.isPremium      = body.isPremium === true || body.isPremium === 'true';
+    body.price          = Number.isFinite(Number(body.price))          ? Math.max(0, Number(body.price))          : 0;
+    body.previewPercent = Number.isFinite(Number(body.previewPercent)) ? Math.max(0, Math.min(100, Number(body.previewPercent))) : 0;
 
-    course.materials.push(matBody);
+    body.addedBy = _editorStamp(req);
+    course.materials.push(body);
     await course.save();
     cacheClear('courses:');
     res.json({ success: true, message: 'Material added successfully!', course });
@@ -6547,7 +7694,84 @@ app.post('/api/courses/:courseId/materials', requireAdminAuth, async (req, res) 
   }
 });
 
-app.put('/api/courses/:courseId/materials/:materialId', requireAdminAuth, async (req, res) => {
+/* ============================================================
+   ⭐ MATERIAL ORDER INSIDE A COURSE (2026-10-06)
+   ------------------------------------------------------------
+   PUT /api/courses/:courseId/materials/reorder   { order: [materialId, …] }
+   (registered BEFORE …/materials/:materialId so "reorder" is never
+   taken for a material id)
+
+   The materials array itself is put in the new order, so every page
+   that lists a course's materials (student course page, type tabs,
+   admin pages, question papers…) follows it with no other change.
+
+   Done inside MongoDB in one atomic update: no material data (PDF
+   base64, quizzes) is read into Node. Materials missing from the list
+   (e.g. one added a moment ago in another tab) keep their relative
+   order and go after the listed ones; ids that no longer exist are
+   ignored. Falls back to a normal load-and-save if the server's
+   MongoDB cannot run update pipelines (older than 4.2).
+   ============================================================ */
+app.put('/api/courses/:courseId/materials/reorder', requireCourseEditor, async (req, res) => {   // moving never removes anything
+  try {
+    const courseId = String(req.params.courseId || '');
+    if (!/^[a-f0-9]{24}$/i.test(courseId)) {
+      return res.status(400).json({ success: false, message: 'Invalid course id.' });
+    }
+    const raw = req.body && req.body.order;
+    if (!Array.isArray(raw) || !raw.length || raw.length > 3000) {
+      return res.status(400).json({ success: false, message: 'Send the new order as a list of material ids.' });
+    }
+    const ids = raw.map(x => String(x || '').trim());
+    if (ids.some(id => !/^[a-f0-9]{24}$/i.test(id)) || new Set(ids).size !== ids.length) {
+      return res.status(400).json({ success: false, message: 'The list contains an invalid or repeated material id.' });
+    }
+    const cOid = new mongoose.Types.ObjectId(courseId);
+    const oids = ids.map(id => new mongoose.Types.ObjectId(id));
+
+    let done = false;
+    try {
+      const listed = oids.map(oid => ({
+        $filter: { input: '$materials', as: 'm', cond: { $eq: ['$$m._id', oid] } }
+      }));
+      const rest = { $filter: { input: '$materials', as: 'm', cond: { $not: [{ $in: ['$$m._id', oids] }] } } };
+      const r = await Course.collection.updateOne(
+        { _id: cOid, materials: { $type: 'array' } },
+        [{ $set: { materials: { $concatArrays: listed.concat([rest]) } } }]
+      );
+      if (!r || !r.matchedCount) {
+        const exists = await Course.exists({ _id: cOid });
+        return res.status(404).json({ success: false, message: exists ? 'This course has no materials yet.' : 'Course not found.' });
+      }
+      done = true;
+    } catch (pipeErr) {
+      console.warn('[materials/reorder] pipeline update unavailable, using load-and-save:', pipeErr.message);
+    }
+
+    if (!done) {
+      const course = await Course.findById(cOid);
+      if (!course) return res.status(404).json({ success: false, message: 'Course not found.' });
+      const rank = new Map(ids.map((id, i) => [id, i]));
+      const cur = course.materials.slice();
+      const listed = cur.filter(m => rank.has(String(m._id))).sort((a, b) => rank.get(String(a._id)) - rank.get(String(b._id)));
+      const rest = cur.filter(m => !rank.has(String(m._id)));
+      course.materials = listed.concat(rest);
+      await course.save();
+    }
+
+    cacheClear('courses:');
+    const after = await Course.findById(cOid).select('materials._id').lean();
+    res.json({
+      success: true,
+      order: ((after && after.materials) || []).map(m => String(m._id))
+    });
+  } catch (e) {
+    console.error('[materials/reorder]', e);
+    res.status(500).json({ success: false, message: 'Could not save the new order. Please try again.' });
+  }
+});
+
+app.put('/api/courses/:courseId/materials/:materialId', requireCourseEditor, async (req, res) => {
   try {
     const course = await Course.findById(req.params.courseId);
     if (!course) return res.status(404).json({ success: false, message: 'Course not found' });
@@ -6555,9 +7779,23 @@ app.put('/api/courses/:courseId/materials/:materialId', requireAdminAuth, async 
     const mat = course.materials.id(req.params.materialId);
     if (!mat) return res.status(404).json({ success: false, message: 'Material not found' });
 
-    const fields = ['title', 'type', 'description', 'url', 'isPremium', 'price', 'previewPercent', 'fileData', 'fileName'];
+    const isProf = req.editorRole === 'professor';
+    const fields = isProf
+      ? ['title', 'type', 'description', 'url', 'fileData', 'fileName']      // no prices for professors
+      : ['title', 'type', 'description', 'url', 'isPremium', 'price', 'previewPercent', 'fileData', 'fileName'];
+    if (isProf) {
+      /* ⭐ Editing must never turn into deleting: a professor can replace
+         the file or link but not empty it, and cannot blank the title. */
+      const had = !!(String(mat.url || '').trim() || String(mat.fileName || '').trim() || String(mat.fileData || '').trim());
+      const next = (f) => (req.body[f] !== undefined ? req.body[f] : mat[f]);
+      const will = !!(String(next('url') || '').trim() || String(next('fileName') || '').trim() || String(next('fileData') || '').trim());
+      if (had && !will) return res.status(403).json({ success: false, code: 'NO_DELETE', message: 'Professors cannot remove a file. Upload a replacement instead.' });
+      if (req.body.title !== undefined && !String(req.body.title || '').trim()) return res.status(400).json({ success: false, message: 'Title cannot be empty.' });
+    }
     fields.forEach(f => { if (req.body[f] !== undefined) mat[f] = req.body[f]; });
     if (req.body.chapterId !== undefined) mat.chapterId = _validChapterId(course, req.body.chapterId);
+    mat.lastEditedBy = _editorStamp(req);
+    if (isProf) console.log(`[prof] ✏️  ${req.authUser.username} edited material ${req.params.materialId} in course ${req.params.courseId}`);
 
     await course.save();
     cacheClear('courses:');
@@ -6828,7 +8066,7 @@ function _sortedChapters(course) {
   return (course.chapters || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
 }
 
-app.post('/api/courses/:courseId/chapters', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/chapters', requireCourseEditor,   /* ⭐ professors organise their own courses; deleting stays with the admin */ async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) {
       return res.status(400).json({ success: false, message: 'Invalid course id.' });
@@ -6869,7 +8107,7 @@ app.post('/api/courses/:courseId/chapters', requireAdminAuth, async (req, res) =
 
 /* Add many chapters in one go (chapter library "Add all", pasted lists,
    new-course auto chapters). Titles already in the course are skipped. */
-app.post('/api/courses/:courseId/chapters/bulk', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/chapters/bulk', requireCourseEditor,   /* ⭐ professors organise their own courses; deleting stays with the admin */ async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) return res.status(400).json({ success: false, message: 'Invalid course id.' });
     const titles = (Array.isArray((req.body || {}).titles) ? req.body.titles : []).map(t => _cleanStr(t, 140)).filter(Boolean).slice(0, 150);
@@ -6894,7 +8132,7 @@ app.post('/api/courses/:courseId/chapters/bulk', requireAdminAuth, async (req, r
   }
 });
 
-app.put('/api/courses/:courseId/chapters/reorder', requireAdminAuth, async (req, res) => {
+app.put('/api/courses/:courseId/chapters/reorder', requireCourseEditor,   /* ⭐ professors organise their own courses; deleting stays with the admin */ async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) return res.status(400).json({ success: false, message: 'Invalid course id.' });
     const order = Array.isArray((req.body || {}).order) ? req.body.order.map(String) : [];
@@ -6915,7 +8153,7 @@ app.put('/api/courses/:courseId/chapters/reorder', requireAdminAuth, async (req,
   }
 });
 
-app.put('/api/courses/:courseId/chapters/:chapterId', requireAdminAuth, async (req, res) => {
+app.put('/api/courses/:courseId/chapters/:chapterId', requireCourseEditor,   /* ⭐ professors organise their own courses; deleting stays with the admin */ async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) return res.status(400).json({ success: false, message: 'Invalid course id.' });
     const course = await Course.findById(req.params.courseId);
@@ -6960,7 +8198,7 @@ app.delete('/api/courses/:courseId/chapters/:chapterId', requireAdminAuth, async
   }
 });
 
-app.put('/api/courses/:courseId/chapters/:chapterId/materials', requireAdminAuth, async (req, res) => {
+app.put('/api/courses/:courseId/chapters/:chapterId/materials', requireCourseEditor,   /* ⭐ professors organise their own courses; deleting stays with the admin */ async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.courseId)) return res.status(400).json({ success: false, message: 'Invalid course id.' });
     const course = await Course.findById(req.params.courseId);
@@ -6982,9 +8220,13 @@ app.put('/api/courses/:courseId/chapters/:chapterId/materials', requireAdminAuth
 /* ============================================================
    ANNOUNCEMENTS
    ============================================================ */
-app.post('/api/courses/:courseId/announcements', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/announcements', requireCourseEditor, async (req, res) => {
   try {
-    const { title, body, authorName } = req.body;
+    const { title, body } = req.body;
+    /* professors post under their own name */
+    const authorName = req.editorRole === 'professor'
+      ? ('Prof. ' + String(req.authUser.fullName || req.authUser.username || '').trim())
+      : req.body.authorName;
     if (!title || !title.trim()) return res.status(400).json({ success: false, message: 'Title required' });
     const ann = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -7018,21 +8260,31 @@ app.post('/api/courses/:id/doubts', requireUser, async (req, res) => {
     const studentName     = req.authUser.fullName || req.authUser.username;
     const studentUsername = req.authUser.username;
     const studentEmail    = req.authUser.email || '';
+    /* ⭐ 2026-10-11 — optional: the material this doubt is about */
+    let materialId = '', materialTitle = '';
+    const wantMat = String((req.body && req.body.materialId) || '');
+    if (/^[a-f0-9]{24}$/i.test(wantMat)) {
+      const c = await Course.findOne({ _id: req.params.id, 'materials._id': wantMat }, { 'materials.$': 1 }).lean();
+      if (c && c.materials && c.materials[0]) { materialId = wantMat; materialTitle = String(c.materials[0].title || '').slice(0, 200); }
+    }
     await Course.findByIdAndUpdate(req.params.id, {
-      $push: { doubts: { studentName, studentUsername, studentEmail, question, date: new Date() } }
+      $push: { doubts: { studentName, studentUsername, studentEmail, question, date: new Date(), materialId, materialTitle } }
     });
     cacheClear('courses:');
     res.json({ success: true, message: 'Doubt submitted successfully!' });
   } catch (e) { res.status(500).json({ success: false, message: 'Error submitting doubt' }); }
 });
 
-app.put('/api/courses/:courseId/doubts/:doubtId', requireAdminAuth, async (req, res) => {
+/* ⭐ the instructor's answer — admin, or (2026-10-11) the course's professor */
+app.put('/api/courses/:courseId/doubts/:doubtId', requireCourseEditor, async (req, res) => {
   try {
-    const { answer } = req.body;
+    const answer = String((req.body && req.body.answer) || '').trim().slice(0, 8000);
+    if (!answer) return res.status(400).json({ success: false, message: 'Type an answer first.' });
     await Course.updateOne(
       { _id: req.params.courseId, "doubts._id": req.params.doubtId },
-      { $set: { "doubts.$.answer": answer } }
+      { $set: { "doubts.$.answer": answer, "doubts.$.answeredBy": req.authUser.fullName || req.authUser.username, "doubts.$.answeredAt": new Date() } }
     );
+    cacheClear('courses:');
     const course = await Course.findById(req.params.courseId);
     const doubt = course?.doubts?.id(req.params.doubtId);
     if (doubt && doubt.studentUsername) {
@@ -7061,7 +8313,7 @@ app.post('/api/courses/:courseId/doubts/:doubtId/replies', requireUser, async (r
     /* ⭐ Author + role come from the session (a student could previously post as "admin"). */
     const authorName     = req.authUser.fullName || req.authUser.username;
     const authorUsername = req.authUser.username;
-    const authorRole     = _isAdminUser(req.authUser) ? 'admin' : 'student';
+    const authorRole     = _isAdminUser(req.authUser) ? 'admin' : _isProfessorUser(req.authUser) ? 'professor' : 'student';
     await Course.updateOne(
       { _id: req.params.courseId, "doubts._id": req.params.doubtId },
       { $push: { "doubts.$.replies": {
@@ -7091,6 +8343,21 @@ app.post('/api/courses/:courseId/doubts/:doubtId/replies', requireUser, async (r
   } catch (e) { res.status(500).json({ success: false, message: 'Error posting reply: ' + e.message }); }
 });
 
+/* ⭐ 2026-10-11 — "me too" vote (toggle) so the most useful doubts rise */
+app.post('/api/courses/:courseId/doubts/:doubtId/upvote', requireUser, async (req, res) => {
+  try {
+    const me = req.authUser.username;
+    const c = await Course.findOne({ _id: req.params.courseId, 'doubts._id': req.params.doubtId }, { 'doubts.$': 1 }).lean();
+    const d = c && c.doubts && c.doubts[0];
+    if (!d) return res.status(404).json({ success: false, message: 'Doubt not found' });
+    const has = (d.upvotes || []).includes(me);
+    await Course.updateOne({ _id: req.params.courseId, 'doubts._id': req.params.doubtId },
+      has ? { $pull: { 'doubts.$.upvotes': me } } : { $addToSet: { 'doubts.$.upvotes': me } });
+    cacheClear('courses:');
+    res.json({ success: true, voted: !has, count: (d.upvotes || []).length + (has ? -1 : 1) });
+  } catch (e) { res.status(500).json({ success: false, message: 'Error: ' + e.message }); }
+});
+
 app.put('/api/courses/:courseId/doubts/:doubtId/replies/:replyId/accept', requireUser, async (req, res) => {
   try {
     const acceptedBy = req.authUser.username;   // ⭐ from the session, not the body
@@ -7116,11 +8383,25 @@ app.put('/api/courses/:courseId/doubts/:doubtId/replies/:replyId/accept', requir
 /* ============================================================
    QUIZ — Save paper (admin)
    ============================================================ */
-app.post('/api/courses/:courseId/materials/:materialId/quiz', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/materials/:materialId/quiz', requireCourseEditor, async (req, res) => {
   try {
     const { quiz, examConfig } = req.body || {};
     if (!Array.isArray(quiz)) {
       return res.status(400).json({ success: false, message: 'quiz must be an array' });
+    }
+    if (req.editorRole === 'professor') {
+      /* ⭐ Professors may add and edit questions, never remove them */
+      const rows = await Course.aggregate([
+        { $match: { _id: new mongoose.Types.ObjectId(String(req.params.courseId)) } },
+        { $project: { m: { $filter: { input: '$materials', as: 'm', cond: { $eq: [{ $toString: '$$m._id' }, String(req.params.materialId)] } } } } },
+        { $project: { n: { $size: { $ifNull: [{ $arrayElemAt: ['$m.quiz', 0] }, []] } } } }
+      ]);
+      const existing = (rows[0] && rows[0].n) || 0;
+      if (quiz.length < existing) {
+        return res.status(403).json({ success: false, code: 'NO_DELETE',
+          message: `Professors cannot delete questions (this paper has ${existing}; ${quiz.length} were sent). Edit the question instead.` });
+      }
+      console.log(`[prof] 📝 ${req.authUser.username} saved paper ${req.params.materialId} (${existing} → ${quiz.length} questions)`);
     }
 
     const update = { 'materials.$.quiz': quiz };
@@ -7159,6 +8440,18 @@ app.post('/api/courses/:courseId/materials/:materialId/quiz', requireAdminAuth, 
         ? Math.max(0, Math.min(8760, parseInt(examConfig.resultPublishDelayHours, 10) || 0))
         : 0;
       update[P + '.resultPublishDelayHours'] = delayH;
+
+      /* ⭐ 2026-10-11 — assignment mode, due date, leaderboard */
+      const kind = examConfig.kind === 'assignment' ? 'assignment' : 'test';
+      update[P + '.kind'] = kind;
+      let dueAt = null;
+      if (kind === 'assignment' && examConfig.dueAt) {
+        const d = new Date(examConfig.dueAt);
+        if (!isNaN(d.getTime())) dueAt = d;
+      }
+      update[P + '.dueAt'] = dueAt;
+      update[P + '.allowLate'] = examConfig.allowLate !== false;
+      update[P + '.showLeaderboard'] = examConfig.showLeaderboard === true;
 
       /* ⚠️ `resultsPublished` / `resultsPublishedAt` are deliberately
          NOT touched here — they persist so re-saving a quiz that has
@@ -7226,13 +8519,16 @@ app.post('/api/user/quiz/:courseId/:materialId/start', requireUser, requireSelfO
        student can resume it freely without burning an attempt.
        ============================================================ */
     const cfg          = mat.examConfig || {};
-    const maxAttempts  = Math.max(0, Number(cfg.maxAttempts) || 0);
+    const baseMaxAttempts = Math.max(0, Number(cfg.maxAttempts) || 0);
 
     const student = await User.findById(userId).select('quizResults').lean();
     if (!student) return res.status(404).json({ success: false, message: 'User not found.' });
 
     const existingResult = (student.quizResults || {})[String(req.params.materialId)] || {};
     const attemptsUsed   = Number(existingResult.attempts) || 0;
+    /* ⭐ extra attempts the instructor granted this student */
+    const extraGranted   = Math.max(0, Number(existingResult.extraAttempts) || 0);
+    const maxAttempts    = baseMaxAttempts > 0 ? baseMaxAttempts + extraGranted : 0;
 
     const publishMode   = cfg.resultPublishMode || 'immediate';
     const publishedAtMs = existingResult.publishedAt
@@ -7261,7 +8557,26 @@ app.post('/api/user/quiz/:courseId/:materialId/start', requireUser, requireSelfO
       materialId: String(req.params.materialId)
     });
 
-    const isResuming = !!(session && session.status === 'in-progress');
+    /* ⭐ 2026-10-10: the last attempt ran out of time without a submit.
+       It used to be deleted below and replaced by a FRESH attempt with a
+       full timer (not even counted) — now it is graded from its autosaved
+       answers and counts as an attempt. */
+    if (session && session.status !== 'submitted' && _quizSessionOverdue(session, await _quizGraceMs())) {
+      const out = await finalizeExpiredQuizSession(session);
+      if (out && out.code === 200) {
+        return res.status(409).json({
+          success: false,
+          code: 'EXPIRED_AUTO_SUBMITTED',
+          message: 'Time ran out on your last attempt — the answers saved before the deadline were submitted.',
+          result: out.body
+        });
+      }
+      session = await QuizSession.findOne({ _id: session._id });
+    }
+
+    /* 'expired' = the heartbeat saw time reach zero; still inside the grace
+       window it is the SAME attempt (a refresh must not start a new one) */
+    const isResuming = !!(session && (session.status === 'in-progress' || session.status === 'expired'));
 
     /* Refuse a fresh attempt once the cap is reached, unless we are
        literally resuming an already-open in-progress session. */
@@ -7299,8 +8614,13 @@ app.post('/api/user/quiz/:courseId/:materialId/start', requireUser, requireSelfO
         );
       }
 
+      /* ⭐ assignments: past the due date with late submissions off → closed */
+      if (cfg.kind === 'assignment' && cfg.dueAt && cfg.allowLate === false && Date.now() > new Date(cfg.dueAt).getTime()) {
+        return res.status(403).json({ success: false, code: 'DEADLINE_PASSED', message: 'The due date for this assignment has passed.' });
+      }
+
       const settings        = await getGlobalSettings();
-      const durationSeconds = parseQuizTimeServer(cfg.totalTime);
+      const durationSeconds = cfg.kind === 'assignment' ? 0 : parseQuizTimeServer(cfg.totalTime);   // assignments have no timer
 
       const shuffleSeed = crypto
         .createHash('sha256')
@@ -7377,6 +8697,15 @@ app.post('/api/user/quiz/:courseId/:materialId/start', requireUser, requireSelfO
       questionOrder: session.questionOrder,
       optionOrders: session.optionOrders,
       questionCount: quiz.length,
+      resumed: isResuming,              // ⭐ false = a fresh attempt (stale saved answers must not carry over)
+      kind:      cfg.kind === 'assignment' ? 'assignment' : 'test',
+      dueAt:     cfg.dueAt || null,
+      allowLate: cfg.allowLate !== false,
+      /* ⭐ resuming (refresh / other device): the server's copy of the answers
+         and the proctoring strikes so far — a reload no longer clears strikes */
+      savedAnswers: isResuming && Array.isArray(session.savedAnswers) ? session.savedAnswers : null,
+      savedAt:      isResuming && session.savedAt ? session.savedAt.getTime() : null,
+      proctor:      isResuming ? (session.proctor || null) : null,
       allowBackNavigation,
       showQuestionPalette,
 
@@ -7551,6 +8880,127 @@ app.get('/api/user/quiz/:courseId/:materialId/heartbeat', requireUser, requireSe
 });
 
 /* ============================================================
+   ⭐ QUIZ — MY RESULT (student, 2026-10-10)
+   GET /api/user/quiz/:courseId/:materialId/my-result?userId=…
+   The student's latest attempt: totals, the grading of every uploaded
+   answer and the grader's feedback — only once results are visible.
+   ============================================================ */
+app.get('/api/user/quiz/:courseId/:materialId/my-result', requireUser, requireSelfOrAdmin('query'), async (req, res) => {
+  try {
+    const userId = String(req.query.userId || '');
+    const mid = String(req.params.materialId);
+    if (!/^[a-f0-9]{24}$/i.test(userId) || !/^[a-f0-9]{24}$/i.test(mid)) return res.status(400).json({ success: false, message: 'Invalid request.' });
+    const course = await Course.findById(req.params.courseId).select('materials').lean();
+    const mat = course && (course.materials || []).find(m => String(m._id) === mid);
+    if (!mat) return res.status(404).json({ success: false, message: 'Test not found.' });
+    const u = await User.findById(userId).select(`quizResults.${mid}`).lean();
+    const r = u && (u.quizResults || {})[mid];
+    if (!r || !r.attempts) return res.status(404).json({ success: false, message: 'You have not submitted this test yet.' });
+
+    const cfg = mat.examConfig || {};
+    const mode = cfg.resultPublishMode || 'immediate';
+    let visible = mode === 'immediate' || !!r.publishedAt;
+    let publishAt = null;
+    if (!visible && mode === 'scheduled') {
+      const abs = cfg.resultPublishAt ? new Date(cfg.resultPublishAt).getTime() : null;
+      const rel = !abs && Number(cfg.resultPublishDelayHours) > 0 && r.lastAttemptAt ? new Date(r.lastAttemptAt).getTime() + Number(cfg.resultPublishDelayHours) * 3600e3 : null;
+      publishAt = abs || rel;
+      if (publishAt && Date.now() >= publishAt) visible = true;
+    }
+    res.set('Cache-Control', 'private, no-store');
+    if (!visible) return res.json({ success: true, visible: false, attempts: r.attempts, publishAt });
+
+    const quiz = Array.isArray(mat.quiz) ? mat.quiz : [];
+    const evals = r.subjectiveEvaluations || {};
+    const written = Object.keys(r.subjectiveQuestionMeta || {}).sort((a, b) => a - b).map(qi => {
+      const ev = evals[qi];
+      return {
+        number: Number(qi) + 1,
+        question: String((quiz[qi] && quiz[qi].question) || '').slice(0, 400),
+        maxMarks: Number((r.subjectiveQuestionMeta[qi] || {}).maxMarks) || 0,
+        awardedMarks: ev ? Number(ev.awardedMarks) || 0 : null,
+        feedback: ev ? String(ev.feedback || '') : ''
+      };
+    });
+    const autoMarks = Number(r.marksEarned) || 0, autoMax = Number(r.marksPossible) || 0;
+    const writtenMarks = Number(r.subjectiveMarksAwarded) || 0, writtenMax = Number(r.subjectiveMaxTotal) || 0;
+
+    /* ⭐ 2026-10-11 — rank, percentile and (when the instructor turned it on) the top 10 */
+    let standing = null, leaderboard = null;
+    if (learningApi) {
+      try {
+        const all = (await learningApi.resultsFor([mid]))[mid] || [];
+        standing = learningApi.rankOf(all, userId);
+        standing.classAvg = all.length ? Math.round(all.reduce((s, x) => s + x.pct, 0) / all.length * 10) / 10 : 0;
+        if (cfg.showLeaderboard) {
+          const nm = (n) => { const p = String(n || 'Student').trim().split(/\s+/); return p.length > 1 ? `${p[0]} ${p[p.length - 1][0]}.` : p[0]; };
+          leaderboard = all.slice().sort((a, b) => b.pct - a.pct).slice(0, 10)
+            .map((x, i) => ({ rank: i + 1, name: nm(x.name), pct: x.pct, me: x.userId === userId }));
+        }
+      } catch (_) {}
+    }
+    res.json({
+      success: true, visible: true, attempts: r.attempts,
+      standing, leaderboard,
+      autoMarks, autoMax, writtenMarks, writtenMax,
+      finalMarks: Math.round((autoMarks + writtenMarks) * 100) / 100, finalMax: autoMax + writtenMax,
+      pendingEvaluation: written.some(w => w.awardedMarks === null),
+      endedNote: r.finalizedBy === 'server' ? 'Time ran out before this attempt was submitted — the answers saved before the deadline were graded.' : '',
+      written
+    });
+  } catch (e) {
+    console.error('[quiz/my-result]', e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ============================================================
+   QUIZ — AUTOSAVE  (⭐ 2026-10-10)
+   ------------------------------------------------------------
+   POST /api/user/quiz/:courseId/:materialId/autosave
+   Body: { userId, answers, timeSpentPerQuestion?, proctor? }
+
+   The player sends the answers a few seconds after every change.
+   Accepted only while the attempt can still be submitted (deadline
+   + grace), so it can never be used to change answers afterwards.
+   ============================================================ */
+const quizAutosaveLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => String((req.body && req.body.userId) || '') + ':' + req.params.materialId,
+  message: { success: false, code: 'RATE_LIMITED', message: 'Saving too often — slowing down.' }
+});
+app.post('/api/user/quiz/:courseId/:materialId/autosave', quizAutosaveLimiter, requireUser, requireSelfOrAdmin('body'), async (req, res) => {
+  try {
+    const { userId, answers, timeSpentPerQuestion, proctor } = req.body || {};
+    if (!userId || !Array.isArray(answers)) return res.status(400).json({ success: false, message: 'userId and answers required.' });
+    if (answers.length > 500 || JSON.stringify(answers).length > 200000) {
+      return res.status(413).json({ success: false, message: 'Answer sheet too large.' });
+    }
+    const session = await QuizSession.findOne({
+      userId: String(userId), courseId: String(req.params.courseId), materialId: String(req.params.materialId)
+    });
+    if (!session) return res.status(404).json({ success: false, code: 'NO_SESSION', message: 'No running attempt.' });
+    if (session.status === 'submitted') return res.status(409).json({ success: false, code: 'ALREADY_SUBMITTED', message: 'Already submitted.' });
+    const _gMs = await _quizGraceMs();
+    if (_quizSessionOverdue(session, _gMs) || await _assignmentClosed(String(req.params.courseId), String(req.params.materialId), _gMs)) {
+      return res.status(410).json({ success: false, code: 'TIME_EXPIRED', message: 'Time is up.' });
+    }
+    const set = { savedAnswers: answers, savedAt: new Date(), lastHeartbeat: new Date() };
+    if (timeSpentPerQuestion && typeof timeSpentPerQuestion === 'object') set.timeSpentPerQuestion = timeSpentPerQuestion;
+    const p = _cleanProctorLog(proctor);
+    /* strikes only ever go up — a client cannot wipe its own record */
+    if (p && (!session.proctor || p.strikes >= (Number(session.proctor.strikes) || 0))) set.proctor = p;
+    await QuizSession.updateOne({ _id: session._id, status: { $ne: 'submitted' } }, { $set: set });
+    const now = Date.now();
+    const endsAt = session.durationSeconds > 0 ? session.startedAt.getTime() + session.durationSeconds * 1000 : null;
+    res.json({ success: true, savedAt: set.savedAt.getTime(), serverNow: now, remainingSeconds: endsAt ? Math.max(0, Math.floor((endsAt - now) / 1000)) : null });
+  } catch (e) {
+    console.error('[quiz/autosave]', e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/* ============================================================
    QUIZ — RESET SESSION  (fresh attempt on retake)
    ------------------------------------------------------------
    POST /api/user/quiz/:courseId/:materialId/reset
@@ -7564,6 +9014,20 @@ app.post('/api/user/quiz/:courseId/:materialId/reset', requireUser, requireSelfO
     const { userId } = req.body || {};
     if (!userId) return res.status(400).json({ success: false, message: 'userId required.' });
 
+    /* ⭐ 2026-10-10: a running attempt cannot be "reset" — that used to hand
+       the student a brand-new full timer in the middle of the exam. Only a
+       finished (submitted / expired / time-over) session is cleared. */
+    const cur = await QuizSession.findOne({
+      userId: String(userId), courseId: String(req.params.courseId), materialId: String(req.params.materialId)
+    });
+    if (cur && cur.status !== 'submitted') {
+      /* still submittable (running, or inside the grace window) → no reset */
+      if (!_quizSessionOverdue(cur, await _quizGraceMs())) {
+        return res.status(409).json({ success: false, code: 'IN_PROGRESS', message: 'This attempt is still running — submit it first.' });
+      }
+      /* ran out without a submit → it counts, graded from its autosave */
+      await finalizeExpiredQuizSession(cur);
+    }
     const result = await QuizSession.deleteOne({
       userId: String(userId),
       courseId: String(req.params.courseId),
@@ -7580,71 +9044,113 @@ app.post('/api/user/quiz/:courseId/:materialId/reset', requireUser, requireSelfO
   }
 });
 
-/* ============================================================
-   QUIZ — Grade submission (student)
-   Supports: single, multiple, integer, matrix
-   ============================================================ */
-app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin('body'), async (req, res) => {
+/* ⭐ 2026-10-10: grading lives in one place so a normal submit, a late
+   submit and the server finalising an abandoned attempt (time ran out,
+   tab closed) all grade the same way. Returns { code, body }. */
+const _gr = (code, body) => ({ code, body });
+
+/* a student's answer in a small, safe shape for storing */
+function _compactAnswer(a) {
+  if (a === undefined || a === null || a === '') return null;
+  if (Array.isArray(a)) return a.slice(0, 50).map(x => (x === undefined || x === null || x === '') ? null : (isFinite(Number(x)) ? Number(x) : null));
+  if (typeof a === 'number') return isFinite(a) ? a : null;
+  const n = Number(a);
+  return isFinite(n) ? n : String(a).slice(0, 40);
+}
+
+/* proctoring log as the client reports it → a small, trusted shape */
+function _cleanProctorLog(p) {
+  if (!p || typeof p !== 'object') return null;
+  const events = (Array.isArray(p.events) ? p.events : []).slice(-50).map(e => ({
+    reason: String((e && e.reason) || '').slice(0, 160),
+    at:     Number(e && e.at) || 0,
+    strike: !(e && e.strike === false)
+  }));
+  return { strikes: Math.max(0, Math.min(99, Number(p.strikes) || 0)), events };
+}
+
+/* ⭐ an assignment whose due date passed and that takes no late work */
+async function _assignmentClosed(courseId, materialId, graceMs) {
   try {
-    const { userId, answers, timeSpentPerQuestion, autoSubmitted } = req.body || {};
-    if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
-    if (!Array.isArray(answers)) {
-      return res.status(400).json({ success: false, message: 'answers must be an array' });
-    }
+    const c = await Course.findOne({ _id: courseId, 'materials._id': materialId }, { 'materials.$': 1 }).lean();
+    const cfg = (c && c.materials && c.materials[0] && c.materials[0].examConfig) || {};
+    return cfg.kind === 'assignment' && !!cfg.dueAt && cfg.allowLate === false && Date.now() > new Date(cfg.dueAt).getTime() + (graceMs || 0);
+  } catch (_) { return false; }
+}
 
-    /* ---- Server-side deadline enforcement ----
-       Load the session (if one exists) and refuse submissions that
-       arrived after the server-recorded deadline + grace. This
-       catches the case where a student disables JS, edits the
-       client clock, or replays a stale request. */
-    let _session = null;
-    try {
-      _session = await QuizSession.findOne({
-        userId: String(userId),
-        courseId: String(req.params.courseId),
-        materialId: String(req.params.materialId)
-      });
-    } catch (_) { /* non-fatal — session may not exist for legacy flows */ }
+async function _quizGraceMs() {
+  try { return (Number((await getGlobalSettings()).examServerTimerGraceSec) || 30) * 1000; }
+  catch (_) { return 30000; }
+}
 
-    if (_session && _session.status === 'submitted') {
-      return res.status(409).json({
-        success: false,
-        code: 'ALREADY_SUBMITTED',
-        message: 'This test has already been submitted.'
-      });
-    }
+/* past deadline + grace? (untimed tests never are) */
+function _quizSessionOverdue(session, graceMs) {
+  if (!session || !(session.durationSeconds > 0)) return false;
+  return Date.now() > new Date(session.startedAt).getTime() + session.durationSeconds * 1000 + graceMs;
+}
 
-    if (_session && _session.durationSeconds > 0) {
-      let graceSec = 30;
-      try {
-        const _gs = await getGlobalSettings();
-        graceSec = Number(_gs.examServerTimerGraceSec) || 30;
-      } catch (_) {}
-      const endsAt = _session.startedAt.getTime() + _session.durationSeconds * 1000;
-      const overdueMs = Date.now() - endsAt;
-      if (overdueMs > graceSec * 1000) {
-        _session.status = 'expired';
-        _session.autoSubmitted = true;
-        _session.submittedAt = new Date();
-        try { await _session.save(); } catch (_) {}
-        console.warn(
-          `[quiz/submit] ⏰ rejected late submission user=${userId} overdue=${Math.round(overdueMs/1000)}s`
-        );
-        return res.status(410).json({
-          success: false,
-          code: 'TIME_EXPIRED',
-          message: 'Your attempt has expired. Answers must be submitted before the deadline.'
-        });
-      }
-    }
+/* Atomically take the right to grade this session — two submits racing
+   (time-up + a click, or two tabs) can no longer record two attempts. */
+async function _claimQuizSession(session) {
+  const prevStatus = session.status;
+  const won = await QuizSession.findOneAndUpdate(
+    { _id: session._id, status: { $ne: 'submitted' } },
+    { $set: { status: 'submitted', submittedAt: new Date() } },
+    { returnDocument: 'after' }
+  );
+  return won ? { session: won, prevStatus } : null;
+}
 
-    const course = await Course.findById(req.params.courseId);
-    if (!course) return res.status(404).json({ success: false, message: 'Course not found' });
-    const mat = course.materials.id(req.params.materialId);
-    if (!mat) return res.status(404).json({ success: false, message: 'Material not found' });
+/* ⭐ The attempt ran out without a submit (tab closed, phone off, network
+   down at time-up). Grade the answers that were autosaved before the
+   deadline as an auto-submitted attempt instead of throwing it away —
+   and instead of handing out a fresh attempt with a full timer. */
+async function finalizeExpiredQuizSession(session) {
+  const claim = await _claimQuizSession(session);
+  if (!claim) return null;                                 // someone else already submitted it
+  try {
+    const out = await gradeQuizAttempt({
+      userId: session.userId, courseId: session.courseId, materialId: session.materialId,
+      answers: Array.isArray(claim.session.savedAnswers) ? claim.session.savedAnswers : [],
+      timeSpentPerQuestion: claim.session.timeSpentPerQuestion,
+      autoSubmitted: true, _session: claim.session, proctor: claim.session.proctor, finalizedBy: 'server'
+    });
+    if (out.code !== 200) await QuizSession.updateOne({ _id: session._id }, { $set: { status: claim.prevStatus } });
+    console.log(`[quiz] ⏰ finalised expired attempt user=${session.userId} mat=${session.materialId} → ${out.code}`);
+    return out;
+  } catch (e) {
+    await QuizSession.updateOne({ _id: session._id }, { $set: { status: claim.prevStatus } }).catch(() => {});
+    throw e;
+  }
+}
+
+async function gradeQuizAttempt({ userId, courseId, materialId, answers, timeSpentPerQuestion, autoSubmitted, _session, proctor, finalizedBy }) {
+  if (!Array.isArray(answers)) answers = [];
+  proctor = _cleanProctorLog(proctor);
+  {
+    const course = await Course.findById(courseId);
+    if (!course) return _gr(404, { success: false, message: 'Course not found' });
+    const mat = course.materials.id(materialId);
+    if (!mat) return _gr(404, { success: false, message: 'Material not found' });
 
     const quiz = mat.quiz || [];
-    if (quiz.length === 0) return res.status(400).json({ success: false, message: 'This material has no questions' });
+    if (quiz.length === 0) return _gr(400, { success: false, message: 'This material has no questions' });
+
+    /* ⭐ 2026-10-10: the attempt limit is enforced here too — before, only
+       /start checked it, so a direct submit (after /reset) could add
+       attempts beyond the cap and overwrite the recorded result. */
+    {
+      let capN = Math.max(0, Number((mat.examConfig || {}).maxAttempts) || 0);
+      if (capN > 0) {
+        const u0 = await User.findById(userId).select('quizResults').lean();
+        const r0 = (((u0 && u0.quizResults) || {})[String(materialId)] || {});
+        const used0 = Number(r0.attempts) || 0;
+        capN += Math.max(0, Number(r0.extraAttempts) || 0);     // instructor-granted extra attempts
+        if (used0 >= capN) {
+          return _gr(403, { success: false, code: 'ATTEMPT_LIMIT_REACHED', message: `You have used all ${capN} attempt${capN === 1 ? '' : 's'} for this test.` });
+        }
+      }
+    }
 
     let score = 0;                    // auto-graded correct count (excludes subjective)
     let totalMarksPossible = 0;       // marks from AUTO-GRADED questions only
@@ -7666,7 +9172,11 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
         const subMax = Number(q.subjectiveMaxMarks) || qMarks || 10;
         subjectiveMaxTotal += subMax;
         subjectiveCount++;
-        subjectiveAnswers[i] = Array.isArray(ans) ? ans.filter(x => x && x.url) : [];
+        /* only files on this server, in a fixed shape (the client sends whatever it likes) */
+        subjectiveAnswers[i] = (Array.isArray(ans) ? ans : [])
+          .filter(x => x && typeof x.url === 'string' && /^\/uploads\/[^\s?#]+$/.test(x.url) && !x.url.includes('..'))
+          .slice(0, 10)
+          .map(x => ({ url: x.url, fileName: String(x.fileName || '').slice(0, 200), isPdf: /\.pdf$/i.test(x.url) || x.isPdf === true }));
         subjectiveQuestionMeta[i] = {
           maxMarks: subMax,
           instructions: q.subjectiveInstructions || ''
@@ -7737,21 +9247,26 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
         }
       }
 
+      const attempted =
+        (qType === 'integer' || qType === 'numerical')
+          ? (ans !== null && ans !== undefined && ans !== '' && !isNaN(Number(ans)))
+          : (Array.isArray(ans) ? ans.filter(x => x !== undefined && x !== null && x !== '').length > 0
+                               : (ans !== null && ans !== undefined && ans !== -1));
+      let gained = 0;
       if (correct) {
         score++;
         marksEarned += qMarks;
-      } else {
-        const attempted =
-          (qType === 'integer' || qType === 'numerical')
-            ? (ans !== null && ans !== undefined && ans !== '' && !isNaN(Number(ans)))
-            : (Array.isArray(ans) ? ans.filter(x => x !== undefined && x !== null && x !== '').length > 0
-                                 : (ans !== null && ans !== undefined && ans !== -1));
-        if (attempted && qNeg < 0) marksEarned += qNeg;
+        gained = qMarks;
+      } else if (attempted && qNeg < 0) {
+        marksEarned += qNeg;
+        gained = qNeg;
       }
 
       return {
         type: qType,
         correct,
+        attempted,
+        gained,
         chosen: ans,
         correctIndexes: q.correctIndexes || (typeof q.correctIndex === 'number' ? [q.correctIndex] : []),
         integerAnswer: q.integerAnswer,
@@ -7773,12 +9288,23 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
       ? Math.max(0, Math.round(marksEarned * 100) / 100)
       : 0;
 
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    if (!user.quizResults) user.quizResults = new Map();
-    const prev = user.quizResults.get(req.params.materialId) || { attempts: 0 };
+    /* ⭐ a written question with nothing uploaded has nothing to grade —
+       it is marked 0 straight away (the grader can still change it), so
+       blank sheets don't sit in the grading queue */
+    const _blankSheetEvals = {};
+    Object.keys(subjectiveAnswers).forEach(qi => {
+      if (!subjectiveAnswers[qi].length) {
+        _blankSheetEvals[qi] = { awardedMarks: 0, feedback: 'No answer was uploaded.', evaluatedAt: new Date(), evaluatedBy: 'auto' };
+      }
+    });
+    const _sheetsToGrade = subjectiveCount - Object.keys(_blankSheetEvals).length;
 
-    user.quizResults.set(req.params.materialId, {
+    const user = await User.findById(userId);
+    if (!user) return _gr(404, { success: false, message: 'User not found' });
+    if (!user.quizResults) user.quizResults = new Map();
+    const prev = user.quizResults.get(materialId) || { attempts: 0 };
+
+    user.quizResults.set(materialId, {
       score,                                  // auto-graded correct count
       total: autoGradedCount,                 // auto-graded total
       percent: pct,
@@ -7792,15 +9318,44 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
       subjectiveQuestionMeta,
       subjectiveMaxTotal,
       subjectiveCount,
-      subjectiveEvaluations: prev.subjectiveEvaluations || {},
-      pendingEvaluation: subjectiveCount > 0,
-      manuallyEvaluated: false
+      subjectiveEvaluations: _blankSheetEvals,  // a new attempt is a new answer sheet — old grades must not carry over
+      subjectiveMarksAwarded: 0,
+      pendingEvaluation: _sheetsToGrade > 0,
+      manuallyEvaluated: subjectiveCount > 0 && _sheetsToGrade === 0,
+
+      /* ⭐ proctoring + how the attempt ended, for the instructor */
+      proctor:      proctor || null,
+      autoSubmitted: autoSubmitted === true,
+      finalizedBy:  finalizedBy || 'student',  // 'server' = time ran out, graded from the autosave
+      /* ⭐ assignments: submitted after the due date */
+      kind: (mat.examConfig || {}).kind === 'assignment' ? 'assignment' : 'test',
+      late: !!((mat.examConfig || {}).kind === 'assignment' && (mat.examConfig || {}).dueAt && Date.now() > new Date(mat.examConfig.dueAt).getTime()),
+
+      /* ⭐ 2026-10-10 — what the student actually answered, question by
+         question (original question order), for the Grading section */
+      responses: results.map(r => r.type === 'subjective'
+        ? { t: 'subjective', a: null, c: null, g: null }
+        : { t: r.type, a: _compactAnswer(r.chosen), c: !!r.correct, at: !!r.attempted, g: r.gained }),
+      questionCount: quiz.length,
+      startedAt: _session && _session.startedAt ? _session.startedAt : null,
+      durationSeconds: _session ? Number(_session.durationSeconds) || 0 : 0,
+      extraAttempts: Number(prev.extraAttempts) || 0,     // granted by the instructor — survives new attempts
+      /* earlier attempts, newest last */
+      history: (prev.attempts > 0
+        ? [...(Array.isArray(prev.history) ? prev.history : []), {
+            attempt: prev.attempts, at: prev.lastAttemptAt || null,
+            marksEarned: (Number(prev.marksEarned) || 0) + (Number(prev.subjectiveMarksAwarded) || 0),
+            marksPossible: (Number(prev.marksPossible) || 0) + (Number(prev.subjectiveMaxTotal) || 0),
+            strikes: (prev.proctor && Number(prev.proctor.strikes)) || 0,
+            finalizedBy: prev.finalizedBy || 'student', autoSubmitted: !!prev.autoSubmitted
+          }]
+        : []).slice(-20)
     });
 
     logActivity(user, {
       type: 'quiz',
-      courseId: req.params.courseId,
-      materialId: req.params.materialId,
+      courseId: courseId,
+      materialId: materialId,
       score, total: autoGradedCount
     });
 
@@ -7864,11 +9419,11 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
           { _id: user._id },
           {
             $set: {
-              [`quizResults.${req.params.materialId}.publishedAt`]:        new Date(submittedAtMs),
-              [`quizResults.${req.params.materialId}.manuallyEvaluated`]:  true,
-              [`quizResults.${req.params.materialId}.finalMarksEarned`]:   normalizedMarks,
-              [`quizResults.${req.params.materialId}.finalMarksPossible`]: totalMarksPossible,
-              [`quizResults.${req.params.materialId}.finalPercent`]:       pct
+              [`quizResults.${materialId}.publishedAt`]:        new Date(submittedAtMs),
+              [`quizResults.${materialId}.manuallyEvaluated`]:  true,
+              [`quizResults.${materialId}.finalMarksEarned`]:   normalizedMarks,
+              [`quizResults.${materialId}.finalMarksPossible`]: totalMarksPossible,
+              [`quizResults.${materialId}.finalPercent`]:       pct
             }
           }
         );
@@ -7898,6 +9453,7 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
         _session.status = 'submitted';
         _session.submittedAt = new Date();
         if (autoSubmitted === true) _session.autoSubmitted = true;
+        if (proctor) _session.proctor = proctor;
         await _session.save();
       } catch (sessErr) {
         console.warn('[quiz/submit] session close failed:', sessErr.message);
@@ -7907,14 +9463,13 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
     /* ---- Store per-question time on the result record too ---- */
     if (timeSpentPerQuestion && typeof timeSpentPerQuestion === 'object') {
       try {
-        const r = user.quizResults.get(String(req.params.materialId));
-        if (r) {
-          r.timeSpentPerQuestion = timeSpentPerQuestion;
-          r.timeSpentTotalSeconds = Object.values(timeSpentPerQuestion)
-            .reduce((s, v) => s + (Number(v) || 0), 0);
-          user.quizResults.set(String(req.params.materialId), r);
-          await user.save();
-        }
+        /* ⭐ a targeted $set — re-saving the whole in-memory result here
+           used to wipe the publishedAt / final marks written just above,
+           so "immediate" results lost their published state */
+        await User.updateOne({ _id: user._id }, { $set: {
+          [`quizResults.${materialId}.timeSpentPerQuestion`]: timeSpentPerQuestion,
+          [`quizResults.${materialId}.timeSpentTotalSeconds`]: Object.values(timeSpentPerQuestion).reduce((s, v) => s + (Number(v) || 0), 0)
+        } });
       } catch (tErr) {
         console.warn('[quiz/submit] time analytics persist failed:', tErr.message);
       }
@@ -7926,7 +9481,10 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
        result is visible; a small, additive `pendingPublication`
        block is returned when it isn't.
        ============================================================ */
+    const _cfgK = mat.examConfig || {};
     const baseMeta = {
+      kind:              _cfgK.kind === 'assignment' ? 'assignment' : 'test',
+      late:              !!(_cfgK.kind === 'assignment' && _cfgK.dueAt && Date.now() > new Date(_cfgK.dueAt).getTime()),
       attempts:          (prev.attempts || 0) + 1,
       attemptsUsed:      (prev.attempts || 0) + 1,
       maxAttempts:       Math.max(0, Number(cfg.maxAttempts) || 0),
@@ -7938,10 +9496,10 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
     if (!resultsVisible) {
       /* Score is hidden. Send enough info for the UI to render an
          informative "Results Pending" card, but no numbers. */
-      return res.json({
+      return _gr(200, {
         success: true,
         pendingPublication: true,
-        pendingEvaluation: subjectiveCount > 0 && !resultsVisible,
+        pendingEvaluation: _sheetsToGrade > 0 && !resultsVisible,
         subjectiveCount,
         subjectiveMaxTotal,
         ...baseMeta,
@@ -7953,7 +9511,7 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
       });
     }
 
-    res.json({
+    return _gr(200, {
       success: true,
       score,
       total: autoGradedCount,
@@ -7965,7 +9523,7 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
 
       subjectiveCount,
       subjectiveMaxTotal,
-      pendingEvaluation: subjectiveCount > 0,
+      pendingEvaluation: _sheetsToGrade > 0,
 
       xp: user.xp || 0,
       level: user.level || 1,
@@ -7974,6 +9532,65 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
 
       ...baseMeta
     });
+  }
+}
+/* ============================================================
+   QUIZ — Grade submission (student)
+   Supports: single, multiple, integer, matrix
+   ============================================================ */
+app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin('body'), async (req, res) => {
+  try {
+    const { userId, answers, timeSpentPerQuestion, autoSubmitted, proctor } = req.body || {};
+    if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({ success: false, message: 'answers must be an array' });
+    }
+
+    /* ---- Server-side deadline enforcement ----
+       Every attempt runs on a server session (created by /start). A
+       submit without one used to skip the timer completely. */
+    const _session = await QuizSession.findOne({
+      userId: String(userId),
+      courseId: String(req.params.courseId),
+      materialId: String(req.params.materialId)
+    });
+    if (!_session) {
+      return res.status(409).json({ success: false, code: 'NO_SESSION', message: 'This attempt was not started on the server. Please open the test again.' });
+    }
+    if (_session.status === 'submitted') {
+      return res.status(409).json({
+        success: false,
+        code: 'ALREADY_SUBMITTED',
+        message: 'This test has already been submitted.'
+      });
+    }
+
+    /* ⭐ Too late (deadline + grace passed): the answers sent now are not
+       accepted, but the attempt is not lost either — it is graded from the
+       answers autosaved before the deadline. */
+    const _graceMs = await _quizGraceMs();
+    if (_quizSessionOverdue(_session, _graceMs) || await _assignmentClosed(String(req.params.courseId), String(req.params.materialId), _graceMs)) {
+      console.warn(`[quiz/submit] ⏰ late submission user=${userId} — grading the autosaved answers`);
+      const out = await finalizeExpiredQuizSession(_session);
+      if (!out) return res.status(409).json({ success: false, code: 'ALREADY_SUBMITTED', message: 'This test has already been submitted.' });
+      if (out.code === 200) {
+        out.body.lateSubmission = true;
+        out.body.message = 'Time was up before your answers reached the server — the answers saved before the deadline were submitted.';
+      }
+      return res.status(out.code).json(out.body);
+    }
+
+    const claim = await _claimQuizSession(_session);
+    if (!claim) return res.status(409).json({ success: false, code: 'ALREADY_SUBMITTED', message: 'This test has already been submitted.' });
+    let out;
+    try {
+      out = await gradeQuizAttempt({ userId, courseId: String(req.params.courseId), materialId: String(req.params.materialId), answers, timeSpentPerQuestion, autoSubmitted, _session: claim.session, proctor });
+    } catch (gradeErr) {
+      await QuizSession.updateOne({ _id: _session._id }, { $set: { status: claim.prevStatus } }).catch(() => {});
+      throw gradeErr;
+    }
+    if (out.code !== 200) await QuizSession.updateOne({ _id: _session._id }, { $set: { status: claim.prevStatus } });   // e.g. attempt limit — nothing was recorded
+    return res.status(out.code).json(out.body);
   } catch (e) {
     console.error('[quiz/grade]', e);
     res.status(500).json({ success: false, message: 'Error grading quiz: ' + e.message });
@@ -7986,77 +9603,408 @@ app.post('/api/user/quiz/:courseId/:materialId', requireUser, requireSelfOrAdmin
    Recomputes total marks and marks the submission as evaluated
    when all subjective questions have been graded.
    ============================================================ */
+/* ============================================================
+   ⭐ GRADING SECTION (2026-10-10)
+   ------------------------------------------------------------
+   One place for the instructor: every test across every course
+   (only their own courses for a professor), the queue of answer
+   sheets waiting for marks, attempts running right now, and a
+   full question-by-question view of any attempt.
+   ============================================================ */
+async function requireGrader(req, res, next) {
+  const token = _extractToken(req, true);
+  if (!token) return res.status(401).json({ success: false, code: 'NO_TOKEN', message: 'Authentication required.' });
+  const r = await resolveSessionUser(token);
+  if (!r.user) return res.status(r.code === 'AUTH_UNAVAILABLE' ? 503 : 401).json({ success: false, code: r.code, message: r.message });
+  req.authUser = r.user;
+  if (_isAdminUser(r.user)) { req.graderScope = null; return next(); }
+  if (_isProfessorUser(r.user)) {
+    req.graderScope = new Set(((r.user.professor && r.user.professor.courses) || []).map(String));
+    return next();
+  }
+  return res.status(403).json({ success: false, message: 'Instructors only.' });
+}
+
+/* final marks of one stored result */
+function _resultFinal(r) {
+  const earned = (Number(r.marksEarned) || 0) + (Number(r.subjectiveMarksAwarded) || 0);
+  const possible = (Number(r.marksPossible) || 0) + (Number(r.subjectiveMaxTotal) || 0);
+  return { earned: Math.round(earned * 100) / 100, possible, pct: possible > 0 ? Math.round(earned / possible * 1000) / 10 : 0 };
+}
+function _resultPending(r) {
+  const total = Object.keys(r.subjectiveQuestionMeta || {}).length;
+  return Math.max(0, total - Object.keys(r.subjectiveEvaluations || {}).length);
+}
+
+app.get('/api/admin/grading/overview', requireGrader, async (req, res) => {
+  try {
+    const scope = req.graderScope;
+    const courseQuery = scope ? { _id: { $in: [...scope].filter(id => /^[a-f0-9]{24}$/i.test(id)) } } : {};
+    const courses = await Course.find(courseQuery).select('name code title isPremium materials').lean();
+
+    const tests = [];
+    const testById = new Map();
+    for (const c of courses) {
+      for (const m of (c.materials || [])) {
+        const quiz = Array.isArray(m.quiz) ? m.quiz : [];
+        if (m.type !== 'quiz' && quiz.length === 0) continue;
+        const cfg = m.examConfig || {};
+        const t = {
+          courseId: String(c._id), courseName: c.name || c.title || 'Course', courseCode: c.code || '',
+          materialId: String(m._id), title: m.title || 'Test',
+          questions: quiz.length,
+          subjectiveQuestions: quiz.filter(q => q.type === 'subjective').length,
+          totalMarks: quiz.reduce((s, q) => s + (q.type === 'subjective' ? (Number(q.subjectiveMaxMarks) || Number(q.marks) || 10) : (typeof q.marks === 'number' ? q.marks : 4)), 0),
+          timeLimit: cfg.totalTime || '', maxAttempts: Number(cfg.maxAttempts) || 0,
+          publishMode: cfg.resultPublishMode || 'immediate',
+          submissions: 0, toGrade: 0, flagged: 0, running: 0, avgPct: 0, best: 0, lastSubmissionAt: null, _sum: 0
+        };
+        tests.push(t);
+        testById.set(t.materialId, t);
+      }
+    }
+
+    const ids = [...testById.keys()];
+    const queue = [];
+    if (ids.length) {
+      const or = ids.map(id => ({ [`quizResults.${id}`]: { $exists: true } }));
+      const users = await User.find({ $or: or }).select('username fullName quizResults').lean();
+      for (const u of users) {
+        for (const [mid, r] of Object.entries(u.quizResults || {})) {
+          const t = testById.get(mid);
+          if (!t || !r || !r.attempts) continue;
+          const f = _resultFinal(r);
+          t.submissions++;
+          t._sum += f.pct;
+          t.best = Math.max(t.best, f.pct);
+          if ((r.proctor && r.proctor.strikes > 0) || r.autoSubmitted) t.flagged++;
+          if (!t.lastSubmissionAt || new Date(r.lastAttemptAt) > new Date(t.lastSubmissionAt)) t.lastSubmissionAt = r.lastAttemptAt || null;
+          const pending = _resultPending(r);
+          if (pending > 0) {
+            t.toGrade++;
+            const files = Object.values(r.subjectiveAnswers || {}).reduce((s, a) => s + (Array.isArray(a) ? a.length : 0), 0);
+            queue.push({
+              userId: String(u._id), name: u.fullName || u.username, username: u.username,
+              courseId: t.courseId, courseName: t.courseName, courseCode: t.courseCode,
+              materialId: mid, testTitle: t.title, submittedAt: r.lastAttemptAt || null,
+              pending, files, strikes: (r.proctor && r.proctor.strikes) || 0
+            });
+          }
+        }
+      }
+      const graceMs = await _quizGraceMs();
+      const live = await QuizSession.find({ materialId: { $in: ids }, status: { $ne: 'submitted' } })
+        .select('materialId startedAt durationSeconds').lean();
+      for (const s of live) {
+        if (_quizSessionOverdue(s, graceMs)) continue;
+        const t = testById.get(String(s.materialId));
+        if (t) t.running++;
+      }
+    }
+    tests.forEach(t => { t.avgPct = t.submissions ? Math.round(t._sum / t.submissions * 10) / 10 : 0; delete t._sum; });
+    queue.sort((a, b) => new Date(a.submittedAt || 0) - new Date(b.submittedAt || 0));
+
+    const dayAgo = Date.now() - 24 * 3600e3;
+    res.set('Cache-Control', 'private, no-store');
+    res.json({
+      success: true,
+      role: scope ? 'professor' : 'admin',
+      totals: {
+        tests: tests.length,
+        submissions: tests.reduce((s, t) => s + t.submissions, 0),
+        toGrade: queue.length,
+        running: tests.reduce((s, t) => s + t.running, 0),
+        flagged: tests.reduce((s, t) => s + t.flagged, 0),
+        last24h: tests.filter(t => t.lastSubmissionAt && new Date(t.lastSubmissionAt).getTime() > dayAgo).length
+      },
+      tests, queue: queue.slice(0, 200)
+    });
+  } catch (e) {
+    console.error('[grading/overview]', e);
+    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+/* One attempt, question by question — with the answer key (instructors only) */
+app.get('/api/admin/quiz/:courseId/:materialId/attempt/:userId', requireCourseEditor, async (req, res) => {
+  try {
+    const mid = String(req.params.materialId), uid = String(req.params.userId);
+    if (!/^[a-f0-9]{24}$/i.test(mid) || !/^[a-f0-9]{24}$/i.test(uid)) return res.status(400).json({ success: false, message: 'Invalid request.' });
+    const course = await Course.findById(req.params.courseId).select('name code title description isPremium price materials').lean();
+    const mat = course && (course.materials || []).find(m => String(m._id) === mid);
+    if (!mat) return res.status(404).json({ success: false, message: 'Test not found.' });
+    const u = await User.findById(uid).select(`username fullName email phone createdAt quizResults.${mid}`).lean();
+    if (!u) return res.status(404).json({ success: false, message: 'Student not found.' });
+    const r = (u.quizResults || {})[mid];
+    if (!r) return res.status(404).json({ success: false, message: 'This student has not submitted this test.' });
+
+    /* rank among everyone who took it */
+    const others = await User.find({ [`quizResults.${mid}`]: { $exists: true } }).select(`quizResults.${mid}`).lean();
+    const pcts = others.map(o => _resultFinal((o.quizResults || {})[mid] || {}).pct).sort((a, b) => b - a);
+    const mine = _resultFinal(r);
+    const rank = pcts.findIndex(p => p <= mine.pct) + 1;
+
+    const session = await QuizSession.findOne({ userId: uid, materialId: mid }).select('status startedAt durationSeconds savedAt').lean();
+    const quiz = (mat.quiz || []).map((q, i) => ({
+      index: i, type: q.type || 'single', question: q.question || '', image: q.image || q.imageUrl || '',
+      options: q.options || [], correctIndexes: q.correctIndexes || (typeof q.correctIndex === 'number' ? [q.correctIndex] : []),
+      integerAnswer: q.integerAnswer, integerTolerance: q.integerTolerance || 0,
+      rangeMin: q.rangeMin, rangeMax: q.rangeMax,
+      matrixLeftItems: q.matrixLeftItems || [], matrixRightItems: q.matrixRightItems || [], matrixRows: q.matrixRows || [],
+      marks: typeof q.marks === 'number' ? q.marks : 4, negativeMarks: typeof q.negativeMarks === 'number' ? q.negativeMarks : -1,
+      subjectiveMaxMarks: Number(q.subjectiveMaxMarks) || Number(q.marks) || 10,
+      explanation: q.explanation || ''
+    }));
+    res.set('Cache-Control', 'private, no-store');
+    res.json({
+      success: true,
+      course: { id: String(course._id), name: course.name || course.title || 'Course', code: course.code || '', isPremium: !!course.isPremium },
+      test: { id: mid, title: mat.title || 'Test', config: mat.examConfig || {} },
+      student: { id: uid, username: u.username, fullName: u.fullName || '', email: u.email || '', phone: u.phone || '', joinedAt: u.createdAt || null },
+      result: r,
+      final: mine, rank, of: pcts.length,
+      classAvgPct: pcts.length ? Math.round(pcts.reduce((s, p) => s + p, 0) / pcts.length * 10) / 10 : 0,
+      session: session ? { status: session.status, startedAt: session.startedAt, savedAt: session.savedAt } : null,
+      quiz
+    });
+  } catch (e) {
+    console.error('[grading/attempt]', e);
+    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+/* Give one student another attempt (e.g. after a network failure) */
+app.post('/api/admin/quiz/:courseId/:materialId/grant-attempt', requireCourseEditor, async (req, res) => {
+  try {
+    const mid = String(req.params.materialId), uid = String((req.body || {}).userId || '');
+    const count = Math.max(1, Math.min(5, parseInt((req.body || {}).count, 10) || 1));
+    if (!/^[a-f0-9]{24}$/i.test(mid) || !/^[a-f0-9]{24}$/i.test(uid)) return res.status(400).json({ success: false, message: 'Invalid request.' });
+    const course = await Course.findById(req.params.courseId).select('materials._id materials.examConfig').lean();
+    const mat = course && (course.materials || []).find(m => String(m._id) === mid);
+    if (!mat) return res.status(404).json({ success: false, message: 'Test not found.' });
+    if (!(Number((mat.examConfig || {}).maxAttempts) > 0)) return res.status(400).json({ success: false, message: 'This test has unlimited attempts — nothing to grant.' });
+    const upd = await User.updateOne({ _id: uid, [`quizResults.${mid}`]: { $exists: true } }, { $inc: { [`quizResults.${mid}.extraAttempts`]: count } });
+    if (!upd.matchedCount) return res.status(404).json({ success: false, message: 'This student has not attempted the test yet.' });
+    const u = await User.findById(uid).select(`quizResults.${mid}`).lean();
+    const r = (u.quizResults || {})[mid] || {};
+    const cap = Number(mat.examConfig.maxAttempts) + (Number(r.extraAttempts) || 0);
+    console.log(`[grading] ➕ ${count} extra attempt(s) user=${uid} mat=${mid} by ${req.authUser.username}`);
+    res.json({ success: true, extraAttempts: Number(r.extraAttempts) || 0, attemptsUsed: Number(r.attempts) || 0, maxAttempts: cap,
+      message: `${count} extra attempt${count === 1 ? '' : 's'} granted — ${Math.max(0, cap - (Number(r.attempts) || 0))} left now.` });
+  } catch (e) {
+    console.error('[grading/grant-attempt]', e);
+    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+/* ============================================================
+   ⭐ 2026-10-10 — SUBMISSIONS for one paper (admin, or the professor
+   of the course): every student's latest attempt with marks, the
+   uploaded answer sheets still to grade, proctoring strikes and how
+   the attempt ended — plus the attempts running right now.
+   ============================================================ */
+app.get('/api/admin/quiz/:courseId/:materialId/submissions', requireCourseEditor, async (req, res) => {
+  try {
+    const mid = String(req.params.materialId);
+    if (!/^[a-f0-9]{24}$/i.test(mid)) return res.status(400).json({ success: false, message: 'Invalid material id.' });
+    const course = await Course.findById(req.params.courseId).select('materials').lean();
+    const mat = course && (course.materials || []).find(m => String(m._id) === mid);
+    if (!mat) return res.status(404).json({ success: false, message: 'Test not found.' });
+
+    const users = await User.find({ [`quizResults.${mid}`]: { $exists: true } })
+      .select(`username fullName email quizResults.${mid}`).lean();
+    const rows = users.map(u => {
+      const r = (u.quizResults || {})[mid] || {};
+      const subjTotal = Object.keys(r.subjectiveQuestionMeta || {}).length;
+      const graded = Object.keys(r.subjectiveEvaluations || {}).length;
+      return {
+        userId: String(u._id), username: u.username, fullName: u.fullName || '', email: u.email || '',
+        attempts: r.attempts || 0, lastAttemptAt: r.lastAttemptAt || null,
+        score: r.score || 0, total: r.total || 0,
+        marksEarned: Number(r.marksEarned) || 0, marksPossible: Number(r.marksPossible) || 0,
+        subjectiveMarksAwarded: Number(r.subjectiveMarksAwarded) || 0, subjectiveMaxTotal: Number(r.subjectiveMaxTotal) || 0,
+        finalMarksEarned: (Number(r.marksEarned) || 0) + (Number(r.subjectiveMarksAwarded) || 0),
+        finalMarksPossible: (Number(r.marksPossible) || 0) + (Number(r.subjectiveMaxTotal) || 0),
+        subjectiveTotal: subjTotal, subjectiveGraded: graded, pendingEvaluation: subjTotal > graded,
+        subjectiveAnswers: r.subjectiveAnswers || {}, subjectiveQuestionMeta: r.subjectiveQuestionMeta || {},
+        subjectiveEvaluations: r.subjectiveEvaluations || {},
+        publishedAt: r.publishedAt || null,
+        proctor: r.proctor || null, autoSubmitted: !!r.autoSubmitted, finalizedBy: r.finalizedBy || 'student',
+        timeSpentTotalSeconds: Number(r.timeSpentTotalSeconds) || 0,
+        extraAttempts: Number(r.extraAttempts) || 0,
+        late: !!r.late,
+        hasDetail: Array.isArray(r.responses)
+      };
+    }).sort((a, b) => (b.pendingEvaluation - a.pendingEvaluation) || (new Date(b.lastAttemptAt || 0) - new Date(a.lastAttemptAt || 0)));
+
+    /* attempts running now */
+    const live = await QuizSession.find({ courseId: String(req.params.courseId), materialId: mid, status: { $ne: 'submitted' } })
+      .select('userId startedAt durationSeconds lastHeartbeat savedAt savedAnswers proctor status').lean();
+    const liveUsers = live.length ? await User.find({ _id: { $in: live.map(s => s.userId).filter(id => /^[a-f0-9]{24}$/i.test(id)) } }).select('username fullName').lean() : [];
+    const nameOf = Object.fromEntries(liveUsers.map(u => [String(u._id), u.fullName || u.username]));
+    const now = Date.now();
+    const running = live.map(s => {
+      const endsAt = s.durationSeconds > 0 ? new Date(s.startedAt).getTime() + s.durationSeconds * 1000 : null;
+      return {
+        userId: s.userId, name: nameOf[s.userId] || 'Student', startedAt: s.startedAt,
+        remainingSeconds: endsAt ? Math.max(0, Math.floor((endsAt - now) / 1000)) : null,
+        lastSeenAt: s.lastHeartbeat, savedAt: s.savedAt,
+        answered: Array.isArray(s.savedAnswers) ? s.savedAnswers.filter(a => Array.isArray(a) ? a.length > 0 : (a !== '' && a !== null && a !== undefined)).length : 0,
+        strikes: (s.proctor && Number(s.proctor.strikes)) || 0
+      };
+    });
+
+    const quiz = Array.isArray(mat.quiz) ? mat.quiz : [];
+
+    /* ⭐ class analytics — score spread + how each question went */
+    const pcts = rows.map(r => r.finalMarksPossible > 0 ? r.finalMarksEarned / r.finalMarksPossible * 100 : 0).sort((a, b) => a - b);
+    const median = pcts.length ? (pcts.length % 2 ? pcts[(pcts.length - 1) / 2] : (pcts[pcts.length / 2 - 1] + pcts[pcts.length / 2]) / 2) : 0;
+    const distribution = Array.from({ length: 10 }, (_, b) => pcts.filter(p => Math.min(9, Math.floor(p / 10)) === b).length);
+    const qStats = quiz.map((q, i) => ({ index: i, type: q.type || 'single', seen: 0, attempted: 0, correct: 0, timeSum: 0, timeN: 0, gradedSum: 0, gradedN: 0 }));
+    users.forEach(u => {
+      const r = (u.quizResults || {})[mid] || {};
+      const resp = Array.isArray(r.responses) && r.responses.length === quiz.length ? r.responses : null;
+      const tsp = r.timeSpentPerQuestion || {};
+      qStats.forEach((st, i) => {
+        const t = Number(tsp[i]);
+        if (t > 0) { st.timeSum += t; st.timeN++; }
+        if (st.type === 'subjective') {
+          const ev = (r.subjectiveEvaluations || {})[i];
+          const max = Number(((r.subjectiveQuestionMeta || {})[i] || {}).maxMarks) || 0;
+          if (ev && max > 0) { st.gradedSum += (Number(ev.awardedMarks) || 0) / max; st.gradedN++; }
+          if (((r.subjectiveAnswers || {})[i] || []).length) st.attempted++;
+          st.seen++;
+          return;
+        }
+        if (!resp) return;
+        st.seen++;
+        if (resp[i].at) st.attempted++;
+        if (resp[i].c) st.correct++;
+      });
+    });
+    const questionStats = qStats.map(st => ({
+      index: st.index, type: st.type,
+      question: String((quiz[st.index] || {}).question || '').slice(0, 200),
+      responses: st.seen,
+      attemptedPct: st.seen ? Math.round(st.attempted / st.seen * 100) : null,
+      correctPct: st.type === 'subjective' ? (st.gradedN ? Math.round(st.gradedSum / st.gradedN * 100) : null) : (st.seen ? Math.round(st.correct / st.seen * 100) : null),
+      avgTimeSeconds: st.timeN ? Math.round(st.timeSum / st.timeN) : null
+    }));
+
+    const cfg = mat.examConfig || {};
+    const fullCourse = await Course.findById(req.params.courseId).select('name code title').lean();
+    res.set('Cache-Control', 'private, no-store');
+    res.json({
+      success: true,
+      title: mat.title || 'Test',
+      course: { id: String(req.params.courseId), name: (fullCourse && (fullCourse.name || fullCourse.title)) || 'Course', code: (fullCourse && fullCourse.code) || '' },
+      config: {
+        totalTime: cfg.totalTime || '', maxAttempts: Number(cfg.maxAttempts) || 0,
+        allowBackNavigation: cfg.allowBackNavigation === true, resultPublishMode: cfg.resultPublishMode || 'immediate',
+        resultPublishAt: cfg.resultPublishAt || null, questionCount: quiz.length,
+        totalMarks: quiz.reduce((s2, q) => s2 + (q.type === 'subjective' ? (Number(q.subjectiveMaxMarks) || Number(q.marks) || 10) : (typeof q.marks === 'number' ? q.marks : 4)), 0)
+      },
+      questions: quiz.map((q, i) => ({ index: i, type: q.type || 'single', question: String(q.question || '').slice(0, 300) })),
+      resultPublishMode: cfg.resultPublishMode || 'immediate',
+      stats: {
+        count: pcts.length,
+        avgPct: pcts.length ? Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length * 10) / 10 : 0,
+        medianPct: Math.round(median * 10) / 10,
+        highestPct: pcts.length ? Math.round(pcts[pcts.length - 1] * 10) / 10 : 0,
+        lowestPct: pcts.length ? Math.round(pcts[0] * 10) / 10 : 0,
+        passPct: pcts.length ? Math.round(pcts.filter(p => p >= 40).length / pcts.length * 100) : 0,
+        distribution
+      },
+      questionStats,
+      submissions: rows,
+      running
+    });
+  } catch (e) {
+    console.error('[admin/quiz/submissions]', e);
+    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+/* Grade one uploaded answer — admin or the course's professor */
+app.post('/api/admin/quiz/:courseId/:materialId/evaluate', requireCourseEditor, async (req, res) => {
+  try {
+    const { userId, questionIndex, awardedMarks, feedback } = req.body || {};
+    const out = await _applySubjectiveEvaluation({
+      userId, materialId: String(req.params.materialId), courseId: String(req.params.courseId),
+      questionIndex, awardedMarks, feedback, evaluatorId: String(req.authUser._id)
+    });
+    res.status(out.code).json(out.body);
+  } catch (e) {
+    console.error('[admin/quiz/evaluate]', e);
+    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+async function _applySubjectiveEvaluation({ userId, materialId, courseId, questionIndex, awardedMarks, feedback, evaluatorId }) {
+  if (!userId || !/^[a-f0-9]{24}$/i.test(String(userId)) || questionIndex === undefined || questionIndex === null) {
+    return _gr(400, { success: false, message: 'userId and questionIndex are required.' });
+  }
+  const marks = Number(awardedMarks);
+  if (!isFinite(marks) || marks < 0) return _gr(400, { success: false, message: 'Invalid marks value.' });
+
+  const user = await User.findById(userId);
+  if (!user) return _gr(404, { success: false, message: 'User not found.' });
+  const result = user.quizResults && user.quizResults.get(String(materialId));
+  if (!result) return _gr(404, { success: false, message: 'No submission found for this test.' });
+
+  const qi = String(questionIndex);
+  const meta = (result.subjectiveQuestionMeta || {})[qi];
+  if (!meta) return _gr(400, { success: false, message: 'That question has no uploaded answer to grade.' });
+  const maxAllowed = Number(meta.maxMarks) || 0;
+  if (marks > maxAllowed) return _gr(400, { success: false, message: `Marks cannot exceed ${maxAllowed} for this question.` });
+
+  if (!result.subjectiveEvaluations) result.subjectiveEvaluations = {};
+  result.subjectiveEvaluations[qi] = {
+    awardedMarks: Math.round(marks * 100) / 100,
+    feedback: String(feedback || '').slice(0, 1000),
+    evaluatedAt: new Date(),
+    evaluatedBy: String(evaluatorId || '')
+  };
+  const subjectiveMarksAwarded = Object.values(result.subjectiveEvaluations).reduce((s, ev) => s + (Number(ev.awardedMarks) || 0), 0);
+  result.subjectiveMarksAwarded = subjectiveMarksAwarded;
+  const totalSubjective = Object.keys(result.subjectiveQuestionMeta || {}).length;
+  const gradedSubjective = Object.keys(result.subjectiveEvaluations).length;
+  const wasPending = result.pendingEvaluation === true;
+  result.pendingEvaluation = gradedSubjective < totalSubjective;
+  result.manuallyEvaluated = gradedSubjective >= totalSubjective;
+  result.evaluatedAt = new Date();
+  result.finalMarksEarned = (Number(result.marksEarned) || 0) + subjectiveMarksAwarded;
+  result.finalMarksPossible = (Number(result.marksPossible) || 0) + (Number(result.subjectiveMaxTotal) || 0);
+  result.finalPercent = result.finalMarksPossible > 0 ? Math.round((result.finalMarksEarned / result.finalMarksPossible) * 100) : (Number(result.percent) || 0);
+
+  user.quizResults.set(String(materialId), result);
+  user.markModified('quizResults');           // nested edits in a Mixed map must be flagged or they are not saved
+
+  /* every answer sheet graded and the result is already visible → tell the student */
+  if (wasPending && !result.pendingEvaluation && result.publishedAt) {
+    if (!Array.isArray(user.notifications)) user.notifications = [];
+    user.notifications.push({
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      type: 'quiz-result', read: false, createdAt: new Date(),
+      title: '📝 Your answer sheet has been graded',
+      body: `Final score: ${result.finalMarksEarned} / ${result.finalMarksPossible} (${result.finalPercent}%).`,
+      link: courseId ? `#/course/${courseId}` : ''
+    });
+    if (user.notifications.length > 50) user.notifications = user.notifications.slice(-50);
+  }
+  await user.save();
+  console.log(`[quiz/evaluate] ✅ user=${user.username} material=${materialId} Q${qi} → ${marks}`);
+  return _gr(200, { success: true, message: 'Marks saved.', result });
+}
+
 app.post('/api/admin/quiz/evaluate-subjective', requireAdminAuth, async (req, res) => {
   try {
     const { userId, materialId, questionIndex, awardedMarks, feedback } = req.body || {};
-
-    if (!userId || materialId === undefined || questionIndex === undefined) {
-      return res.status(400).json({
-        success: false,
-        message: 'userId, materialId and questionIndex are required.'
-      });
-    }
-
-    const marks = Number(awardedMarks);
-    if (isNaN(marks) || marks < 0) {
-      return res.status(400).json({ success: false, message: 'Invalid marks value.' });
-    }
-
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
-    if (!user.quizResults) user.quizResults = new Map();
-    const result = user.quizResults.get(String(materialId));
-    if (!result) {
-      return res.status(404).json({ success: false, message: 'No quiz result found for this material.' });
-    }
-
-    const meta = (result.subjectiveQuestionMeta || {})[questionIndex];
-    const maxAllowed = meta ? Number(meta.maxMarks) : 100;
-    if (marks > maxAllowed) {
-      return res.status(400).json({
-        success: false,
-        message: `Marks cannot exceed ${maxAllowed} for this question.`
-      });
-    }
-
-    if (!result.subjectiveEvaluations) result.subjectiveEvaluations = {};
-    result.subjectiveEvaluations[questionIndex] = {
-      awardedMarks: marks,
-      feedback: String(feedback || '').slice(0, 500),
-      evaluatedAt: new Date(),
-      evaluatedBy: String(req.adminUser._id)
-    };
-
-    // Recompute total subjective marks awarded
-    let subjectiveMarksAwarded = 0;
-    Object.values(result.subjectiveEvaluations).forEach(ev => {
-      subjectiveMarksAwarded += Number(ev.awardedMarks) || 0;
+    const out = await _applySubjectiveEvaluation({
+      userId, materialId: String(materialId || ''), courseId: String((req.body || {}).courseId || ''),
+      questionIndex, awardedMarks, feedback, evaluatorId: String(req.adminUser._id)
     });
-    result.subjectiveMarksAwarded = subjectiveMarksAwarded;
-
-    // If all subjective questions have been graded → mark as fully evaluated
-    const totalSubjective = Object.keys(result.subjectiveQuestionMeta || {}).length;
-    const gradedSubjective = Object.keys(result.subjectiveEvaluations).length;
-    result.pendingEvaluation = gradedSubjective < totalSubjective;
-    result.manuallyEvaluated = gradedSubjective >= totalSubjective;
-    result.evaluatedAt = new Date();
-
-    // Final marks = auto-graded marks + subjective marks awarded
-    result.finalMarksEarned = (Number(result.marksEarned) || 0) + subjectiveMarksAwarded;
-    result.finalMarksPossible = (Number(result.marksPossible) || 0) +
-                                (Number(result.subjectiveMaxTotal) || 0);
-
-    user.quizResults.set(String(materialId), result);
-    await user.save();
-
-    console.log(`[admin/quiz/evaluate] ✅ user=${user.username} material=${materialId} Q${questionIndex} → ${marks} marks`);
-
-    res.json({
-      success: true,
-      message: 'Marks awarded successfully.',
-      result
-    });
+    res.status(out.code).json(out.body);
   } catch (e) {
     console.error('[admin/quiz/evaluate-subjective]', e);
     res.status(500).json({ success: false, message: 'Server error: ' + e.message });
@@ -8653,9 +10601,10 @@ app.get('/api/settings/owner', async (req, res) => {
     const payload = {
       success: true,
       owner: {
-        name:    op.name  || 'Krish Yadav',
-        title:   op.title || 'Founder & Course Director',
-        role:    op.role  || 'Founder',
+        /* ⭐ only what the admin saved — no built-in name/bio is ever shown */
+        name:    op.name  || '',
+        title:   op.title || '',
+        role:    op.role  || '',
         bio:     op.bio   || '',
         email:   op.email || '',
         phone:   op.phone || '',
@@ -9667,6 +11616,19 @@ app.post('/api/subscribe/create', requireUser, requireSelfOrAdmin('body'), async
     const plan = (s.subscriptionPlans || []).find(p => p.id === planId && p.enabled);
     if (!plan) return res.status(404).json({ success:false, message:'Plan not found or disabled.' });
 
+    /* ⭐ 2026-10-10: a student who already has premium.
+       Before, this route set status 'pending' on them — which switched their
+       PAID premium off until the new payment finished (forever, if they closed
+       the payment window). Now:
+         • auto-pay on  → nothing to buy, it renews by itself;
+         • auto-pay off → "extend": a one-time order whose days are ADDED to
+           the current end date. Nothing about the live plan changes until
+           the payment is confirmed (the new plan waits in pendingPlan). */
+    const renewing = userHasActiveSubscription(user);
+    if (renewing && user.subscription.autoRenew) {
+      return res.status(409).json({ success:false, message:'Your premium renews automatically — there is nothing to pay now.' });
+    }
+
     /* ---- Coupon (optional) ---- */
     let coupon = null;
     let finalAmount = Number(plan.amount) || 0;
@@ -9680,8 +11642,8 @@ app.post('/api/subscribe/create', requireUser, requireSelfOrAdmin('body'), async
       finalAmount = Math.max(1, Math.round((finalAmount - discount) * 100) / 100);
     }
 
-    /* ---- Mode 1: One-time ORDER (with coupon) ---- */
-    if (coupon) {
+    /* ---- Mode 1: One-time ORDER (with coupon, or extending live premium) ---- */
+    if (coupon || renewing) {
       const order = await razorpay.orders.create({
         amount: Math.round(finalAmount * 100),   // paise
         currency: 'INR',
@@ -9689,11 +11651,29 @@ app.post('/api/subscribe/create', requireUser, requireSelfOrAdmin('body'), async
         notes: {
           userId: String(user._id),
           planId: plan.id,
-          couponCode: coupon.code,
+          couponCode: coupon ? coupon.code : '',
           purpose: 'aero-one-time-subscription',
-          durationDays: plan.durationDays
+          durationDays: plan.durationDays,
+          planTitle: plan.title,
+          extend: renewing ? '1' : ''
         }
       });
+
+      if (renewing) {
+        user.subscription.lastOrderId = order.id;
+        user.subscription.pendingPlan = {
+          orderId: order.id, planId: plan.id, planTitle: plan.title, durationDays: plan.durationDays,
+          amount: plan.amount, amountPaid: finalAmount, couponApplied: coupon ? coupon.code : null
+        };
+        user.markModified('subscription');
+        await user.save();
+        console.log(`[subscribe/create] extension order ${order.id} for ${user.username} · ₹${finalAmount}`);
+        return res.json({
+          success: true, mode: 'one-time', extend: true, key_id: process.env.RAZORPAY_KEY_ID, orderId: order.id,
+          amount: finalAmount, originalAmount: plan.amount, discountPercent: coupon ? coupon.discountPercent : 0,
+          couponCode: coupon ? coupon.code : null, planTitle: plan.title, durationDays: plan.durationDays
+        });
+      }
 
       if (!user.subscription) user.subscription = {};
       user.subscription.status = 'pending';
@@ -9775,6 +11755,18 @@ app.post('/api/subscribe/create', requireUser, requireSelfOrAdmin('body'), async
    verify, webhook, a replayed request). Without this check each hop
    extended the subscription again, re-counted the coupon and bumped
    the referrer's stats. */
+/* ⭐ 2026-10-10: an extension bought while premium was live waits in
+   pendingPlan until its payment is confirmed — then it becomes the plan. */
+function applyPendingPlan(user, orderId) {
+  const sub = user && user.subscription, pp = sub && sub.pendingPlan;
+  if (!pp || !pp.orderId || pp.orderId !== orderId) return false;
+  sub.planId = pp.planId; sub.planTitle = pp.planTitle; sub.planDurationDays = pp.durationDays;
+  sub.amount = pp.amount; sub.amountPaid = pp.amountPaid; sub.couponApplied = pp.couponApplied || null;
+  sub.pendingPlan = null;
+  user.markModified('subscription');
+  return true;
+}
+
 function paymentAlreadyApplied(user, paymentId) {
   if (!paymentId || !user || !user.subscription) return false;
   const hist = user.subscription.history || [];
@@ -9910,6 +11902,7 @@ app.post('/api/subscribe/verify-order', requireUser, requireSelfOrAdmin('body'),
     }
 
     if (!user.subscription) user.subscription = {};
+    applyPendingPlan(user, razorpay_order_id);
     const now = new Date();
     const durationDays = user.subscription.planDurationDays || 30;
     const base = (user.subscription.expiresAt && new Date(user.subscription.expiresAt) > now)
@@ -10319,8 +12312,11 @@ app.post('/api/subscribe/cancel/verify', requireUser, requireSelfOrAdmin('body')
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
-    if (!user.subscription || !user.subscription.active) {
+    if (!userHasActiveSubscription(user)) {
       return res.status(400).json({ success: false, message: 'This subscription is no longer active.' });
+    }
+    if (!user.subscription.autoRenew) {
+      return res.json({ success: true, message: 'Auto-pay is already off. Premium stays active until it ends.', user: serializeUser(user) });
     }
 
     // Try to cancel on Razorpay's side (best-effort)
@@ -10332,14 +12328,15 @@ app.post('/api/subscribe/cancel/verify', requireUser, requireSelfOrAdmin('body')
       }
     }
 
-    user.subscription.active = false;
+    /* ⭐ 2026-10-10: only auto-pay stops. The student already paid for this
+       period, so premium stays on until expiresAt (it used to switch off at
+       once, while the message promised "until the end of the billing period"). */
     user.subscription.autoRenew = false;
-    user.subscription.status = 'cancelled';
     user.subscription.history = user.subscription.history || [];
     user.subscription.history.push({
-      status: 'revoked',
+      status: 'auto-renew-off',
       amount: 0,
-      note: 'Cancelled by user (OTP verified)',
+      note: 'Auto-pay cancelled by user (OTP verified) — access kept until the end of the paid period',
       date: new Date()
     });
     _clearAuthUserCache();          // ⭐ NEW
@@ -10349,7 +12346,8 @@ app.post('/api/subscribe/cancel/verify', requireUser, requireSelfOrAdmin('body')
 
     res.json({
       success: true,
-      message: 'Subscription cancelled. You can continue using it until the end of the current billing period.',
+      message: 'Auto-pay cancelled. Your premium stays active until ' +
+        (user.subscription.expiresAt ? new Date(user.subscription.expiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : 'the end of the paid period') + '.',
       user: serializeUser(user)
     });
   } catch (e) {
@@ -10685,6 +12683,9 @@ app.post('/api/razorpay-webhook', async (req, res) => {
             const durationDays = parseInt(order.notes.durationDays, 10) || 30;
             const now = new Date();
             if (!user.subscription) user.subscription = {};
+            applyPendingPlan(user, orderId);
+            if (order.notes.planTitle) user.subscription.planTitle = order.notes.planTitle;
+            user.subscription.planDurationDays = durationDays;
             const base = (user.subscription.expiresAt && new Date(user.subscription.expiresAt) > now)
               ? new Date(user.subscription.expiresAt) : now;
             user.subscription.active = true;
@@ -10767,7 +12768,10 @@ app.post('/api/razorpay-webhook', async (req, res) => {
           user.subscription.active = true;
           user.subscription.status = 'active';
           user.subscription.subscriptionId = subEntity.id || user.subscription.subscriptionId;
-          user.subscription.planId = subEntity.plan_id || user.subscription.planId;
+          /* ⭐ 2026-10-10: our plan id (plan_6m…), never Razorpay's plan_XXXX —
+             verify looks the duration up by it, and a Razorpay id fell back to 30 days */
+          if (notes.planId) user.subscription.planId = notes.planId;
+          if (subEntity.plan_id) user.subscription.razorpayPlanId = subEntity.plan_id;
           user.subscription.planDurationDays = durationDays;
           user.subscription.startedAt = user.subscription.startedAt || now;
           user.subscription.expiresAt = expiresAt;
@@ -10799,8 +12803,13 @@ app.post('/api/razorpay-webhook', async (req, res) => {
       if (userId) {
         const user = await User.findById(userId);
         if (user && user.subscription) {
-          user.subscription.active = false;
-          user.subscription.status = event === 'subscription.halted' ? 'halted' : 'cancelled';
+          /* ⭐ 2026-10-10: auto-pay stopping must not take away days already
+             paid for — premium stays on until expiresAt, then lapses by itself */
+          const paidUntil = user.subscription.expiresAt && new Date(user.subscription.expiresAt) > new Date();
+          if (!paidUntil) {
+            user.subscription.active = false;
+            user.subscription.status = event === 'subscription.halted' ? 'halted' : 'cancelled';
+          }
           user.subscription.autoRenew = false;
           user.subscription.history = user.subscription.history || [];
           user.subscription.history.push({
@@ -10810,6 +12819,7 @@ app.post('/api/razorpay-webhook', async (req, res) => {
             date: new Date()
           });
           await user.save();
+          _clearAuthUserCache();
           console.log(`[Webhook] Subscription ${event} → user ${userId}`);
         }
       }
@@ -10950,6 +12960,345 @@ app.post('/api/user/notifications/:userId/mark-read', requireUser, requireSelfOr
 /* ============================================================
    STUDENTS LIST
    ============================================================ */
+
+/* ============================================================
+   ⭐ PROFESSOR ROLE — registration, approvals, course access
+   (2026-10-07)
+   ------------------------------------------------------------
+   1. POST /api/professor/register       (email OTP from /api/send-otp)
+        → account created with professor.status = 'pending'
+   2. Admin: GET  /api/admin/professors?status=…
+             POST /api/admin/professors/:id/approve | reject | revoke
+   3. Professor (approved): POST /api/professor/course-requests
+        { courseName, courseCode, message } → pending request
+   4. Admin: GET  /api/admin/professor-requests?status=…
+             POST /api/admin/professor-requests/:profId/:reqId/approve { courseId }
+             POST /api/admin/professor-requests/:profId/:reqId/reject  { reason }
+             POST /api/admin/professors/:id/courses/:courseId/remove
+   Only then does the course appear for the professor (see
+   _professorScope / requireCourseEditor / evaluateMaterialAccess).
+   ============================================================ */
+const PROF_TEXT = (v, max) => String(v == null ? '' : v).replace(/[\u0000-\u001f]+/g, ' ').trim().slice(0, max);
+
+async function _mailBestEffort(to, subject, text) {
+  try {
+    if (!to) return;
+    await withTimeout(transporter.sendMail({ to, subject, text }), 20000, subject);
+  } catch (e) { console.warn('[prof-mail] could not send "' + subject + '":', e.message); }
+}
+async function _notifyUser(userId, title, body, type) {
+  try {
+    await User.updateOne({ _id: userId }, { $push: { notifications: { $each: [{
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      type: type || 'info', title, body, createdAt: new Date(), read: false
+    }], $slice: -100 } } });
+  } catch (_) {}
+}
+async function _notifyAdmins(title, body) {
+  try {
+    await User.updateMany({ role: 'admin' }, { $push: { notifications: { $each: [{
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      type: 'info', title, body, createdAt: new Date(), read: false
+    }], $slice: -100 } } });
+  } catch (_) {}
+  const adminEmail = String(process.env.ADMIN_EMAIL || '').trim();
+  if (adminEmail) _mailBestEffort(adminEmail, 'RankerNode — ' + title, body + '\n\nOpen the admin panel → Professors to review.');
+}
+
+/* ---- 1. Registration ---- */
+app.post('/api/professor/register', authLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const fullName = PROF_TEXT(b.fullName, 120);
+    const cleanUsername = String(b.username || '').trim().toLowerCase();
+    const cleanEmail = String(b.email || '').trim().toLowerCase();
+    const cleanPhone = normalizePhone(b.phone);
+    const password = b.password;
+    const prof = {
+      designation:     PROF_TEXT(b.designation, 80),
+      department:      PROF_TEXT(b.department, 120),
+      institution:     PROF_TEXT(b.institution, 160),
+      qualification:   PROF_TEXT(b.qualification, 120),
+      specialization:  PROF_TEXT(b.specialization, 160),
+      experienceYears: Math.max(0, Math.min(70, parseInt(b.experienceYears, 10) || 0)),
+      employeeId:      PROF_TEXT(b.employeeId, 60),
+      profileUrl:      /^https?:\/\//i.test(String(b.profileUrl || '').trim()) ? PROF_TEXT(b.profileUrl, 300) : '',
+      bio:             PROF_TEXT(b.bio, 1000)
+    };
+    if (!fullName || !cleanUsername || !cleanEmail || !cleanPhone || !password) {
+      return res.status(400).json({ success: false, message: 'Full name, username, email, contact number and password are required.' });
+    }
+    if (!prof.designation || !prof.department || !prof.institution) {
+      return res.status(400).json({ success: false, message: 'Designation, department and institution are required.' });
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 200) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters.' });
+    }
+    if (!/^[a-z0-9._-]{3,40}$/.test(cleanUsername)) {
+      return res.status(400).json({ success: false, message: 'Username must be 3–40 characters: letters, numbers, dot, dash or underscore.' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+    }
+    const clash = await User.findOne({ $or: [{ username: cleanUsername }, { email: cleanEmail }, { phone: cleanPhone }] }).select('username email phone').lean();
+    if (clash) {
+      const field = clash.email === cleanEmail ? 'Email' : clash.phone === cleanPhone ? 'Contact number' : 'Username';
+      return res.status(400).json({ success: false, message: `${field} already exists!` });
+    }
+    /* email ownership — the same OTP flow students use */
+    const record = await otpGet(cleanEmail);
+    if (!record) return res.status(400).json({ success: false, message: 'No OTP was requested for this email (or it expired).' });
+    if (record.attempts >= 5) { await otpDel(cleanEmail); return res.status(400).json({ success: false, message: 'Too many incorrect attempts. Request a new OTP.' }); }
+    if (String(b.otp || '').trim() !== record.otp) {
+      await otpBumpAttempts(cleanEmail);
+      return res.status(400).json({ success: false, message: 'Invalid OTP. Please try again.' });
+    }
+
+    const user = new User({
+      fullName, username: cleanUsername, email: cleanEmail, phone: cleanPhone,
+      password: await bcrypt.hash(password, 10),
+      role: 'professor',
+      professor: Object.assign(prof, { status: 'pending', appliedAt: new Date(), courses: [], requests: [] })
+    });
+    await user.save();
+    await otpDel(cleanEmail);
+    console.log(`[prof] 🆕 professor application: ${cleanUsername} · ${prof.designation}, ${prof.department}, ${prof.institution}`);
+    _notifyAdmins('New professor application',
+      `${fullName} (${prof.designation}, ${prof.department}, ${prof.institution}) has registered as a professor and is waiting for approval.`);
+    res.json({ success: true, status: 'pending',
+      message: 'Application submitted! Your account is now waiting for admin approval — you will get an email as soon as it is approved.' });
+  } catch (e) {
+    console.error('[professor/register]', e);
+    res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+/* ---- Professor: own status, approved courses, requests ---- */
+app.get('/api/professor/me', requireProfessor, async (req, res) => {
+  try {
+    const u = await User.findById(req.authUserId).select('username fullName email phone role professor').lean();
+    if (!u) return res.status(404).json({ success: false, message: 'Account not found.' });
+    const p = serializeProfessor(u);
+    const courses = p.courses.length
+      ? await Course.find({ _id: { $in: p.courses.filter(id => mongoose.Types.ObjectId.isValid(id)) } }).select('name code').lean()
+      : [];
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ success: true, professor: p, courses: courses.map(c => ({ id: String(c._id), name: c.name, code: c.code })) });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+/* The professor's approved courses, in the same shape as GET /api/courses */
+app.get('/api/professor/courses', requireProfessor, async (req, res) => {
+  try {
+    const ids = ((req.authUser.professor && req.authUser.professor.courses) || [])
+      .map(String).filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
+    const courses = ids.length
+      ? await Course.aggregate([{ $match: { _id: { $in: ids } } }, COURSE_LIST_PROJECT_STAGE, { $sort: { sortOrder: 1, name: 1, _id: 1 } }])
+      : [];
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ success: true, courses, pagination: { page: 1, limit: courses.length, total: courses.length, totalPages: 1, hasMore: false } });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+/* ---- 3. Course-access request ---- */
+app.post('/api/professor/course-requests', requireProfessor, async (req, res) => {
+  try {
+    const courseName = PROF_TEXT((req.body || {}).courseName, 160);
+    const courseCode = PROF_TEXT((req.body || {}).courseCode, 40).toUpperCase();
+    const message    = PROF_TEXT((req.body || {}).message, 600);
+    if (!courseName || !courseCode) return res.status(400).json({ success: false, message: 'Course name and course code are both required.' });
+    const u = await User.findById(req.authUserId).select('professor fullName username');
+    if (!u || !u.professor) return res.status(404).json({ success: false, message: 'Account not found.' });
+    const reqs = u.professor.requests || [];
+    if (reqs.filter(r => r.status === 'pending').length >= 20) {
+      return res.status(429).json({ success: false, message: 'You already have 20 pending requests. Please wait for the admin to review them.' });
+    }
+    if (reqs.some(r => r.status === 'pending' && String(r.courseCode).toUpperCase() === courseCode)) {
+      return res.status(400).json({ success: false, message: `You already have a pending request for ${courseCode}.` });
+    }
+    u.professor.requests.push({ courseName, courseCode, message, status: 'pending', requestedAt: new Date() });
+    await u.save();
+    console.log(`[prof] 📨 ${u.username} requested ${courseCode} "${courseName}"`);
+    _notifyAdmins('Course access request',
+      `Prof. ${u.fullName || u.username} requested access to ${courseCode} — ${courseName}.${message ? '\nMessage: ' + message : ''}`);
+    res.json({ success: true, message: 'Request sent to the admin.', professor: serializeProfessor(u) });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
+});
+
+/* ---- 2. Admin: applications ---- */
+app.get('/api/admin/professors', requireAdminAuth, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'all');
+    const filter = { role: 'professor' };
+    if (['pending', 'approved', 'rejected', 'revoked'].includes(status)) filter['professor.status'] = status;
+    const [list, counts, courseRows] = await Promise.all([
+      User.find(filter).select('username fullName email phone createdAt professor activeSession.lastSeenAt').sort({ createdAt: -1 }).limit(500).lean(),
+      User.aggregate([{ $match: { role: 'professor' } }, { $group: { _id: '$professor.status', n: { $sum: 1 } } }]),
+      Course.find({}).select('name code').lean()
+    ]);
+    const courseName = new Map(courseRows.map(c => [String(c._id), { id: String(c._id), name: c.name, code: c.code }]));
+    const c = { pending: 0, approved: 0, rejected: 0, revoked: 0 };
+    counts.forEach(x => { if (x._id in c) c[x._id] = x.n; });
+    const pendingRequests = await User.aggregate([
+      { $match: { role: 'professor', 'professor.status': 'approved' } },
+      { $project: { n: { $size: { $filter: { input: { $ifNull: ['$professor.requests', []] }, as: 'r', cond: { $eq: ['$$r.status', 'pending'] } } } } } },
+      { $group: { _id: null, n: { $sum: '$n' } } }
+    ]);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      counts: Object.assign(c, { pendingRequests: (pendingRequests[0] && pendingRequests[0].n) || 0 }),
+      professors: list.map(u => {
+        const p = serializeProfessor(u);
+        return { _id: String(u._id), username: u.username, fullName: u.fullName, email: u.email, phone: u.phone,
+                 createdAt: u.createdAt, lastSeenAt: (u.activeSession && u.activeSession.lastSeenAt) || null,
+                 professor: Object.assign(p, { courseList: p.courses.map(id => courseName.get(id) || { id, name: '(deleted course)', code: '' }) }) };
+      })
+    });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
+});
+
+async function _setProfessorStatus(req, res, status, verb) {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid id.' });
+    const note = PROF_TEXT((req.body || {}).reason || (req.body || {}).note, 500);
+    if ((status === 'rejected' || status === 'revoked') && !note) {
+      return res.status(400).json({ success: false, message: 'Please give a short reason — the professor will see it.' });
+    }
+    const set = {
+      'professor.status': status, 'professor.reviewedAt': new Date(),
+      'professor.reviewedBy': String(req.authUser.username || ''), 'professor.reviewNote': note
+    };
+    /* revoking also ends the professor's current session everywhere */
+    if (status === 'revoked') { set['activeSession.sessionId'] = null; set.sessions = []; }
+    const u = await User.findOneAndUpdate({ _id: req.params.id, role: 'professor' }, { $set: set }, { returnDocument: 'after' })
+      .select('username fullName email professor');
+    if (!u) return res.status(404).json({ success: false, message: 'Professor not found.' });
+    _clearAuthUserCache();
+    console.log(`[prof] 🛂 ${req.authUser.username} ${verb} professor ${u.username}`);
+    const who = u.fullName || u.username;
+    if (status === 'approved') {
+      _notifyUser(u._id, 'Your professor account is approved', 'You can now sign in and request access to your courses.', 'success');
+      _mailBestEffort(u.email, 'RankerNode — your professor account is approved',
+        `Dear ${who},\n\nYour professor account on RankerNode has been approved. Sign in with your username "${u.username}" and use "Request course access" to get the courses you teach.\n\n— RankerNode`);
+    } else if (status === 'rejected') {
+      _mailBestEffort(u.email, 'RankerNode — professor application update',
+        `Dear ${who},\n\nYour professor application could not be approved.\nReason: ${note}\n\nPlease contact the RankerNode admin if you think this is a mistake.`);
+    } else if (status === 'revoked') {
+      _mailBestEffort(u.email, 'RankerNode — professor access withdrawn',
+        `Dear ${who},\n\nYour professor access on RankerNode has been withdrawn.\nReason: ${note}`);
+    }
+    res.json({ success: true, message: `Professor ${verb}.`, professor: serializeProfessor(u) });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
+}
+app.post('/api/admin/professors/:id/approve', requireAdminAuth, (req, res) => _setProfessorStatus(req, res, 'approved', 'approved'));
+app.post('/api/admin/professors/:id/reject',  requireAdminAuth, (req, res) => _setProfessorStatus(req, res, 'rejected', 'rejected'));
+app.post('/api/admin/professors/:id/revoke',  requireAdminAuth, (req, res) => _setProfessorStatus(req, res, 'revoked', 'revoked'));
+
+/* ---- 4. Admin: course-access requests ---- */
+app.get('/api/admin/professor-requests', requireAdminAuth, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    const [profs, courses] = await Promise.all([
+      User.find({ role: 'professor', 'professor.requests.0': { $exists: true } })
+        .select('username fullName email professor.status professor.designation professor.department professor.institution professor.courses professor.requests').lean(),
+      Course.find({}).select('name code').lean()
+    ]);
+    const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const out = [];
+    profs.forEach(u => (u.professor.requests || []).forEach(r => {
+      if (status !== 'all' && r.status !== status) return;
+      /* suggest the course whose code (or else name) matches */
+      const byCode = courses.find(c => norm(c.code) && norm(c.code) === norm(r.courseCode));
+      const byName = !byCode && courses.find(c => String(c.name || '').trim().toLowerCase() === String(r.courseName || '').trim().toLowerCase());
+      const match = byCode || byName || null;
+      out.push({
+        _id: String(r._id), professorId: String(u._id), professorName: u.fullName || u.username, username: u.username, email: u.email,
+        professorStatus: u.professor.status, designation: u.professor.designation, department: u.professor.department, institution: u.professor.institution,
+        courseName: r.courseName, courseCode: r.courseCode, message: r.message, status: r.status,
+        requestedAt: r.requestedAt, reviewedAt: r.reviewedAt, reviewNote: r.reviewNote, courseId: r.courseId,
+        suggestedCourse: match ? { id: String(match._id), name: match.name, code: match.code, by: byCode ? 'code' : 'name' } : null,
+        alreadyHasSuggested: !!(match && (u.professor.courses || []).map(String).includes(String(match._id)))
+      });
+    }));
+    out.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ success: true, requests: out, courses: courses.map(c => ({ id: String(c._id), name: c.name, code: c.code })) });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
+});
+
+async function _decideCourseRequest(req, res, action) {
+  try {
+    const { profId, reqId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(profId) || !mongoose.Types.ObjectId.isValid(reqId)) return res.status(400).json({ success: false, message: 'Invalid id.' });
+    const u = await User.findOne({ _id: profId, role: 'professor' }).select('username fullName email professor');
+    if (!u || !u.professor) return res.status(404).json({ success: false, message: 'Professor not found.' });
+    const r = u.professor.requests.id(reqId);
+    if (!r) return res.status(404).json({ success: false, message: 'Request not found.' });
+    if (r.status !== 'pending') return res.status(400).json({ success: false, message: 'This request has already been ' + r.status + '.' });
+    const note = PROF_TEXT((req.body || {}).reason || (req.body || {}).note, 500);
+    let course = null;
+    if (action === 'approve') {
+      if (u.professor.status !== 'approved') return res.status(400).json({ success: false, message: 'Approve the professor account first.' });
+      const courseId = String((req.body || {}).courseId || '');
+      if (!mongoose.Types.ObjectId.isValid(courseId)) return res.status(400).json({ success: false, message: 'Choose the course to grant.' });
+      course = await Course.findById(courseId).select('name code').lean();
+      if (!course) return res.status(404).json({ success: false, message: 'Course not found.' });
+      if (!u.professor.courses.map(String).includes(courseId)) u.professor.courses.push(courseId);
+      r.courseId = courseId;
+    } else if (!note) {
+      return res.status(400).json({ success: false, message: 'Please give a short reason — the professor will see it.' });
+    }
+    r.status = action === 'approve' ? 'approved' : 'rejected';
+    r.reviewedAt = new Date();
+    r.reviewedBy = String(req.authUser.username || '');
+    r.reviewNote = note;
+    await u.save();
+    _clearAuthUserCache();
+    console.log(`[prof] 🛂 ${req.authUser.username} ${r.status} ${u.username}'s request for ${r.courseCode}${course ? ' → ' + course.code : ''}`);
+    if (course) {
+      _notifyUser(u._id, 'Course access approved', `${course.code ? course.code + ' — ' : ''}${course.name} is now in your dashboard.`, 'success');
+      _mailBestEffort(u.email, 'RankerNode — course access approved',
+        `Dear ${u.fullName || u.username},\n\nYou now have access to ${course.code ? course.code + ' — ' : ''}${course.name}. It is in your professor dashboard, where you can add and edit its materials.\n\n— RankerNode`);
+    } else {
+      _notifyUser(u._id, 'Course access request declined', `${r.courseCode} — ${r.courseName}: ${note}`, 'warning');
+    }
+    res.json({ success: true, message: action === 'approve' ? 'Access granted.' : 'Request declined.' });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
+}
+app.post('/api/admin/professor-requests/:profId/:reqId/approve', requireAdminAuth, (req, res) => _decideCourseRequest(req, res, 'approve'));
+app.post('/api/admin/professor-requests/:profId/:reqId/reject',  requireAdminAuth, (req, res) => _decideCourseRequest(req, res, 'reject'));
+
+/* Admin: take one course away from a professor (does not touch content) */
+app.post('/api/admin/professors/:id/courses/:courseId/remove', requireAdminAuth, async (req, res) => {
+  try {
+    const u = await User.findOneAndUpdate({ _id: req.params.id, role: 'professor' },
+      { $pull: { 'professor.courses': String(req.params.courseId) } }, { returnDocument: 'after' }).select('username professor');
+    if (!u) return res.status(404).json({ success: false, message: 'Professor not found.' });
+    _clearAuthUserCache();
+    console.log(`[prof] 🛂 ${req.authUser.username} removed course ${req.params.courseId} from ${u.username}`);
+    res.json({ success: true, message: 'Course access removed.', professor: serializeProfessor(u) });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+/* ⚡ ADMIN — student count only (2026-10-07)
+   The Overview tile used to download the whole student list just to
+   count it. This answers with one number from the { role, createdAt }
+   index — a few milliseconds — and is cached for 15 s; any roster
+   change (register / create / import / delete) clears the cache. */
+app.get('/api/admin/stats/student-count', requireAdminAuth, async (req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    const cached = cacheGet('stats:students-count');
+    if (cached != null) return res.json({ success: true, count: cached, cached: true });
+    const count = await User.countDocuments({ role: 'student' });
+    cacheSet('stats:students-count', count, 15000);
+    res.json({ success: true, count });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 app.get('/api/students', requireAdminAuth, async (req, res) => {
   try {
     /* ⚡ Only the fields the admin UI actually renders. Excluding
@@ -11478,7 +13827,7 @@ app.post('/api/user/video-progress', requireUser, async (req, res) => {
     const before = await User.findOneAndUpdate(
       { _id: req.authUserId },
       { $set: set, $max: { [key + '.pct']: pct } },
-      { new: false, projection: { [key]: 1 } }
+      { returnDocument: 'before', projection: { [key]: 1 } }
     ).lean();
 
     const prev = before && before.videoProgress && before.videoProgress[mid];
@@ -11524,6 +13873,7 @@ app.post('/api/materials/:courseId/:materialId/video-session',
   attachUserFromToken,
   async (req, res) => {
   try {
+    if (_visitorWithoutAccount(req)) return _sendSignupRequired(res);
     /* ⚠️ SECURITY: We must NOT trust a client-supplied userId — a
        student could pass another student's _id and stream their
        premium video. The attachUserFromToken middleware reads the
@@ -11555,12 +13905,10 @@ app.post('/api/materials/:courseId/:materialId/video-session',
         });
       }
 
-      const ownsCourse   = (user.purchases || []).includes(String(course._id));
-      const ownsMaterial = (user.purchases || []).includes(String(mat._id));
-      const subscribed   = userHasActiveSubscription(user);
-      const isAdminUser  = String(user.role || '').trim().toLowerCase() === 'admin';
-
-      if (!ownsCourse && !ownsMaterial && !subscribed && !isAdminUser) {
+      /* ⭐ 2026-10-10: the same rule as files (evaluateMaterialAccess) — this
+         copy forgot approved professors, who could not play premium videos
+         of the very courses they were given */
+      if (!evaluateMaterialAccess(user, course, mat).allowed) {
         return res.status(403).json({
           success: false,
           message: 'Purchase or subscription required to watch this video.'
@@ -11610,7 +13958,7 @@ app.post('/api/materials/:courseId/:materialId/video-session',
 /* ============================================================
    PLAYLISTS
    ============================================================ */
-app.post('/api/courses/:courseId/playlists', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/playlists', requireCourseEditor, async (req, res) => {
   try {
     const { title, description, materialIds } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ success: false, message: 'Title is required.' });
@@ -11688,7 +14036,7 @@ app.delete('/api/courses/:courseId/playlists/:playlistId', requireAdminAuth, asy
   } catch (e) { res.status(500).json({ success: false, message: 'Server error: ' + e.message }); }
 });
 
-app.post('/api/courses/:courseId/playlists/:playlistId/materials', requireAdminAuth, async (req, res) => {
+app.post('/api/courses/:courseId/playlists/:playlistId/materials', requireCourseEditor, async (req, res) => {
   try {
     const { materialId } = req.body || {};
     if (!materialId) return res.status(400).json({ success: false, message: 'materialId required.' });
@@ -12076,7 +14424,7 @@ app.put('/api/admin/alumni/:id/approve', requireAdminAuth, async (req, res) => {
     const doc = await Alumni.findByIdAndUpdate(
       req.params.id,
       { status: 'approved', approvedAt: new Date(), approvedBy: String(req.adminUser._id) },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Alumni approved.' });
@@ -12091,7 +14439,7 @@ app.put('/api/admin/alumni/:id/reject', requireAdminAuth, async (req, res) => {
     const doc = await Alumni.findByIdAndUpdate(
       req.params.id,
       { status: 'rejected', approvedAt: null },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Alumni rejected.' });
@@ -12117,7 +14465,7 @@ app.put('/api/admin/friends/:id/approve', requireAdminAuth, async (req, res) => 
     const doc = await Friend.findByIdAndUpdate(
       req.params.id,
       { status: 'approved', approvedAt: new Date(), approvedBy: String(req.adminUser._id) },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Friend approved.' });
@@ -12132,7 +14480,7 @@ app.put('/api/admin/friends/:id/reject', requireAdminAuth, async (req, res) => {
     const doc = await Friend.findByIdAndUpdate(
       req.params.id,
       { status: 'rejected', approvedAt: null },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Friend rejected.' });
@@ -12191,16 +14539,22 @@ app.post('/api/feedback/submit', feedbackLimiter, async (req, res) => {
 /* Public: list APPROVED feedback only */
 app.get('/api/feedback', async (req, res) => {
   try {
+    /* Public (also shown on the landing page): short shared cache so a
+       traffic spike doesn't hit Mongo, while a newly approved review
+       still appears within a minute. ⚡ The server also keeps the list in
+       memory (cleared the moment any review is submitted / approved /
+       rejected / deleted), so most visits never touch MongoDB at all. */
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    const hit = cacheGet('feedback:approved');
+    if (hit) { res.setHeader('X-Cache', 'HIT'); return res.json(hit); }
     const list = await Feedback.find({ status: 'approved' })
-      .select('-studentEmail -approvedBy')
+      .select('studentName studentUsername rating title message courseName approvedAt submittedAt createdAt')
       .sort({ approvedAt: -1 })
       .limit(60)
       .lean();
-    /* Public (also shown on the landing page): short shared cache so a
-       traffic spike doesn't hit Mongo, while a newly approved review
-       still appears within a minute. */
-    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
-    res.json({ success: true, feedback: list });
+    const payload = { success: true, feedback: list };
+    cacheSet('feedback:approved', payload, 5 * 60 * 1000);
+    res.json(payload);
   } catch (e) {
     console.error('[feedback/list]', e);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -12223,7 +14577,7 @@ app.put('/api/admin/feedback/:id/approve', requireAdminAuth, async (req, res) =>
     const doc = await Feedback.findByIdAndUpdate(
       req.params.id,
       { status: 'approved', approvedAt: new Date(), approvedBy: String(req.adminUser._id) },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Feedback approved.' });
@@ -12238,7 +14592,7 @@ app.put('/api/admin/feedback/:id/reject', requireAdminAuth, async (req, res) => 
     const doc = await Feedback.findByIdAndUpdate(
       req.params.id,
       { status: 'rejected', approvedAt: null },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Feedback rejected.' });
@@ -12959,7 +15313,8 @@ app.get('/api/admin/live-activity', requireAdminAuth, async (req, res) => {
 /* ---- Rate limiter — 10 requests / minute, per-user when possible ---- */
 const aiDoubtLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
+  /* ⭐ Premium perk (2026-10-10): 3× the AI limit while subscribed */
+  max: (req) => (req.authUser && userHasActiveSubscription(req.authUser)) ? 30 : 10,
   standardHeaders: true,
   legacyHeaders: false,
   // Per signed-in user (from the verified token, never from the body). Fall back to IP.
@@ -12993,6 +15348,192 @@ function getGeminiClient() {
   return _geminiClient;
 }
 
+/* ⭐ Student notes (2026-10-09) — see notes-api.js. Guarded like the AI
+   engine: a missing file can never take login or courses down. */
+try {
+  const Notebook = require('./models/Notebook');
+  const NotePage = require('./models/NotePage');
+  require('./notes-api')(app, { requireUser, rateLimit, mongoose, Notebook, NotePage, logger: console });
+  console.log('[notes] ✅ notes API ready');
+} catch (e) {
+  console.error('❌ [notes] notes API not loaded:', e.message);
+  app.all('/api/notes', (req, res) => res.status(503).json({ success: false, message: 'Notes are being updated on the server. Please try again shortly.' }));
+  app.all('/api/notes/*rest', (req, res) => res.status(503).json({ success: false, message: 'Notes are being updated on the server. Please try again shortly.' }));
+}
+
+/* ⭐ LaTeX engine (2026-10-10) — real TeX Live for quiz diagrams; see tex-api.js */
+try {
+  const TexRender = require('./models/TexRender');
+  require('./tex-api')(app, { requireUser, rateLimit, TexRender, logger: console });
+  console.log('[tex] ✅ LaTeX engine API ready');
+} catch (e) {
+  console.error('❌ [tex] LaTeX engine not loaded:', e.message);
+}
+
+/* ============================================================
+   ⭐ PRIVACY POLICY + ACCOUNT DELETION (2026-10-12)
+   ------------------------------------------------------------
+   Google Play requires both for apps with sign-up:
+     GET  /privacy          → privacy.html
+     GET  /delete-account   → delete-account.html (works without the app)
+     POST /api/account/delete
+          signed in (Settings › Account):  { password, confirm: "DELETE" }
+          from the web page:               { username, password, confirm: "DELETE" }
+   Students can delete their own account. Admin and professor
+   accounts are refused here (they hold site content; the admin
+   team handles those).
+   Deleted at once: the user record (profile, progress, quiz
+   results, purchases list, sessions), handwritten notebooks and
+   pages, help-desk tickets, reviews and contributions they wrote.
+   Security logs and daily usage counters expire on their own
+   (12 and 6 months).
+   ============================================================ */
+app.get('/privacy', (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.sendFile(path.join(__dirname, 'privacy.html'));
+});
+app.get('/delete-account', (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.sendFile(path.join(__dirname, 'delete-account.html'));
+});
+
+const accountDeleteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 6,
+  standardHeaders: true, legacyHeaders: false,
+  message: { success: false, message: 'Too many attempts. Please wait 15 minutes and try again.' }
+});
+
+app.post('/api/account/delete', accountDeleteLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (String(b.confirm || '').trim().toUpperCase() !== 'DELETE') {
+      return res.status(400).json({ success: false, message: 'Type DELETE to confirm.' });
+    }
+    const password = String(b.password || '');
+    if (!password) return res.status(400).json({ success: false, message: 'Enter your password.' });
+
+    /* who: the signed-in user, else the username typed on the web page */
+    let user = null;
+    const token = _extractToken(req, false);
+    if (token) {
+      const r = await resolveSessionUser(token);
+      if (r && r.user) user = await User.findById(r.user._id);
+    }
+    if (!user) {
+      const raw = String(b.username || '').trim();
+      if (!raw) return res.status(400).json({ success: false, message: 'Enter your username.' });
+      const clean = raw.toLowerCase();
+      user = await User.findOne({ username: clean }) || await User.findOne({ username: raw });
+      if (!user) {
+        const esc = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        user = await User.findOne({ username: new RegExp('^' + esc + '$', 'i') });
+      }
+    }
+    const ok = user && user.password ? await bcrypt.compare(password, user.password).catch(() => false) : false;
+    if (!ok) return res.status(400).json({ success: false, message: 'Username or password is incorrect.' });
+
+    const role = String(user.role || 'student').trim().toLowerCase();
+    if (role !== 'student') {
+      return res.status(403).json({ success: false, message: 'Admin and professor accounts can only be removed by the RankerNode team. Please contact them.' });
+    }
+
+    const uid = user._id;
+    const uname = String(user.username || '');
+    const tidy = async (label, fn) => { try { return await fn(); } catch (e) { console.warn(`[account-delete] ${label}:`, e.message); return null; } };
+    await tidy('notebooks', () => require('./models/Notebook').deleteMany({ userId: uid }));
+    await tidy('note pages', () => require('./models/NotePage').deleteMany({ userId: uid }));
+    await tidy('help desk', () => require('./models/SupportTicket').deleteMany({ userId: uid }));
+    if (uname) {
+      await tidy('reviews', () => Feedback.deleteMany({ studentUsername: uname }));
+      await tidy('contributions', () => Contribution.deleteMany({ studentUsername: uname }));
+    }
+    await User.findByIdAndDelete(uid);
+    _clearAuthUserCache();
+    try { cacheClear('feedback:'); } catch (_) {}
+    console.log(`[account-delete] 🗑️ student "${uname}" deleted their account (ip ${_clientIp(req)})`);
+    res.json({ success: true, message: 'Your RankerNode account and its data have been deleted.' });
+  } catch (e) {
+    console.error('[account-delete]', e);
+    res.status(500).json({ success: false, message: 'Could not delete the account right now. Please try again later.' });
+  }
+});
+
+/* ⭐ Premium Help Desk (2026-10-10) — see help-api.js */
+try {
+  const SupportTicket = require('./models/SupportTicket');
+  require('./help-api')(app, { requireUser, requireAdminAuth, rateLimit, mongoose, SupportTicket, User,
+    userHasActiveSubscription, transporter, escapeHtml, withTimeout, clearAuthCache: _clearAuthUserCache, logger: console });
+  console.log('[help] ✅ premium help desk ready');
+} catch (e) {
+  console.error('❌ [help] help desk not loaded:', e.message);
+}
+
+/* ⭐ Learning features (2026-10-11) — practice, mistakes, daily challenge,
+   performance, assignments, test series, question bank, report card.
+   See learning-api.js. Guarded: a problem there never takes the site down. */
+let learningApi = null;
+try {
+  const QBankItem = require('./models/QBankItem');
+  const TestSeries = require('./models/TestSeries');
+  learningApi = require('./learning-api')(app, {
+    requireUser, requireGrader, rateLimit, mongoose, Course, User, QBankItem, TestSeries,
+    evaluateMaterialAccess, istDateKey, awardXP, getAI: () => aiEngine, pickModel: _aiPickedModel, logger: console
+  });
+  console.log('[learn] ✅ learning features ready');
+} catch (e) {
+  console.error('❌ [learn] learning features not loaded:', e.message);
+}
+
+/* ⭐ AI engine v3 (2026-10-08) — Gemini + Groq, model picker, fallbacks.
+   See ai-engine.js. GROQ_API_KEY is optional; GEMINI_API_KEY is optional;
+   at least one is needed. AI_MODELS (comma list) pins the models. */
+/* A missing ai-engine.js (e.g. not added to git) must never take the whole
+   site down — login, courses and payments keep working, only AI is off. */
+let aiEngine;
+try {
+  const { createAiEngine } = require('./ai-engine');
+  aiEngine = createAiEngine({ getGeminiClient, logger: console });
+} catch (e) {
+  console.error('❌ [ai] ai-engine.js could not be loaded — AI Solver disabled until it is deployed:', e.message);
+  const off = { message: 'The AI Solver is being updated on the server. Please try again in a few minutes.' };
+  aiEngine = {
+    configured: () => false, hasGemini: () => false, hasGroq: () => false, catalogErrors: () => ({ engine: e.message }),
+    getCatalog: async () => [], buildChain: () => ({ chain: [], picked: null, switched: null, requested: null }),
+    run: async () => ({ used: null, attempts: [], lastError: null }), failureMessage: () => off,
+    publicList: async () => ({ default: 'auto', providers: { gemini: false, groq: false }, models: [] }),
+    testAll: async () => [], coolLeft: () => 0
+  };
+}
+const AI_MODEL_ID_RE = /^(auto|(gemini|groq):[A-Za-z0-9._\/-]{2,80})$/;
+function _aiPickedModel(v) {
+  const s = String(v || '').trim();
+  return AI_MODEL_ID_RE.test(s) ? s : 'auto';
+}
+
+/* GET /api/ai/models — what the model picker shows */
+app.get('/api/ai/models', requireUser, async (req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store, private');
+    const out = await aiEngine.publicList();
+    res.json(Object.assign({ success: true }, out));
+  } catch (e) {
+    console.error('[ai/models]', e);
+    res.status(500).json({ success: false, message: 'Could not load the AI models.' });
+  }
+});
+
+/* POST /api/admin/ai/test — admin health check of every model */
+app.post('/api/admin/ai/test', requireAdminAuth, async (req, res) => {
+  try {
+    if (!aiEngine.configured()) return res.json({ success: true, results: [], providers: { gemini: false, groq: false } });
+    const results = await aiEngine.testAll();
+    res.json({ success: true, results, providers: { gemini: aiEngine.hasGemini(), groq: aiEngine.hasGroq() }, listErrors: aiEngine.catalogErrors() });
+  } catch (e) {
+    console.error('[admin/ai/test]', e);
+    res.status(500).json({ success: false, message: 'Test failed: ' + e.message });
+  }
+});
+
 /* ============================================================
    POST /api/ai/solve-doubt
    Body:    { question: string, courseId?: string }
@@ -13009,11 +15550,11 @@ app.post('/api/ai/solve-doubt', requireUser, aiDoubtLimiter, async (req, res) =>
     if (String(question).length > 8000) {
       return res.status(400).json({ success: false, message: 'Question too long (max 8000 chars).' });
     }
-    if (!process.env.GEMINI_API_KEY) {
-      console.error('[ai] ❌ GEMINI_API_KEY is not set');
+    if (!aiEngine.configured()) {
+      console.error('[ai] ❌ neither GEMINI_API_KEY nor GROQ_API_KEY is set');
       return res.status(500).json({
         success: false,
-        message: 'AI is not configured. Please ask the admin to set GEMINI_API_KEY.'
+        message: 'AI is not configured. Please ask the admin to set GEMINI_API_KEY or GROQ_API_KEY.'
       });
     }
 
@@ -13055,91 +15596,26 @@ app.post('/api/ai/solve-doubt', requireUser, aiDoubtLimiter, async (req, res) =>
       ? `${contextBlock}\nStudent's doubt: ${question}`
       : `Student's doubt: ${question}`;
 
-    /* ---------- 5. Model fallback chain (auto-discovered) ---------- */
-    // Ask Google what models your key can actually use.
-    // Cache the result for 10 minutes so we don't hit the API every request.
-    /* Shared with /api/ai/chat — filtered, ranked, cached 10 min. */
-    const MODELS = await aiModelChain();
-
-    if (MODELS.length === 0) {
-      return res.status(503).json({
-        success: false,
-        message: 'AI is not configured — no usable Gemini models were found for this API key.'
-      });
+    /* ---------- 5. ⭐ v3 engine: picked model → fallbacks (Gemini + Groq) ---------- */
+    const catalog = await aiEngine.getCatalog();
+    const plan = aiEngine.buildChain(catalog, _aiPickedModel((req.body || {}).model), {});
+    if (!plan.chain.length) {
+      return res.status(503).json({ success: false, message: 'AI is not configured — no usable AI models were found.' });
     }
-
-    let answer = null;
-    let usedModel = null;
-    let lastError = null;
-
-    const ai = getGeminiClient();
-
-    for (const model of MODELS) {
-      try {
-        console.log(`[ai] Trying model: ${model}`);
-        const t0 = Date.now();
-
-        const response = await ai.models.generateContent({
-          model,
-          contents: userPrompt,
-          config: {
-            systemInstruction,
-            temperature: 0.5,
-            maxOutputTokens: 8192        // 2.5 models count "thinking" here — 2048 cut answers short
-          }
-        });
-
-        // @google/genai v2.x — `response.text` is a getter, not a function.
-        const text = typeof response.text === 'function'
-          ? response.text()
-          : response.text;
-
-        if (text && String(text).trim()) {
-          answer = String(text).trim();
-          usedModel = model;
-          console.log(`[ai] ✅ ${model} succeeded (${answer.length} chars in ${Date.now() - t0}ms)`);
-          break;
-        }
-
-        console.warn(`[ai] Model "${model}" returned empty text`);
-        lastError = { model, message: 'Empty response' };
-      } catch (err) {
-        const msg = err && err.message ? err.message : String(err);
-        const status = err && (err.status || err.statusCode || (err.error && err.error.code));
-        console.error(`[ai] ❌ Model "${model}" failed:`, msg);
-        lastError = { model, message: msg, status };
-      }
-    }
-
-    /* ---------- 6. Friendly failure ---------- */
-    if (!answer) {
-      let friendly = 'AI is temporarily unavailable. Please try again in a moment.';
-      if (lastError) {
-        const status = lastError.status;
-        const msg = String(lastError.message || '');
-        if (status === 401 || status === 403) {
-          friendly = 'AI authentication failed. Please ask the admin to verify GEMINI_API_KEY.';
-        } else if (status === 429) {
-          friendly = 'AI rate limit reached. Please wait a minute and try again.';
-        } else if (status === 400) {
-          friendly = 'AI could not process that request. Try rephrasing your question.';
-        } else if (status === 404) {
-          friendly = 'AI model unavailable. Please contact admin to update the model name.';
-        } else if (/network|fetch|ENOTFOUND|ETIMEDOUT|ECONNREFUSED/i.test(msg)) {
-          friendly = 'Network error reaching the AI service. Check the server internet connection.';
-        } else if (/api key|API_KEY_INVALID|invalid.*key/i.test(msg)) {
-          friendly = 'AI API key is invalid. Please ask the admin to check GEMINI_API_KEY.';
-        }
-      }
-      return res.status(503).json({ success: false, message: friendly });
-    }
-
-    /* ---------- 7. Success ---------- */
-    return res.json({
-      success: true,
-      answer,
-      model: usedModel
+    let answer = '';
+    const t0 = Date.now();
+    const result = await aiEngine.run({
+      chain: plan.chain,
+      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      system: systemInstruction, temperature: 0.5, maxTokens: 8192,
+      onDelta: (t) => { answer += t; }
     });
+    if (!result.used || !answer.trim()) {
+      const f = aiEngine.failureMessage(result, plan.chain);
+      return res.status(503).json({ success: false, message: f.message, retryAfter: f.retryAfter });
+    }
+    console.log(`[ai/solve-doubt] ✅ ${result.used.id} · ${answer.length} chars · ${Date.now() - t0} ms`);
+    return res.json({ success: true, answer: answer.trim(), model: result.used.label, modelId: result.used.id, partial: !!result.partial });
 
   } catch (e) {
     console.error('[ai/solve-doubt] Fatal:', e);
@@ -13191,42 +15667,7 @@ const aiUpload = multer({
   limits: { fileSize: AI_LIMITS.fileBytes, files: AI_LIMITS.files, fields: 12, fieldSize: 256 * 1024, parts: 24 }
 });
 
-/* ---- Which Gemini models to try, best first (cached 10 min) ----
-   AI_MODELS in .env (comma separated) overrides the automatic order. */
-const AI_SKIP_MODEL_RE = /(tts|image|embedding|live|audio|veo|imagen|aqa|robotics|computer-use|learnlm|gemma|nano)/i;
-async function aiModelChain() {
-  const forced = String(process.env.AI_MODELS || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (forced.length) return forced;
-  const now = Date.now();
-  if (!global.__aeroAiModelCache || (now - global.__aeroAiModelCache.at) > 10 * 60 * 1000) {
-    try {
-      const listResp = await getGeminiClient().models.list();
-      const discovered = [];
-      for await (const m of listResp) {
-        const id = String(m.name || '').replace(/^models\//, '');
-        if (!id || !/^gemini/i.test(id) || AI_SKIP_MODEL_RE.test(id)) continue;
-        const methods = m.supportedActions || m.supportedGenerationMethods || [];
-        const canGenerate = Array.isArray(methods) ? methods.some(x => /generateContent/i.test(x)) : true;
-        if (canGenerate) discovered.push(id);
-      }
-      const rank = (s) => {
-        let r = /pro/.test(s) ? 30 : /flash-lite|lite/.test(s) ? 10 : /flash/.test(s) ? 20 : 0;
-        const v = (s.match(/(\d+(?:\.\d+)?)/) || [])[1];
-        r += v ? Math.min(9, parseFloat(v)) : 0;             // newer generation first
-        if (/latest/.test(s)) r += 0.5;
-        if (/preview|exp/.test(s)) r -= 3;                    // stable before preview
-        return r;
-      };
-      discovered.sort((a, b) => rank(b) - rank(a) || a.length - b.length);
-      global.__aeroAiModelCache = { at: now, models: discovered };
-      console.log('[ai] Discovered models:', discovered.join(', '));
-    } catch (e) {
-      console.warn('[ai] Model discovery failed, using static fallback:', e.message);
-      global.__aeroAiModelCache = { at: now - 9 * 60 * 1000, models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash'] };
-    }
-  }
-  return (global.__aeroAiModelCache.models || []).slice(0, 4);
-}
+/* (v2 aiModelChain removed 2026-10-08 — model choice now lives in ai-engine.js) */
 
 function aiFriendlyError(lastError) {
   let friendly = 'AI is temporarily unavailable. Please try again in a moment.';
@@ -13443,8 +15884,8 @@ async function _aiChatHandler(req, res) {
   if (question.length > AI_LIMITS.questionChars) {
     return res.status(400).json({ success: false, message: `Message too long (max ${AI_LIMITS.questionChars} characters). Attach long text as a .txt file instead.` });
   }
-  if (!process.env.GEMINI_API_KEY) {
-    return res.status(503).json({ success: false, message: 'AI is not configured. Please ask the admin to set GEMINI_API_KEY.' });
+  if (!aiEngine.configured()) {
+    return res.status(503).json({ success: false, message: 'AI is not configured. Please ask the admin to set GEMINI_API_KEY or GROQ_API_KEY.' });
   }
   const convId = /^[A-Za-z0-9_-]{8,64}$/.test(String(body.convId || '')) ? String(body.convId) : '';
   const convKey = convId ? req.authUserId + ':' + convId : '';
@@ -13499,10 +15940,19 @@ async function _aiChatHandler(req, res) {
   userParts.push({ text: contextText + (question || 'Please read the attached file(s) and solve / explain the question(s) in them step by step.') });
   contents.push({ role: 'user', parts: userParts });
 
-  /* 5. Stream the answer */
-  const chain = await aiModelChain();
-  if (!chain.length) {
-    return res.status(503).json({ success: false, message: 'AI is not configured — no usable Gemini models were found for this API key.' });
+  /* 5. ⭐ v3: pick the model chain (what the attachments need decides
+        which models can answer), then stream from the first that works */
+  const allParts = contents.reduce((a, c) => a.concat(c.parts || []), []);
+  const needs = {
+    pdf: allParts.some(p => p.inlineData && /pdf/i.test(p.inlineData.mimeType || '')),
+    images: allParts.some(p => p.inlineData && /^image\//i.test(p.inlineData.mimeType || ''))
+  };
+  const catalog = await aiEngine.getCatalog();
+  const plan = aiEngine.buildChain(catalog, _aiPickedModel(body.model), needs);
+  if (!plan.chain.length) {
+    return res.status(503).json({ success: false, message: catalog.length
+      ? 'None of the available AI models can read this kind of attachment. Please attach the question as text, or ask the admin to add a Gemini key.'
+      : 'AI is not configured — no usable AI models were found for the server\'s API keys.' });
   }
 
   res.status(200);
@@ -13520,58 +15970,31 @@ async function _aiChatHandler(req, res) {
   res.on('close', () => { if (!res.writableEnded) { clientGone = true; ac.abort(); } });
   const ping = setInterval(() => send({ t: 'ping' }), 8000);
 
-  send({ t: 'meta', files: prepared.accepted, earlierFiles: earlierParts.length ? earlierParts.length - 1 : 0 });
+  send({ t: 'meta', files: prepared.accepted, earlierFiles: earlierParts.length ? earlierParts.length - 1 : 0,
+         requested: plan.requested ? plan.requested.label : null, switched: plan.switched });
 
-  const ai = getGeminiClient();
-  let usedModel = null;
-  let lastError = null;
-  let partial = false;
   let total = 0;
   const t0 = Date.now();
+  let result;
   try {
-    for (const model of chain) {
-      if (clientGone) break;
-      let got = 0;
-      try {
-        const stream = await ai.models.generateContentStream({
-          model, contents,
-          config: { systemInstruction: AI_SYSTEM_V2, temperature: 0.4, maxOutputTokens: 8192, abortSignal: ac.signal }
-        });
-        let finish = '';
-        for await (const chunk of stream) {
-          if (clientGone) break;
-          let t = '';
-          try { t = chunk && chunk.text; } catch (_) { t = ''; }
-          if (t) { got += t.length; send({ t: 'delta', text: t }); }
-          const c0 = chunk && chunk.candidates && chunk.candidates[0];
-          if (c0 && c0.finishReason) finish = String(c0.finishReason);
-          if (!t && chunk && chunk.promptFeedback && chunk.promptFeedback.blockReason) finish = 'SAFETY';
-        }
-        if (got) {
-          usedModel = model; total = got;
-          if (finish === 'MAX_TOKENS') partial = true;
-          break;
-        }
-        lastError = { model, message: finish === 'SAFETY' ? 'blocked by safety' : 'Empty response' };
-        if (finish === 'SAFETY') break;                    // another model would refuse too
-      } catch (err) {
-        if (clientGone) break;
-        const msg = err && err.message ? err.message : String(err);
-        const status = err && (err.status || err.statusCode || (err.error && err.error.code));
-        console.error(`[ai/chat] ❌ ${model}:`, msg.slice(0, 300));
-        lastError = { model, message: msg, status };
-        if (got) { usedModel = model; total = got; partial = true; break; }   // keep what was written
-      }
-    }
+    result = await aiEngine.run({
+      chain: plan.chain, contents, system: AI_SYSTEM_V2, temperature: 0.4, maxTokens: 8192, signal: ac.signal,
+      onModel: (e, i) => send({ t: 'model', id: e.id, label: e.label, attempt: i + 1 }),
+      onDelta: (t) => { total += t.length; send({ t: 'delta', text: t }); }
+    });
   } finally {
     clearInterval(ping);
   }
   if (clientGone) { console.log('[ai/chat] client stopped the answer'); return; }
-  if (usedModel) {
-    console.log(`[ai/chat] ✅ ${usedModel} · ${total} chars · ${prepared.accepted.length} file(s) · ${Date.now() - t0} ms`);
-    send({ t: 'done', model: usedModel, partial, filesExpired });
+  if (result.used) {
+    const fellBack = plan.requested && result.used.id !== plan.requested.id;
+    console.log(`[ai/chat] ✅ ${result.used.id} · ${total} chars · ${prepared.accepted.length} file(s) · ${Date.now() - t0} ms` +
+                (result.attempts.length > 1 ? ` · after ${result.attempts.length - 1} fallback(s)` : ''));
+    send({ t: 'done', model: result.used.label, modelId: result.used.id, partial: !!result.partial, filesExpired,
+           requested: plan.requested ? plan.requested.label : null, fallback: !!fellBack, switched: plan.switched });
   } else {
-    send({ t: 'error', message: aiFriendlyError(lastError) });
+    const f = aiEngine.failureMessage(result, plan.chain);
+    send({ t: 'error', message: f.message, retryAfter: f.retryAfter || null });
   }
   res.end();
 }
@@ -13734,7 +16157,7 @@ app.put('/api/admin/login-popups/:id', requireAdminAuth, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid id.' });
     const doc = await LoginPopup.findByIdAndUpdate(req.params.id,
       { $set: Object.assign(_popupClean(req.body), { updatedBy: (req.authUser && req.authUser.username) || 'admin' }), $inc: { version: 1 } },
-      { new: true }).lean();
+      { returnDocument: 'after' }).lean();
     if (!doc) return res.status(404).json({ success: false, message: 'Pop-up not found.' });
     _popupInvalidate();
     res.json({ success: true, popup: doc });
@@ -13854,7 +16277,8 @@ function readAppRelease() {
   if (_appRelease) return _appRelease;
   try {
     const r = JSON.parse(fs.readFileSync(APP_RELEASE_JSON, 'utf8'));
-    _appRelease = r && r.android ? r : { android: null };
+    /* keep every platform (android, windows…) — a missing one is just null */
+    _appRelease = r && typeof r === 'object' ? Object.assign({ android: null }, r) : { android: null };
   } catch (_) { _appRelease = { android: null }; }
   return _appRelease;
 }
@@ -13878,7 +16302,7 @@ function _publicAndroid(a) {
 
 app.get('/api/app-release', (req, res) => {
   res.setHeader('Cache-Control', 'public, max-age=60');
-  res.json({ success: true, android: _publicAndroid(_androidReleaseLive()) });
+  res.json({ success: true, android: _publicAndroid(_androidReleaseLive()), windows: _publicWindows(_windowsReleaseLive()) });
 });
 
 let _apkCountTimer = null;
@@ -13903,7 +16327,7 @@ app.get('/api/admin/app-release', requireAdminAuth, (req, res) => {
   res.json({ success: true, android: a ? Object.assign(_publicAndroid(a), {
     file: path.basename(a.file), sha256: a.sha256, uploadedBy: a.uploadedBy, downloads: a.downloads || 0,
     previous: readAppRelease().previous || null
-  }) : { available: false } });
+  }) : { available: false }, windows: _adminWindows(), windowsJob: _winJob });
 });
 
 const apkUpload = multer({
@@ -13976,7 +16400,7 @@ app.post('/api/admin/app-release/android', requireAdminAuth, (req, res) => {
       for (const f of await fs.promises.readdir(APP_RELEASE_DIR)) {
         if (f.endsWith('.apk') && !keep.has(f)) fs.promises.rm(path.join(APP_RELEASE_DIR, f), { force: true }).catch(() => {});
       }
-      await writeAppRelease({ android, previous: prev ? { version: prev.version, versionCode: prev.versionCode, file: prev.file, uploadedAt: prev.uploadedAt } : null });
+      await writeAppRelease(Object.assign({}, readAppRelease(), { android, previous: prev ? { version: prev.version, versionCode: prev.versionCode, file: prev.file, uploadedAt: prev.uploadedAt } : null }));
       console.log(`[app-release] 📱 Android ${version} (${versionCode}) uploaded · ${(buf.length / 1048576).toFixed(1)} MB`);
       res.json({ success: true, android: _publicAndroid(android) });
     } catch (e) {
@@ -13990,7 +16414,292 @@ app.post('/api/admin/app-release/android', requireAdminAuth, (req, res) => {
 app.delete('/api/admin/app-release/android', requireAdminAuth, async (req, res) => {
   try {
     const rel = readAppRelease();
-    await writeAppRelease({ android: null, previous: rel.android ? { version: rel.android.version, versionCode: rel.android.versionCode, file: rel.android.file, uploadedAt: rel.android.uploadedAt } : null });
+    await writeAppRelease(Object.assign({}, rel, { android: null, previous: rel.android ? { version: rel.android.version, versionCode: rel.android.versionCode, file: rel.android.file, uploadedAt: rel.android.uploadedAt } : null }));
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, message: 'Server error.' }); }
+});
+/* ============================================================
+   ⭐ WINDOWS APP — installer + automatic updates (2026-10-10)
+   ------------------------------------------------------------
+   The Windows app (desktop-app/, built and tested by GitHub
+   Actions) is published by the admin — straight from the newest
+   GitHub Release, or by uploading the .exe. Students download it
+   from "Get App"; installed apps read latest.yml every few hours
+   and update themselves.
+
+   Public:  GET  /download/windows             → RankerNode-Setup-x.y.z.exe
+            GET  /download/windows/latest.yml  → update feed (electron-updater)
+            GET  /download/windows/<setup>.exe → the same file under its versioned name
+   Admin:   POST /api/admin/app-release/windows               multipart: file (.exe), notes?, force?
+            POST /api/admin/app-release/windows/from-github   { force? } → runs in the background,
+                 progress in GET /api/admin/app-release → windowsJob
+            DELETE /api/admin/app-release/windows
+   ============================================================ */
+const APP_GITHUB_REPO = process.env.APP_GITHUB_REPO || 'KrishYadav7/rankernode';
+const WIN_MAX_BYTES = 300 * 1024 * 1024;
+
+function _windowsReleaseLive() {
+  const w = readAppRelease().windows;
+  if (!w || !w.file) return null;
+  const fp = path.join(APP_RELEASE_DIR, path.basename(w.file));
+  return fs.existsSync(fp) ? Object.assign({}, w, { fp }) : null;
+}
+function _publicWindows(w) {
+  return w ? { available: true, version: w.version, size: w.size, url: '/download/windows',
+               updatedAt: w.uploadedAt, notes: w.notes || '' }
+           : { available: false };
+}
+function _adminWindows() {
+  const w = _windowsReleaseLive();
+  if (!w) return { available: false, previous: readAppRelease().windowsPrevious || null };
+  return Object.assign(_publicWindows(w), {
+    file: path.basename(w.file), sha256: w.sha256, uploadedBy: w.uploadedBy, source: w.source || 'upload',
+    downloads: w.downloads || 0, updates: w.updates || 0, test: w.test || null,
+    previous: readAppRelease().windowsPrevious || null
+  });
+}
+const _winSetupName = (v) => `RankerNode-Setup-${String(v).replace(/[^0-9A-Za-z._-]/g, '')}.exe`;
+function _cmpVer(a, b) {
+  const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+/* count downloads without writing the file on every request */
+let _winCountTimer = null;
+function _countWindows(field) {
+  const rel = readAppRelease();
+  if (!rel.windows) return;
+  rel.windows[field] = (rel.windows[field] || 0) + 1;
+  clearTimeout(_winCountTimer);
+  _winCountTimer = setTimeout(() => { writeAppRelease(rel).catch(() => {}); }, 5000);
+}
+function _sendWindowsExe(req, res, w) {
+  const type = 'application/vnd.microsoft.portable-executable';
+  res.setHeader('Content-Type', type);
+  res.setHeader('Content-Disposition', `attachment; filename="${_winSetupName(w.version)}"`);
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.sendFile(w.fp, { headers: { 'Content-Type': type } });
+}
+
+app.get('/download/windows', (req, res) => {
+  const w = _windowsReleaseLive();
+  if (!w) return res.redirect(302, '/#apps');            // nothing published yet → the install section
+  if (req.method === 'GET' && !req.headers.range) _countWindows('downloads');
+  _sendWindowsExe(req, res, w);
+});
+
+/* the feed electron-updater reads (same format electron-builder writes) */
+app.get('/download/windows/latest.yml', (req, res) => {
+  const w = _windowsReleaseLive();
+  res.setHeader('Cache-Control', 'no-cache');
+  if (!w || !w.sha512) return res.status(404).type('text/plain').send('No Windows release published.');
+  const name = _winSetupName(w.version);
+  res.type('text/yaml').send(
+    `version: ${w.version}\n` +
+    `files:\n  - url: ${name}\n    sha512: ${w.sha512}\n    size: ${w.size}\n` +
+    `path: ${name}\nsha512: ${w.sha512}\nreleaseDate: '${w.uploadedAt}'\n`);
+});
+
+app.get('/download/windows/:file', (req, res) => {
+  const w = _windowsReleaseLive();
+  if (!w || req.params.file !== _winSetupName(w.version)) return res.status(404).end();
+  if (req.method === 'GET' && !req.headers.range) _countWindows('updates');
+  _sendWindowsExe(req, res, w);
+});
+
+/* size + hashes without reading the whole file into memory */
+function _hashFile(fp) {
+  return new Promise((resolve, reject) => {
+    const h512 = crypto.createHash('sha512');
+    const h256 = crypto.createHash('sha256');
+    let size = 0;
+    fs.createReadStream(fp)
+      .on('data', (c) => { size += c.length; h512.update(c); h256.update(c); })
+      .on('error', reject)
+      .on('end', () => resolve({ size, sha512: h512.digest('base64'), sha256: h256.digest('hex') }));
+  });
+}
+
+/* Is this really a Windows installer? (an .exe built by NSIS) */
+async function _looksLikeWindowsInstaller(fp) {
+  const fh = await fs.promises.open(fp, 'r');
+  try {
+    const st = await fh.stat();
+    if (st.size < 1024 * 1024) return false;
+    const len = Math.min(st.size, 8 * 1024 * 1024);
+    const head = Buffer.alloc(len);
+    await fh.read(head, 0, len, 0);
+    if (head.toString('latin1', 0, 2) !== 'MZ') return false;
+    const pe = head.readUInt32LE(0x3c);
+    if (pe + 4 > len || head.toString('latin1', pe, pe + 4) !== 'PE\u0000\u0000') return false;
+    return head.indexOf('NullsoftInst', 0, 'latin1') !== -1;
+  } finally { await fh.close(); }
+}
+
+/* make a checked .exe the live Windows release */
+async function _publishWindows(tmp, { version, notes, by, source, test }) {
+  const { size, sha512, sha256 } = await _hashFile(tmp);
+  const name = `RankerNode-Setup-${version}-${crypto.randomBytes(4).toString('hex')}.exe`;
+  await fs.promises.copyFile(tmp, path.join(APP_RELEASE_DIR, name));
+  const rel = readAppRelease();
+  const prev = rel.windows;
+  const windows = {
+    version, file: name, size, sha512, sha256,
+    notes: String(notes || '').slice(0, 500),
+    uploadedAt: new Date().toISOString(), uploadedBy: by || 'admin',
+    source: source || 'upload', test: test || null, downloads: 0, updates: 0
+  };
+  /* keep the previous installer for one release (rollback), delete older ones */
+  const keep = new Set([name, prev && prev.file].filter(Boolean));
+  for (const f of await fs.promises.readdir(APP_RELEASE_DIR)) {
+    if (/\.exe$/i.test(f) && !keep.has(f)) fs.promises.rm(path.join(APP_RELEASE_DIR, f), { force: true }).catch(() => {});
+  }
+  await writeAppRelease(Object.assign({}, readAppRelease(), {
+    windows,
+    windowsPrevious: prev ? { version: prev.version, file: prev.file, uploadedAt: prev.uploadedAt } : null
+  }));
+  console.log(`[app-release] 🪟 Windows ${version} published (${source}) · ${(size / 1048576).toFixed(1)} MB`);
+  return windows;
+}
+
+const exeUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, require('os').tmpdir()),
+    filename: (req, file, cb) => cb(null, 'exe-upload-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex'))
+  }),
+  limits: { fileSize: WIN_MAX_BYTES, files: 1 }
+});
+
+app.post('/api/admin/app-release/windows', requireAdminAuth, (req, res) => {
+  exeUpload.single('file')(req, res, async (err) => {
+    const tmp = req.file && req.file.path;
+    const cleanup = () => { if (tmp) fs.promises.rm(tmp, { force: true }).catch(() => {}); };
+    try {
+      if (err) {
+        return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400)
+          .json({ success: false, message: err.code === 'LIMIT_FILE_SIZE' ? 'The installer is larger than 300 MB.' : 'Upload failed.' });
+      }
+      if (!req.file) return res.status(400).json({ success: false, message: 'Choose the .exe file first.' });
+      if (!(await _looksLikeWindowsInstaller(tmp))) {
+        cleanup();
+        return res.status(415).json({ success: false, message: 'That file is not the RankerNode Windows installer. Upload RankerNode-Setup-x.y.z.exe from GitHub.' });
+      }
+      const m = /(\d+)\.(\d+)\.(\d+)/.exec(String((req.body && req.body.version) || req.file.originalname || ''));
+      if (!m) { cleanup(); return res.status(400).json({ success: false, message: 'Keep the version in the file name (RankerNode-Setup-1.0.5.exe).' }); }
+      const version = m[0];
+      const cur = readAppRelease().windows;
+      if (cur && _cmpVer(version, cur.version) <= 0 && !(req.body && req.body.force === '1')) {
+        cleanup();
+        return res.status(409).json({ success: false, code: 'OLDER_VERSION',
+          message: `Version ${version} is not newer than the current ${cur.version}. Installed apps only update to newer versions.` });
+      }
+      const windows = await _publishWindows(tmp, {
+        version, notes: req.body && req.body.notes, source: 'upload',
+        by: (req.authUser && req.authUser.username) || 'admin'
+      });
+      cleanup();
+      res.json({ success: true, windows: _publicWindows(windows) });
+    } catch (e) {
+      cleanup();
+      console.error('[app-release] windows upload', e);
+      res.status(500).json({ success: false, message: 'Could not save the installer.' });
+    }
+  });
+});
+
+/* ---- publish the newest "windows-v*" GitHub Release (runs in the background) ---- */
+let _winJob = { state: 'idle' };
+async function _ghFetch(url, ms) {
+  const headers = { 'User-Agent': 'rankernode-server', Accept: 'application/vnd.github+json' };
+  if (process.env.GITHUB_TOKEN && /^https:\/\/api\.github\.com\//.test(url)) headers.Authorization = 'Bearer ' + process.env.GITHUB_TOKEN;
+  return fetch(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(ms) });
+}
+async function _runWindowsFromGithub({ force, by }) {
+  const tmp = path.join(require('os').tmpdir(), 'exe-gh-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex'));
+  const set = (o) => { _winJob = Object.assign({}, _winJob, o, { at: Date.now() }); };
+  try {
+    set({ step: 'Looking for the newest Windows build on GitHub…' });
+    const r = await _ghFetch(`https://api.github.com/repos/${APP_GITHUB_REPO}/releases?per_page=40`, 20000);
+    if (!r.ok) throw new Error(`GitHub answered ${r.status}${r.status === 403 ? ' (rate limit — try again in a few minutes)' : ''}.`);
+    const list = await r.json();
+    const rels = (Array.isArray(list) ? list : [])
+      .filter((x) => x && !x.draft && /^windows-v\d+\.\d+\.\d+$/.test(x.tag_name || ''))
+      .sort((a, b) => _cmpVer(b.tag_name.slice(9), a.tag_name.slice(9)));
+    const rel = rels.find((x) => (x.assets || []).some((a) => /^RankerNode-Setup-[\d.]+\.exe$/.test(a.name)));
+    if (!rel) throw new Error('No Windows build on GitHub yet. Run "Windows app (installer)" in GitHub → Actions first.');
+    const version = rel.tag_name.slice(9);
+    const asset = rel.assets.find((a) => /^RankerNode-Setup-[\d.]+\.exe$/.test(a.name));
+    const cur = readAppRelease().windows;
+    if (cur && _cmpVer(version, cur.version) <= 0 && !force) {
+      return set({ state: 'done', step: '', code: 'UP_TO_DATE', version, message: `Windows ${cur.version} is already live — GitHub has nothing newer.` });
+    }
+    if (asset.size > WIN_MAX_BYTES) throw new Error('The installer on GitHub is larger than 300 MB.');
+
+    /* the build's own test report (small text file), if attached */
+    let test = null;
+    const rep = rel.assets.find((a) => /^windows-test-report.*\.txt$/.test(a.name));
+    if (rep && rep.size < 200000) {
+      try {
+        const t = await (await _ghFetch(rep.browser_download_url, 20000)).text();
+        const fails = (t.match(/^FAIL/gm) || []).length;
+        const passes = (t.match(/^PASS/gm) || []).length;
+        test = { passes, fails, url: rep.browser_download_url, failed: (t.match(/^FAIL.*$/gm) || []).slice(0, 8) };
+      } catch (_) {}
+    }
+
+    set({ step: `Downloading RankerNode-Setup-${version}.exe…`, version, total: asset.size, received: 0 });
+    const dl = await _ghFetch(asset.browser_download_url, 15 * 60 * 1000);
+    if (!dl.ok || !dl.body) throw new Error(`Download failed (${dl.status}).`);
+    const { Readable, Transform } = require('stream');
+    const { pipeline } = require('stream/promises');
+    let received = 0;
+    let lastTick = 0;
+    const meter = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length;
+        if (received > WIN_MAX_BYTES) return cb(new Error('The download is larger than 300 MB.'));
+        const now = Date.now();
+        if (now - lastTick > 500) { lastTick = now; set({ received }); }
+        cb(null, chunk);
+      }
+    });
+    await pipeline(Readable.fromWeb(dl.body), meter, fs.createWriteStream(tmp));
+    set({ received, step: 'Checking the installer…' });
+    if (received !== asset.size) throw new Error('The download was incomplete — please try again.');
+    if (!(await _looksLikeWindowsInstaller(tmp))) throw new Error('The file on GitHub is not a Windows installer.');
+    const w = await _publishWindows(tmp, { version, notes: '', by, source: 'github ' + rel.tag_name, test });
+    set({ state: 'done', step: '', code: 'PUBLISHED', version: w.version, message: `Windows ${w.version} is live — students can download it now.` });
+  } catch (e) {
+    console.error('[app-release] windows from GitHub', e && e.message);
+    set({ state: 'error', step: '', message: (e && e.name === 'TimeoutError') ? 'GitHub took too long — please try again.' : ((e && e.message) || 'Failed.') });
+  } finally {
+    fs.promises.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
+app.post('/api/admin/app-release/windows/from-github', requireAdminAuth, (req, res) => {
+  if (typeof fetch !== 'function') return res.status(501).json({ success: false, message: 'The server needs Node.js 18 or newer for this. Upload the .exe instead.' });
+  if (_winJob.state === 'running' && Date.now() - (_winJob.at || 0) < 2 * 60 * 1000) {
+    return res.status(409).json({ success: false, message: 'Already fetching from GitHub — please wait.', windowsJob: _winJob });
+  }
+  _winJob = { state: 'running', step: 'Starting…', startedAt: Date.now(), at: Date.now() };
+  _runWindowsFromGithub({ force: !!(req.body && (req.body.force === true || req.body.force === '1')), by: (req.authUser && req.authUser.username) || 'admin' });
+  res.status(202).json({ success: true, windowsJob: _winJob });
+});
+
+app.delete('/api/admin/app-release/windows', requireAdminAuth, async (req, res) => {
+  try {
+    const rel = readAppRelease();
+    await writeAppRelease(Object.assign({}, rel, {
+      windows: null,
+      windowsPrevious: rel.windows ? { version: rel.windows.version, file: rel.windows.file, uploadedAt: rel.windows.uploadedAt } : (rel.windowsPrevious || null)
+    }));
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, message: 'Server error.' }); }
 });
@@ -15048,7 +17757,7 @@ app.post('/api/admin/quiz/:courseId/:materialId/publish',
    so subsequent submissions are visible without any delay.
    ============================================================ */
 app.post('/api/admin/quiz/:courseId/:materialId/publish-now',
-  requireAdminAuth,
+  requireCourseEditor,          // ⭐ 2026-10-11 — admin, or the professor of this course
   async (req, res) => {
     try {
       /* 1. Flip the mode so any later submission is immediate too */

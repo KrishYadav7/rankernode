@@ -2,4 +2,7 @@
 <paths>
     <!-- Photos taken with the camera for AI Solver / uploads -->
     <cache-path name="camera" path="camera/" />
+    <!-- Android 7–9: files the website saves (notes PDF, exports) -->
+    <external-files-path name="downloads" path="Download/" />
+    <files-path name="downloads_internal" path="Download/" />
 </paths>

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delete your account — RankerNode</title>
+<meta name="description" content="How to delete your RankerNode account and what data is removed.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  :root { --ink:#0A1238; --muted:#454d73; --line:#dde1ee; --bg:#f5f6fa; --card:#ffffff; --accent:#4F46E5; --danger:#B42318; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body { font: 16px/1.6 "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  header { background: var(--ink); color: #fff; }
+  .bar { max-width: 760px; margin: 0 auto; padding: 16px 20px; display: flex; align-items: center; gap: 12px; }
+  .bar img { width: 36px; height: 36px; border-radius: 9px; background: #fff; }
+  .bar a { color: #fff; text-decoration: none; font-weight: 700; font-size: 18px; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; display: flex; flex-direction: column; gap: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 28px clamp(18px, 4vw, 36px); }
+  h1 { margin: 0 0 8px; font-size: clamp(28px, 5vw, 36px); line-height: 1.15; }
+  h2 { font-size: 20px; margin: 0 0 10px; }
+  p, li { color: #222a4d; }
+  ul, ol { padding-left: 1.2em; margin: 8px 0; }
+  li { margin: 4px 0; }
+  a { color: var(--accent); }
+  label { display: block; font-weight: 600; font-size: 15px; margin: 14px 0 6px; }
+  input[type=text], input[type=password] { width: 100%; font: inherit; padding: 11px 12px; border: 1.5px solid #c4c9dc; border-radius: 10px; background: #fff; color: var(--ink); }
+  input:focus { outline: 3px solid rgba(24,0,173,.25); border-color: var(--accent); }
+  .check { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; font-size: 15px; }
+  .check input { width: 20px; height: 20px; margin-top: 2px; flex-shrink: 0; }
+  button { margin-top: 20px; font: inherit; font-weight: 700; color: #fff; background: var(--danger); border: 0; border-radius: 10px; padding: 12px 22px; cursor: pointer; min-height: 46px; }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  .msg { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-weight: 600; display: none; }
+  .msg.err { display: block; background: #FDECEA; color: #8A1C12; }
+  .msg.ok { display: block; background: #E7F6EC; color: #14532D; }
+  .note { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<header><div class="bar"><img src="/favicon.svg" alt=""><a href="/">RankerNode</a></div></header>
+<main>
+<section class="card">
+<h1>Delete your RankerNode account</h1>
+<p>You can delete your RankerNode student account at any time. Deletion is immediate and cannot be undone.</p>
+<h2>What is deleted</h2>
+<ul>
+<li>your profile: name, username, email, phone number, photo and password;</li>
+<li>your learning progress, quiz and exam results, streaks and certificates;</li>
+<li>your handwritten notes and notebooks, help-desk messages, reviews and contributions;</li>
+<li>access to courses and plans you bought — they cannot be restored to a new account.</li>
+</ul>
+<h2>What is kept</h2>
+<ul>
+<li>security and access logs, deleted automatically within 12 months;</li>
+<li>daily usage counts, deleted automatically within 6 months;</li>
+<li>payment records held by Razorpay, as the law requires.</li>
+</ul>
+<p class="note">See the full <a href="/privacy">privacy policy</a>.</p>
+</section>
+
+<section class="card">
+<h2>Option 1 — inside the website or app</h2>
+<ol>
+<li>Sign in to RankerNode.</li>
+<li>Open your profile menu (top right) → <strong>Settings</strong>.</li>
+<li>Under <strong>Account</strong>, choose <strong>Delete my account</strong> and confirm with your password.</li>
+</ol>
+</section>
+
+<section class="card">
+<h2>Option 2 — right here</h2>
+<form id="delForm" novalidate>
+<label for="dUser">Username</label>
+<input id="dUser" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+<label for="dPass">Password</label>
+<input id="dPass" type="password" autocomplete="current-password" required>
+<label for="dConfirm">Type <strong>DELETE</strong> to confirm</label>
+<input id="dConfirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+<div class="check"><input id="dAgree" type="checkbox"><label for="dAgree" style="margin:0;font-weight:500">I understand my account and its data will be deleted permanently.</label></div>
+<button id="dBtn" type="submit">Delete my account permanently</button>
+<div id="dMsg" class="msg" role="status" aria-live="polite"></div>
+</form>
+<p class="note">Forgot your password? Reset it from the <a href="/app">sign-in page</a> first. Admin and professor accounts are removed by the RankerNode team on request.</p>
+</section>
+</main>
+<script>
+(function () {
+  var f = document.getElementById('delForm');
+  var btn = document.getElementById('dBtn');
+  var msg = document.getElementById('dMsg');
+  function show(t, ok) { msg.textContent = t; msg.className = 'msg ' + (ok ? 'ok' : 'err'); }
+  f.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var u = document.getElementById('dUser').value.trim();
+    var p = document.getElementById('dPass').value;
+    var c = document.getElementById('dConfirm').value.trim();
+    if (!u || !p) return show('Enter your username and password.', false);
+    if (c.toUpperCase() !== 'DELETE') return show('Type DELETE in the confirmation box.', false);
+    if (!document.getElementById('dAgree').checked) return show('Tick the box to confirm.', false);
+    btn.disabled = true; show('Deleting…', true);
+    fetch('/api/account/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'omit',
+      body: JSON.stringify({ username: u, password: p, confirm: 'DELETE' })
+    }).then(function (r) { return r.json().catch(function () { return { success: false, message: 'Server error (' + r.status + ').' }; }); })
+      .then(function (d) {
+        if (d && d.success) {
+          f.reset();
+          show(d.message || 'Your account has been deleted.', true);
+          try { sessionStorage.removeItem('aero_token'); sessionStorage.removeItem('aero_user'); } catch (_) {}
+        } else {
+          btn.disabled = false;
+          show((d && d.message) || 'Could not delete the account.', false);
+        }
+      }).catch(function () { btn.disabled = false; show('Network error — please try again.', false); });
+  });
+})();
+</script>
+</body>
+</html>

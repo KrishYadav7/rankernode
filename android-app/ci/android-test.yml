@@ -1,0 +1,85 @@
+# ============================================================
+#  RankerNode Android app — automatic phone test (emulator)
+#  Runs the real app on an Android 14 emulator on GitHub:
+#    • installs the latest released APK → opens it → checks the
+#      website loads, "Get App" is hidden, screenshots are
+#      blocked, links/back/rotation/offline screen work, no crash;
+#    • installs a debug copy → drives the page to test downloads
+#      (notes PDF → Downloads/RankerNode) and takes screenshots.
+#  Results are published as a GitHub Release "android-test-<n>".
+#  Start it by hand: Actions → "Android app (test on emulator)" → Run workflow.
+# ============================================================
+name: Android app (test on emulator)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Build a debug copy (same code, page inspectable)
+        working-directory: android-app
+        run: gradle assembleDirectDebug --no-daemon --stacktrace
+
+      - name: Download the latest released APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" --jq '[.[] | select(.tag_name | startswith("android-v"))][0].tag_name')
+          echo "Latest release: $TAG"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.apk' -O release.apk
+          cp android-app/app/build/outputs/apk/direct/debug/app-direct-debug.apk debug.apk
+          ls -l release.apk debug.apk
+          echo "REL_TAG=$TAG" >> "$GITHUB_ENV"
+          pip install --quiet websocket-client
+
+      - name: Enable KVM (fast emulator)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Test on an Android 14 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
+          script: bash android-app/ci/emulator-test.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          [ -f test-out/report.txt ] && cat test-out/report.txt || echo "no report"
+          grep -h "^RESULT" test-out/report.txt 2>/dev/null | while read -r l; do echo "::notice::$l"; done || true
+
+      - name: Publish results
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd test-out 2>/dev/null || exit 0
+          zip -q -r ../emulator-test-results.zip . || true
+          cd ..
+          gh release create "android-test-${{ github.run_number }}" -R "$GITHUB_REPOSITORY" \
+            --title "Android emulator test ${{ github.run_number }}" --notes "Automatic test of ${REL_TAG:-the latest APK}. Not an app release." \
+            --prerelease emulator-test-results.zip test-out/report.txt test-out/*.png 2>&1 || true

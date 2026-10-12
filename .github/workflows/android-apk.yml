@@ -2,7 +2,8 @@
 #  Build the RankerNode Android app (signed APK) in the cloud.
 #  Runs when android-app/ changes on main, or by hand:
 #  GitHub → Actions → "Android app (APK)" → Run workflow.
-#  The finished AltitudeAcademy-<version>.apk appears under the run's
+#  The finished RankerNode-<version>.apk (website) and
+#  RankerNode-<version>-play.aab (Google Play) appear under the run's
 #  "Artifacts" (and as a GitHub Release). Upload it in
 #  Admin → Mobile App on the website.
 #
@@ -52,7 +53,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.13'
 
       - name: Restore the signing key
         env:
@@ -68,16 +69,19 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: gradle assembleRelease --no-daemon --stacktrace
+        run: gradle assembleDirectRelease bundlePlayRelease --no-daemon --stacktrace
 
       - name: Name the APK
         id: apk
         run: |
-          OUT="AltitudeAcademy-1.0.${{ github.run_number }}.apk"
-          cp android-app/app/build/outputs/apk/release/app-release.apk "$OUT"
+          OUT="RankerNode-1.0.${{ github.run_number }}.apk"
+          AAB="RankerNode-1.0.${{ github.run_number }}-play.aab"
+          cp android-app/app/build/outputs/apk/direct/release/app-direct-release.apk "$OUT"
+          cp android-app/app/build/outputs/bundle/playRelease/app-play-release.aab "$AAB"
           echo "file=$OUT" >> "$GITHUB_OUTPUT"
-          ls -lh "$OUT"
-          sha256sum "$OUT"
+          echo "aab=$AAB" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT" "$AAB"
+          sha256sum "$OUT" "$AAB"
 
       - name: Remove the signing key from the runner
         if: always()
@@ -85,8 +89,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AltitudeAcademy-1.0.${{ github.run_number }}
-          path: ${{ steps.apk.outputs.file }}
+          name: RankerNode-1.0.${{ github.run_number }}
+          path: |
+            ${{ steps.apk.outputs.file }}
+            ${{ steps.apk.outputs.aab }}
           retention-days: 90
 
       - name: Publish as a GitHub Release
@@ -95,6 +101,11 @@ jobs:
           tag_name: android-v1.0.${{ github.run_number }}
           name: RankerNode Android 1.0.${{ github.run_number }}
           body: |
-            Signed Android app. Upload this APK in the website's Admin → Mobile App tab
-            so students get it from the "Get App" button.
-          files: ${{ steps.apk.outputs.file }}
+            Signed Android app.
+            • RankerNode-1.0.${{ github.run_number }}.apk — upload in the website's Admin → Apps tab
+              so students get it from the "Get App" button.
+            • RankerNode-1.0.${{ github.run_number }}-play.aab — upload in Google Play Console
+              (Testing / Production → Create release).
+          files: |
+            ${{ steps.apk.outputs.file }}
+            ${{ steps.apk.outputs.aab }}

@@ -1,3 +1,6 @@
+/* Google Play build of the Android app → no in-app buying (see aeroPlayBlocksPurchase) */
+const AERO_PLAY_STORE = /RankerNodeApp\/\S+ Store\/Play/.test((typeof navigator !== 'undefined' && navigator.userAgent) || '');
+if (AERO_PLAY_STORE) { try { document.documentElement.classList.add('aero-play-store'); } catch (_) {} }
 /* ============================================================
    API CONFIGURATION
    ============================================================ */
@@ -246,7 +249,7 @@ ${isPrint ? `
 @media print{html,body{background:none}.toolbar{display:none!important}.stage{padding:0;display:block;min-height:0}.cert{transform:none!important;box-shadow:none;border-radius:0;margin:0}}
 ` : ''}
 </style></head><body>
-${isPrint ? `<div class="toolbar"><button class="btn-print" onclick="window.print()">🖨️ Print / Save as PDF</button><button class="btn-close" onclick="window.close()">Close</button></div>` : ''}
+${isPrint ? `<div class="toolbar"><button class="btn-print" onclick="if(window.RankerNodePrint){RankerNodePrint.print()}else{window.print()}">🖨️ Print / Save as PDF</button><button class="btn-close" onclick="window.close()">Close</button></div>` : ''}
 <div class="stage"><div class="cert ${t.borderStyle}" id="cert">
   ${t.borderStyle === 'modern' ? '<div class="band"></div>' : ''}
   ${watermark}${corners}${seal}
@@ -862,7 +865,13 @@ function checkCertificateEligibility(course) {
   const warm = () => {
     if (warmed) return;
     warmed = true;
-    try { window.loadPDFJS().catch(() => {}); } catch (e) {}
+    try {
+      window.loadPDFJS().then(() => {
+        /* ⚡ Also start the PDF.js worker, so the first PDF opens without
+           waiting for it to boot. */
+        try { if (window.PDFViewer && window.PDFViewer.prewarmWorker) window.PDFViewer.prewarmWorker(); } catch (_) {}
+      }).catch(() => {});
+    } catch (e) {}
   };
 
   // Desktop: hover anywhere on a material card
@@ -1012,6 +1021,24 @@ function checkCertificateEligibility(course) {
     try { _analyticsCacheAt = 0; } catch (e) {}
     try { invalidateCommunityCache(); } catch (e) {}
 
+    /* ⭐ Course order (Admin → Courses) or the material order inside a
+       course (course editor → Materials) changed. Only the course list is
+       refetched — quietly, no toast. The admin's own change is already on
+       screen, so its echo is ignored. */
+    if (scope === 'courses:order' || scope === 'courses:material-order') {
+      if (Date.now() - (window.__aeroCourseOrderSelfAt || 0) < 6000) return;
+      if (isBusy()) { window.__aeroSyncPending = { scope, detail }; return; }
+      try { if (typeof fetchCoursesFromDB === 'function') fetchCoursesFromDB(true).catch(() => {}); } catch (e) {}
+      return;
+    }
+
+    /* ⭐ Professor applications / requests / decisions: only the admin's
+       Professor Access tab and the professor's own dashboard care. */
+    if (scope === 'professors:changed') {
+      try { aeroOnProfessorsChanged(); } catch (e) {}
+      return;
+    }
+
     /* If the user is mid-flow, queue and bail */
     if (isBusy()) {
       window.__aeroSyncPending = { scope, detail };
@@ -1029,7 +1056,7 @@ function checkCertificateEligibility(course) {
       if (currentUser && isAdmin(currentUser)) {
         if (adminTab === 'overview' &&
             typeof renderAdminOverview === 'function') {
-          Promise.resolve(renderAdminOverview()).catch(() => {});
+          Promise.resolve(renderAdminOverview({ force: true })).catch(() => {});
         }
         if (adminTab === 'students' &&
             typeof renderAdminStudents === 'function') {
@@ -1825,6 +1852,20 @@ function renderCoursesLoadingSkeleton(message) {
 function getCourses() { return liveCourses; }
 function findCourse(id) { return getCourses().find(c => c.id === id) || null; }
 
+/* ⭐ COURSE DISPLAY ORDER (2026-10-05) — one rule for the admin list and
+   the student catalog, matching GET /api/courses:
+     1. courses the admin has not placed yet (no sortOrder) come first,
+        featured before others, then A–Z — exactly the old catalog order,
+        so nothing moves until the admin arranges the courses;
+     2. then the admin's order (Admin → Courses → drag ⋮⋮ or ↑ ↓). */
+function courseDisplayCompare(a, b) {
+  const ao = Number.isFinite(a && a.sortOrder), bo = Number.isFinite(b && b.sortOrder);
+  if (ao !== bo) return ao ? 1 : -1;
+  if (ao && a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  if (!!a.featured !== !!b.featured) return a.featured ? -1 : 1;
+  return String(a.name || '').localeCompare(String(b.name || ''));
+}
+
 /* Client-side course catalog cache.
    - Students: cached for 60s → instant navigation between pages.
    - Admins:   always fresh → no risk of stale admin dashboard.
@@ -1859,7 +1900,8 @@ async function fetchCoursesFromDB(force = false, page = 1) {
      savePlaylistFromModal, autoGeneratePlaylist, renamePlaylist,
      deletePlaylist, addSelectedVideoToPlaylist, …) without editing
      any of them.                                                */
-  const effectiveForce = force === true || isAdmin;
+  const isProfUser = !!(currentUser && String(currentUser.role || '').toLowerCase() === 'professor');
+  const effectiveForce = force === true || isAdmin || isProfUser;
 
   // Fast path: fresh cache + first page + non-admin
   if (!effectiveForce && page === 1 && liveCourses.length > 0
@@ -1895,7 +1937,9 @@ async function fetchCoursesFromDB(force = false, page = 1) {
     // ⚡ NO _t= cache-buster on normal fetches → browser HTTP cache
     //    + server in-memory cache both work. Force-refresh (admin
     //    button, after mutations) still bypasses everything.
-    const baseUrl = `${API_BASE}/courses?limit=${PER_PAGE}&page=${page}`;
+    /* ⭐ a professor only ever loads the courses approved for them */
+    const baseUrl = isProfUser ? `${API_BASE}/professor/courses?page=${page}`
+                               : `${API_BASE}/courses?limit=${PER_PAGE}&page=${page}`;
     const url     = effectiveForce ? `${baseUrl}&_t=${Date.now()}` : baseUrl;
     const opts    = effectiveForce ? { cache: 'no-store' } : {};
 
@@ -1977,6 +2021,10 @@ async function fetchSingleCourse(courseId) {
         playlists: c.playlists || []
       };
       const idx = liveCourses.findIndex(x => x.id === normalized.id);
+      /* keep the list position if this server copy predates sortOrder */
+      if (idx >= 0 && normalized.sortOrder === undefined && liveCourses[idx].sortOrder !== undefined) {
+        normalized.sortOrder = liveCourses[idx].sortOrder;
+      }
       if (idx >= 0) liveCourses[idx] = normalized;
       else liveCourses.push(normalized);
       return normalized;
@@ -1995,6 +2043,7 @@ let currentUser = null;
 let currentCourseId = null;
 let currentMaterialFilter = 'all';
 let loginRole = 'student';
+let professorNav = 'courses';         // ⭐ professor dashboard: 'courses' | 'requests'
 let studentNav = 'home';
 let adminTab = 'overview';
 let editingCourseId = null;
@@ -2464,6 +2513,13 @@ let liveOwnerProfile = {
 let _ownerProfileLoaded = false;
 
 let _ownerProfileCacheAt = 0;
+/* ⚡ the founder card the ADMIN saved last time is kept on this device, so
+   Home paints it instantly; it is refreshed from the server right after.
+   (Never a built-in text — only what came from the server.) */
+try {
+  const _oc = JSON.parse(localStorage.getItem('aero_owner_v2') || 'null');
+  if (_oc && typeof _oc === 'object' && typeof _oc.name === 'string') { liveOwnerProfile = _oc; _ownerProfileLoaded = true; }
+} catch (_) {}
 const OWNER_PROFILE_CACHE_MS = 30 * 1000;   // 30s — short enough for live hide/show
 
 async function fetchOwnerProfile(force = false) {
@@ -2483,6 +2539,7 @@ async function fetchOwnerProfile(force = false) {
     if (data.success && data.owner) {
       liveOwnerProfile = data.owner;
       _ownerProfileCacheAt = Date.now();
+      try { localStorage.setItem('aero_owner_v2', JSON.stringify(data.owner)); } catch (_) {}
     }
   } catch (e) { /* silent */ }
 
@@ -2660,7 +2717,13 @@ function hydrateMaterialThumbs() {
     if (el.classList.contains('has-thumb')) return;
     const cached = getPDFThumbnail(mid);
     if (cached) {
-      el.innerHTML = `<img src="${cached}" alt="" loading="lazy" decoding="async">`;
+      /* Swap only the placeholder cover — keep the lock badge and the
+         hover "Open" hint that sit on top of the thumbnail. */
+      const cover = el.querySelector('.material-thumb-cover');
+      const img = `<img src="${cached}" alt="" loading="lazy" decoding="async">`;
+      if (cover) cover.outerHTML = img;
+      else el.insertAdjacentHTML('afterbegin', img);
+      el.style.background = '';
       el.classList.add('has-thumb');
     }
   });
@@ -2745,6 +2808,12 @@ function getMaterialAccessInfo(course, mat) {
       subscribed: false,
       isFreeContent: true
     };
+  }
+
+  /* ⭐ A professor has full access to the courses approved for them */
+  if (typeof profCanEdit === 'function' && profCanEdit(course.id)) {
+    return { hasFullAccess: true, canPreview: false, previewPercent: 0, isCoursePremium, isMatPremium,
+             ownsCourse: false, ownsMaterial: false, subscribed: false, isFreeContent: false };
   }
 
   /* Guests — course-level premium still requires login,
@@ -2952,6 +3021,8 @@ function syncHashToState() {
   addingCourse = false; addingProfessor = false; addingMaterialCourseId = null; addingStudent = false;
   if (parts[0] === 'admin') {
     adminTab = parts[1] || 'overview';
+  } else if (parts[0] === 'professor') {
+    professorNav = ['requests', 'profile', 'grading'].includes(parts[1]) ? parts[1] : 'courses';
   } else if (parts[0] === 'courses') {
     studentNav = 'courses';
     /* #/courses/<category> — deep link from the landing page cards */
@@ -2960,8 +3031,12 @@ function syncHashToState() {
     studentNav = 'saved';
   } else if (parts[0] === 'analytics') {
     studentNav = 'analytics';
+  } else if (parts[0] === 'practice') {
+    studentNav = 'practice';         // #/practice or #/practice/<tab>
   } else if (parts[0] === 'ai') {
     studentNav = 'ai';
+  } else if (parts[0] === 'notes') {
+    studentNav = 'notes';            // #/notes or #/notes/<notebookId> (id is read at render time)
   } else {
     studentNav = 'home';
   }
@@ -3056,7 +3131,7 @@ async function copyToClipboard(text) {
    CSS variable block. Nothing else in the codebase changes.
    ============================================================ */
 const THEME_CONFIG = {
-  order: ['light', 'dim', 'dark'],
+  order: ['light', 'aurora', 'dim', 'dark', 'space'],
   themes: {
     light: {
       id: 'light', family: 'light', label: 'Light', icon: 'fa-sun',
@@ -3072,17 +3147,57 @@ const THEME_CONFIG = {
       id: 'dark', family: 'dark', label: 'Night', icon: 'fa-moon',
       palette: 'dark grey surfaces with off-white text', next: 'light',
       ariaLabel: 'Night mode — click for Light'
+    },
+    /* ⭐ 2026-10-08 — "Space": rendered as data-theme="dark" (so every
+       dark-mode rule keeps working) + data-skin="space" on <html>, which
+       swaps in the deep-space palette, nebula glow and starfield. */
+    space: {
+      id: 'space', family: 'dark', label: 'Space', icon: 'fa-user-astronaut',
+      palette: 'deep-space navy, nebula glow and twinkling stars', next: 'light',
+      ariaLabel: 'Space mode — click for Light'
+    },
+    /* ⭐ 2026-10-10 — "Aurora": data-theme="light" (every light rule keeps
+       working) + data-skin="aurora" — a pearl page lit by drifting
+       northern lights, twilight header and hero skies. */
+    aurora: {
+      id: 'aurora', family: 'light', label: 'Aurora', icon: 'fa-wand-magic-sparkles',
+      palette: 'pearl daylight with drifting northern-lights colour', next: 'dark',
+      ariaLabel: 'Aurora mode — click for Night'
     }
   }
 };
+const SPACE_SKIN = 'space';
+const AURORA_SKIN = 'aurora';
 const THEME_CYCLE = THEME_CONFIG.order;
 
 function getThemeMeta(theme) {
   return THEME_CONFIG.themes[theme] || THEME_CONFIG.themes.light;
 }
 function getCurrentTheme() {
-  const t = document.documentElement.getAttribute('data-theme') || 'light';
+  const root = document.documentElement;
+  if (root.getAttribute('data-skin') === SPACE_SKIN) return 'space';
+  if (root.getAttribute('data-skin') === AURORA_SKIN) return 'aurora';
+  const t = root.getAttribute('data-theme') || 'light';
   return THEME_CONFIG.themes[t] ? t : 'light';
+}
+/* Writes the theme onto <html>. Space = dark base + space skin. */
+function _setThemeAttrs(id) {
+  const root = document.documentElement;
+  if (id === 'space') {
+    root.setAttribute('data-theme', 'dark');
+    root.setAttribute('data-skin', SPACE_SKIN);
+  } else if (id === 'aurora') {
+    root.setAttribute('data-theme', 'light');
+    root.setAttribute('data-skin', AURORA_SKIN);
+  } else {
+    root.setAttribute('data-theme', id);
+    root.removeAttribute('data-skin');
+  }
+  /* browser / Android status-bar colour follows the theme */
+  try {
+    const m = document.querySelector('meta[name="theme-color"]');
+    if (m) m.setAttribute('content', id === 'space' ? '#050816' : id === 'aurora' ? '#070b24' : id === 'light' ? '#0b1226' : id === 'dim' ? '#14142b' : '#0c0e12');
+  } catch (_) {}
 }
 function isNightMode() {
   return getThemeMeta(getCurrentTheme()).family === 'dark';
@@ -3122,7 +3237,7 @@ function applyTheme(theme) {
   const id = THEME_CONFIG.themes[theme] ? theme : 'light';
 
   _withThemeTransition(() => {
-    document.documentElement.setAttribute('data-theme', id);
+    _setThemeAttrs(id);
   });
 
   try { localStorage.setItem('aero_theme', id); } catch (e) {}
@@ -3130,6 +3245,8 @@ function applyTheme(theme) {
      single header switch always returns them to it. */
   if (getThemeMeta(id).family === 'dark') {
     try { localStorage.setItem(PREFERRED_DARK_KEY, id); } catch (e) {}
+  } else {
+    try { localStorage.setItem(PREFERRED_LIGHT_KEY, id); } catch (e) {}
   }
   updateThemeIcon();
   renderSettingsThemeUI();
@@ -3141,7 +3258,14 @@ const PREFERRED_DARK_KEY = 'aero_theme_dark';
 function getPreferredDarkTheme() {
   let t = null;
   try { t = localStorage.getItem(PREFERRED_DARK_KEY); } catch (e) {}
-  return (t === 'dim' || t === 'dark') ? t : 'dark';
+  return (t === 'dim' || t === 'dark' || t === 'space') ? t : 'dark';
+}
+/* …and which light style (Light / Aurora) it returns to */
+const PREFERRED_LIGHT_KEY = 'aero_theme_light';
+function getPreferredLightTheme() {
+  let t = null;
+  try { t = localStorage.getItem(PREFERRED_LIGHT_KEY); } catch (e) {}
+  return t === 'aurora' ? 'aurora' : 'light';
 }
 
 /* Kept for backward compatibility with any old onclick="cycleTheme()" */
@@ -3188,20 +3312,79 @@ function renderSettingsThemeUI() {
   const hint = document.getElementById('nightModeHint');
   if (hint) {
     hint.textContent = night
-      ? `${meta.label} theme active — ${meta.palette}. The top-bar switch flips back to Light.`
-      : 'The sun/moon switch in the top bar flips Light ↔ dark. Pick which dark style it uses here.';
+      ? `${meta.label} theme active — ${meta.palette}. The top-bar switch flips back to ${getThemeMeta(getPreferredLightTheme()).label}.`
+      : (theme === 'aurora'
+        ? 'Aurora theme active — pearl daylight with drifting northern-lights colour. The top-bar switch flips to your dark style.'
+        : 'The sun/moon switch in the top bar flips light ↔ dark and remembers the styles you pick here — try the new Aurora theme.');
   }
 }
 
 function openSettingsModal() {
   renderSettingsThemeUI();
   renderExpandBiosUI();
+  /* Account section: privacy policy for everyone signed in; self-delete for students */
+  const acct = document.getElementById('settingsAccountSection');
+  if (acct) acct.hidden = !currentUser;
+  const delRow = document.getElementById('settingsDeleteRow');
+  if (delRow) delRow.hidden = !(currentUser && String(currentUser.role || 'student') === 'student');
   openModal('settingsModal');
+}
+
+/* ⭐ 2026-10-12 — students delete their own account (Google Play requirement).
+   Server: POST /api/account/delete { password, confirm: "DELETE" } */
+function openDeleteAccountDialog() {
+  closeModal('settingsModal');
+  const old = document.getElementById('deleteAccountModal'); if (old) old.remove();
+  const m = document.createElement('div');
+  m.className = 'modal-overlay active';
+  m.id = 'deleteAccountModal';
+  m.innerHTML = `
+    <div class="modal-box" style="max-width:460px;" role="dialog" aria-modal="true" aria-labelledby="delAccTitle">
+      <h3 id="delAccTitle"><i class="fas fa-triangle-exclamation" style="color:var(--rose-600)"></i> Delete your account?</h3>
+      <p class="modal-sub">This permanently deletes your account, progress, quiz results, notes and access to anything you bought. It cannot be undone.</p>
+      <div class="form-group">
+        <label for="delAccPw">Your password</label>
+        <input type="password" id="delAccPw" autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label for="delAccConfirm">Type <strong>DELETE</strong> to confirm</label>
+        <input type="text" id="delAccConfirm" autocomplete="off" autocapitalize="characters" spellcheck="false">
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-outline" onclick="document.getElementById('deleteAccountModal').remove()">Cancel</button>
+        <button type="button" class="btn btn-danger" id="delAccBtn" onclick="confirmDeleteAccount()"><i class="fas fa-trash-alt"></i> Delete permanently</button>
+      </div>
+    </div>`;
+  document.body.appendChild(m);
+  m.addEventListener('click', (e) => { if (e.target === m) m.remove(); });
+  setTimeout(() => { const i = document.getElementById('delAccPw'); if (i) i.focus(); }, 50);
+}
+
+async function confirmDeleteAccount() {
+  const pw = (document.getElementById('delAccPw') || {}).value || '';
+  const conf = ((document.getElementById('delAccConfirm') || {}).value || '').trim();
+  if (!pw) return showToast('Enter your password.', 'error');
+  if (conf.toUpperCase() !== 'DELETE') return showToast('Type DELETE to confirm.', 'error');
+  const btn = document.getElementById('delAccBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetchJSON(`${API_BASE}/account/delete`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw, confirm: 'DELETE' })
+    });
+    if (!res || !res.success) throw new Error((res && res.message) || 'Could not delete the account.');
+    const m = document.getElementById('deleteAccountModal'); if (m) m.remove();
+    showToast('Your account has been deleted.', 'success');
+    setTimeout(() => { try { logout(); } catch (_) { location.href = '/'; } }, 900);
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    showToast(e.message, 'error');
+  }
 }
 
 /* Header switch: OFF → Light, ON → the user's preferred dark style. */
 function toggleNightMode() {
-  applyTheme(isNightMode() ? 'light' : getPreferredDarkTheme());
+  applyTheme(isNightMode() ? getPreferredLightTheme() : getPreferredDarkTheme());
 }
 
 /* Sub-option of Night mode */
@@ -3322,7 +3505,7 @@ function initBioToggles() {
   const fallback = prefers ? 'dark' : 'light';
   const initial = valid.includes(saved) ? saved : fallback;
   /* Set before first paint — no transition, no flash. */
-  document.documentElement.setAttribute('data-theme', initial);
+  _setThemeAttrs(initial);
 })();
 
 /* ============================================================
@@ -3568,11 +3751,102 @@ document.addEventListener('click', (e) => {
 /* ============================================================
    AUTH
    ============================================================ */
-function setLoginRole(role) {
-  loginRole = role;
-  document.querySelectorAll('.login-role-toggle button').forEach(b =>
-    b.classList.toggle('active', b.dataset.role === role));
+/* ⭐ 2026-10-08 — role-aware login copy. Professors and admins finish
+   signing in with a 6-digit email code (server enforces it). */
+const LOGIN_ROLE_COPY = {
+  student: {
+    h: 'Welcome back', sub: 'Sign in to continue to your courses.',
+    btn: '<i class="fas fa-sign-in-alt"></i> Sign In', otp: ''
+  },
+  professor: {
+    h: 'Professor sign-in', sub: 'Add and update content for the courses you teach.',
+    btn: '<i class="fas fa-arrow-right"></i> Continue',
+    otp: 'After your password we email a 6-digit code to your registered address — enter it to finish signing in.'
+  },
+  admin: {
+    h: 'Admin sign-in', sub: 'Manage courses, students, professors and settings.',
+    btn: '<i class="fas fa-arrow-right"></i> Continue',
+    otp: 'After your password we email a 6-digit code to the admin address. An admin account can stay signed in on up to 3 devices.'
+  }
+};
+function _loginSubmitLabel() {
+  return (LOGIN_ROLE_COPY[loginRole] || LOGIN_ROLE_COPY.student).btn;
 }
+function _loginClearTabError() {
+  const el = document.getElementById('loginTabError');
+  if (el) el.hidden = true;
+  document.querySelectorAll('.login-role-toggle button').forEach(b => b.classList.remove('lg-hint'));
+}
+function _loginShowTabError(accountRole, message) {
+  const names = { student: 'Student', professor: 'Professor', admin: 'Admin' };
+  const role = names[accountRole] ? accountRole : 'student';
+  let el = document.getElementById('loginTabError');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'loginTabError';
+    el.className = 'lg-tab-error';
+    el.setAttribute('role', 'alert');
+    const form = document.getElementById('loginForm');
+    if (form) form.parentNode.insertBefore(el, form);
+  }
+  el.innerHTML = `<i class="fas fa-circle-exclamation"></i>
+    <div><strong>Wrong tab for this account</strong>
+    <span>${escapeHtml(message || ('These details belong to a ' + names[role] + ' account.'))}</span>
+    <button type="button" class="lg-tab-error-btn" onclick="setLoginRole('${role}');document.getElementById('loginPassword')?.focus();">
+      <i class="fas fa-arrow-right-arrow-left"></i> Switch to ${names[role]} tab</button></div>`;
+  el.hidden = false;
+  const tg = document.querySelector('.login-role-toggle');
+  if (tg) { tg.classList.remove('aero-shake'); void tg.offsetWidth; tg.classList.add('aero-shake'); }
+  const target = document.querySelector(`.login-role-toggle button[data-role="${role}"]`);
+  if (target) target.classList.add('lg-hint');
+}
+function setLoginRole(role) {
+  if (!LOGIN_ROLE_COPY[role]) role = 'student';
+  loginRole = role;
+  _loginClearTabError();
+  document.querySelectorAll('.login-role-toggle button').forEach(b => {
+    const on = b.dataset.role === role;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  const tg = document.querySelector('.login-role-toggle');
+  if (tg) tg.style.setProperty('--lg-i', String(['student', 'professor', 'admin'].indexOf(role)));
+  const c = LOGIN_ROLE_COPY[role];
+  const h = document.getElementById('loginHeading'); if (h) h.textContent = c.h;
+  const sub = document.getElementById('loginSub'); if (sub) sub.textContent = c.sub;
+  const note = document.getElementById('loginOtpNote');
+  const noteText = document.getElementById('loginOtpNoteText');
+  if (note) note.hidden = !c.otp;
+  if (noteText && c.otp) noteText.textContent = c.otp;
+  const shell = document.querySelector('#loginView .lg-shell');
+  if (shell) shell.setAttribute('data-role', role);
+  const btn = document.querySelector('#loginForm button[type="submit"]');
+  if (btn && !btn.disabled) btn.innerHTML = c.btn;
+}
+function toggleLoginPasswordVisibility() {
+  const inp = document.getElementById('loginPassword');
+  const btn = document.getElementById('loginEyeBtn');
+  if (!inp) return;
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  if (btn) {
+    btn.innerHTML = show ? '<i class="fas fa-eye-slash"></i>' : '<i class="fas fa-eye"></i>';
+    btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    btn.title = show ? 'Hide password' : 'Show password';
+  }
+  try { inp.focus({ preventScroll: true }); } catch (_) {}
+}
+(function wireLoginPasswordExtras() {
+  const inp = document.getElementById('loginPassword');
+  const hint = document.getElementById('loginCapsHint');
+  if (!inp || !hint) return;
+  const check = (e) => {
+    try { hint.hidden = !(e.getModifierState && e.getModifierState('CapsLock')); } catch (_) {}
+  };
+  inp.addEventListener('keydown', check);
+  inp.addEventListener('keyup', check);
+  inp.addEventListener('blur', () => { hint.hidden = true; });
+})();
 async function handleLogin(e) {
   e.preventDefault();
 
@@ -3641,11 +3915,12 @@ async function handleLogin(e) {
       // ─── 2FA path ───
       if (data.requires2FA && data.pendingToken) {
         _adminPendingToken = data.pendingToken;
+        const otpRole = data.otpRole === 'professor' ? 'professor' : 'admin';
         openOtpModal({
-          title: 'Admin 2FA Verification',
-          subtitle: `We've sent a 6-digit code to ${data.maskedEmail || 'your registered email'}. Enter it to finish logging in.`,
+          title: otpRole === 'professor' ? 'Professor verification' : 'Admin verification',
+          subtitle: `We've sent a 6-digit code to ${data.maskedEmail || 'your registered email'}. Enter it to finish signing in.`,
           type: 'admin-login',
-          data: { pendingToken: data.pendingToken }
+          data: { pendingToken: data.pendingToken, role: otpRole }
         });
         showToast('OTP sent — check your inbox (and spam).', 'info');
         resetBtn();
@@ -3670,14 +3945,18 @@ async function handleLogin(e) {
 
         const serverRole = String(data.user.role || '').trim().toLowerCase();
 
-        if (loginRole === 'admin' && serverRole !== 'admin') {
+        if (loginRole !== serverRole && (loginRole === 'admin' || loginRole === 'professor')) {
           showToast(
-            'This account is a student account. Logging you in as a student.',
+            `This is a ${serverRole} account — signing you in as a ${serverRole}.`,
             'info'
           );
         }
 
-        if (serverRole === 'admin') {
+        if (serverRole === 'professor') {
+          professorNav = 'courses';
+          try { history.replaceState(null, '', '#/professor'); }
+          catch (e) { location.hash = '#/professor'; }
+        } else if (serverRole === 'admin') {
           adminTab = 'overview';
           studentNav = 'home';
           try { history.replaceState(null, '', '#/admin/overview'); }
@@ -3724,6 +4003,22 @@ async function handleLogin(e) {
 
       // ─── Real server reply, definitive failure (bad credentials, etc.) ───
       // Do NOT retry — this is intentional.
+      if (data.code === 'WRONG_LOGIN_TAB') {
+        /* ⭐ strict tabs: the account belongs to another tab — say which, don't switch */
+        _loginShowTabError(data.accountRole, data.message);
+        resetBtn();
+        return;
+      }
+      if (data.professorStatus) {
+        /* ⭐ professor account not (or no longer) approved — explain clearly */
+        const st = data.professorStatus;
+        aeroInfoDialog(
+          st === 'pending' ? 'Waiting for admin approval' : st === 'rejected' ? 'Application not approved' : 'Professor access withdrawn',
+          escapeHtml(data.message || ''),
+          st === 'pending' ? 'fa-hourglass-half' : 'fa-circle-exclamation');
+        resetBtn();
+        return;
+      }
       showToast(data.message || 'Login failed. Please try again.', 'error');
       resetBtn();
 
@@ -3770,11 +4065,14 @@ function logout() {
 
   stopSessionHeartbeat();
   _sessionKilled = false;
+  /* ⚡ pages kept on this device for instant re-opening belong to this student */
+  try { if (window.AeroPdfCache) window.AeroPdfCache.clearAll(); } catch (e) {}
 
   _courseCacheAt = 0;
   liveCourses = [];
 
   currentUser = null; currentCourseId = null; editingCourseId = null;
+  try { _aeroSetGuest(false); } catch (e) {}
   window.currentSelectedCourseId = null;
   currentMaterialFilter = 'all'; studentNav = 'home'; adminTab = 'overview';
   clearSession();
@@ -3853,18 +4151,101 @@ function openOtpModal({ title, subtitle, type, data }) {
   const btn     = $('otpModalSubmitBtn');
   const resendRow = document.getElementById('otpResendRow');
 
-  if (titleEl) titleEl.innerHTML = `<i class="fas fa-shield-halved"></i> ${escapeHtml(title)}`;
+  if (titleEl) titleEl.textContent = title;
   if (subEl)   subEl.textContent = subtitle || 'Enter the code we sent you.';
   if (input)   input.value = '';
   if (btn) {
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-check"></i> Verify';
   }
-  // Resend link is only useful for admin-login
-  if (resendRow) resendRow.style.display = (type === 'admin-login') ? 'block' : 'none';
+  // Resend link is only useful for the staff sign-in step
+  if (resendRow) resendRow.style.display = (type === 'admin-login') ? 'flex' : 'none';
+  _otpLastAutoSubmit = '';
+  otpSyncBoxesFromInput();
+  _otpStartTimers(type === 'admin-login');
 
   openModal('otpVerificationModal');
   setTimeout(() => input && input.focus(), 120);
+}
+
+/* ---- ⭐ 6-box OTP display + countdowns (2026-10-08) ----
+   One real <input> (autofill / paste friendly) sits invisibly over
+   six boxes; the boxes only mirror its value. */
+let _otpLastAutoSubmit = '';
+let _otpExpiryTimer = null, _otpResendTimer = null;
+function otpSyncBoxesFromInput() {
+  const input = document.getElementById('otpModalInput');
+  const cells = document.querySelectorAll('#otpCells span');
+  if (!input || !cells.length) return;
+  const v = (input.value || '').replace(/\D/g, '').slice(0, 6);
+  const focused = document.activeElement === input;
+  cells.forEach((c, i) => {
+    c.textContent = v[i] || '';
+    c.classList.toggle('filled', !!v[i]);
+    c.classList.toggle('active', focused && i === Math.min(v.length, 5));
+  });
+  /* auto-verify once all six digits are in (only once per code) */
+  if (v.length === 6 && v !== _otpLastAutoSubmit && _otpContext) {
+    const btn = document.getElementById('otpModalSubmitBtn');
+    if (btn && !btn.disabled) { _otpLastAutoSubmit = v; setTimeout(() => submitOtpVerification(), 60); }
+  }
+}
+(function wireOtpBoxes() {
+  const input = document.getElementById('otpModalInput');
+  if (!input) return;
+  ['focus', 'blur', 'keyup', 'click', 'select'].forEach(ev => input.addEventListener(ev, () => {
+    const v = input.value.length;
+    try { input.setSelectionRange(v, v); } catch (_) {}
+    otpSyncBoxesFromInput();
+  }));
+})();
+function _otpStopTimers() {
+  if (_otpExpiryTimer) { clearInterval(_otpExpiryTimer); _otpExpiryTimer = null; }
+  if (_otpResendTimer) { clearInterval(_otpResendTimer); _otpResendTimer = null; }
+}
+function _otpStartResendCooldown(seconds) {
+  if (_otpResendTimer) { clearInterval(_otpResendTimer); _otpResendTimer = null; }
+  const btn = document.getElementById('otpResendBtn');
+  const wait = document.getElementById('otpResendWait');
+  let left = Math.max(0, seconds | 0);
+  const tick = () => {
+    if (left > 0) {
+      if (btn) btn.style.display = 'none';
+      if (wait) { wait.style.display = ''; wait.textContent = `Didn't get it? Resend in ${left}s`; }
+      left--;
+    } else {
+      if (btn) btn.style.display = '';
+      if (wait) { wait.style.display = ''; wait.textContent = "Didn't get it?"; }
+      clearInterval(_otpResendTimer); _otpResendTimer = null;
+    }
+  };
+  tick();
+  _otpResendTimer = setInterval(tick, 1000);
+}
+function _otpStartTimers(withCountdown) {
+  _otpStopTimers();
+  const el = document.getElementById('otpExpiryText');
+  if (!withCountdown) {
+    if (el) { el.classList.remove('expired'); el.innerHTML = '<i class="fas fa-clock"></i> Code expires in 10 minutes. Check spam if you can\'t find it.'; }
+    return;
+  }
+  const until = Date.now() + 10 * 60 * 1000;
+  const tick = () => {
+    const ms = until - Date.now();
+    if (!el) return;
+    if (ms <= 0) {
+      el.classList.add('expired');
+      el.innerHTML = '<i class="fas fa-circle-exclamation"></i> This code has expired — tap Resend OTP.';
+      clearInterval(_otpExpiryTimer); _otpExpiryTimer = null;
+      return;
+    }
+    const m = Math.floor(ms / 60000), sec = Math.floor((ms % 60000) / 1000);
+    el.classList.remove('expired');
+    el.innerHTML = `<i class="fas fa-clock"></i> Code expires in ${m}:${String(sec).padStart(2, '0')} · check spam too`;
+  };
+  tick();
+  _otpExpiryTimer = setInterval(tick, 1000);
+  _otpStartResendCooldown(30);
 }
 
 /* ---- Resend the OTP for the current context ---- */
@@ -3884,9 +4265,14 @@ async function resendOtpForCurrentContext() {
       if (res.success) {
         // IMPORTANT: Update the pendingToken with the new one returned by the server
         _otpContext.data.pendingToken = res.pendingToken;
+        _adminPendingToken = res.pendingToken;
         showToast('✓ New OTP sent.', 'success');
+        const inp = document.getElementById('otpModalInput');
+        if (inp) { inp.value = ''; _otpLastAutoSubmit = ''; otpSyncBoxesFromInput(); inp.focus(); }
+        _otpStartTimers(true);
       } else {
         showToast(res.message || 'Could not resend.', 'error');
+        if (res.retryAfter) setTimeout(() => _otpStartResendCooldown(res.retryAfter), 0);
       }
     } else {
       showToast('Resend is not available for this step.', 'info');
@@ -3900,6 +4286,7 @@ async function resendOtpForCurrentContext() {
 
 function cancelOtpVerification() {
   _otpContext = null;
+  _otpStopTimers();
   closeModal('otpVerificationModal');
 }
 
@@ -3922,6 +4309,8 @@ async function submitOtpVerification() {
   try {
     if (_otpContext.type === 'register') {
       await _handleRegisterOtp(otp);
+    } else if (_otpContext.type === 'professor-register') {
+      await _handleProfessorRegisterOtp(otp);
     } else if (_otpContext.type === 'forgot-username') {
       await _handleForgotUsernameOtp(otp);
     } else if (_otpContext.type === 'forgot-password') {
@@ -3937,7 +4326,9 @@ async function submitOtpVerification() {
       btn.disabled = false;
       btn.innerHTML = '<i class="fas fa-check"></i> Verify';
     }
-    if (input) { input.value = ''; input.focus(); }
+    if (input) { input.value = ''; _otpLastAutoSubmit = ''; otpSyncBoxesFromInput(); input.focus(); }
+    const cellsBox = document.getElementById('otpCells');
+    if (cellsBox) { cellsBox.classList.remove('aero-shake'); void cellsBox.offsetWidth; cellsBox.classList.add('aero-shake'); }
   }
 }
 
@@ -3950,9 +4341,20 @@ async function _handleRegisterOtp(otp) {
   const data = await res.json();
   if (!data.success) throw new Error(data.message || 'Registration failed.');
 
+  /* ⭐ Registered from the guest catalog → sign in right away and
+     continue to the lesson they clicked (no trip to the login page). */
+  const creds = { username: _otpContext.data && _otpContext.data.username, password: _otpContext.data && _otpContext.data.password };
+  const fromGuest = isGuestBrowsing();
+
   _otpContext = null;
   tempRegisterData = null;
   closeModal('otpVerificationModal');
+  if (fromGuest && creds.username && creds.password) {
+    showToast('🎉 Account created! Signing you in…', 'success');
+    const ok = await aeroGuestSignIn(creds.username, creds.password);
+    if (!ok) showToast('Your account is ready — please sign in to continue.', 'info');
+    return;
+  }
   showToast('🎉 Registration successful! You can now log in.', 'success');
 }
 
@@ -3970,16 +4372,40 @@ async function _handleAdminLoginOtp(otp) {
 
   if (!data.success) throw new Error(data.message || 'Invalid OTP.');
 
-  // ─── HARD-ENFORCE ADMIN ROLE ────────────────────────────────
-  // The user only reached this code path AFTER the server issued an admin
-  // 2FA challenge. Even if the server ever returned the wrong role, we
-  // force it here so the UI can never land on the student dashboard.
+  /* ⭐ 2026-10-08: this step now serves admins AND professors. Trust the
+     role the server signed into the token; never fall back to student. */
+  const _otpRole = String((data.user && data.user.role) || (_otpContext.data && _otpContext.data.role) || 'admin').trim().toLowerCase();
+  if (_otpRole === 'professor') {
+    currentUser = data.user;
+    saveSession(data.user, data.token);
+    _adminPendingToken = null;
+    _otpContext = null;
+    _otpStopTimers();
+    editingCourseId = null; currentCourseId = null; window.currentSelectedCourseId = null;
+    addingCourse = false; addingProfessor = false; addingMaterialCourseId = null; addingStudent = false;
+    quizEditingCourseId = null; quizEditingMaterialId = null;
+    professorNav = 'courses';
+    _profMe = null; _profMeAt = 0;
+    closeModal('otpVerificationModal');
+    try { history.replaceState(null, '', '#/professor'); } catch (e) { location.hash = '#/professor'; }
+    showToast('Signed in — welcome back!', 'success');
+    _sessionKilled = false;
+    startSessionHeartbeat();
+    renderApp();
+    Promise.allSettled([fetchCoursesFromDB(true), fetchProfessorsFromDB(true), fetchSubscriptionSettings(), fetchOwnerProfile(true)])
+      .then(() => { try { renderApp(); } catch (e) {} }).catch(() => {});
+    return;
+  }
   if (data.user) data.user.role = 'admin';
+  if (data.evictedDevices > 0) {
+    setTimeout(() => showToast(`Signed out your least-recently-used device — admin accounts can stay signed in on ${data.maxSessions || 3} devices.`, 'info'), 900);
+  }
 
   currentUser = data.user;
   saveSession(data.user, data.token);
   _adminPendingToken = null;
   _otpContext = null;
+  _otpStopTimers();
   try { ensureStudentAIHomeView(); } catch (e) {}   // ✅ ensure DOM
 
   // Reset ALL routing / editor state — nothing from a previous
@@ -4528,7 +4954,7 @@ function renderAdminAddMaterial(courseId) {
     <div class="editor-section">
       <h3 class="editor-section-title"><i class="fas fa-cog"></i> Access & Settings</h3>
       <div class="editor-grid-3">
-        <div class="form-group"><label>Access Level</label>
+        <div class="form-group admin-only"><label>Access Level</label>
           <label class="toggle-box pro" style="margin-top:6px;">
             <input type="checkbox" id="newMatPremium"
                    onchange="document.getElementById('newMatPriceGroup').style.display=this.checked?'block':'none';document.getElementById('newMatPreviewGroup').style.display=this.checked?'block':'none';">
@@ -4538,10 +4964,10 @@ function renderAdminAddMaterial(courseId) {
         <div class="form-group"><label>Estimated Time (Optional)</label><input type="text" id="newMatTime" placeholder="e.g. 45 mins"></div>
         <div class="form-group"><label>Tags (Optional)</label><input type="text" id="newMatTags" placeholder="e.g. kinematics, basics"></div>
       </div>
-      <div class="form-group" id="newMatPriceGroup" style="display:none; margin-top:10px;">
+      <div class="form-group admin-only" id="newMatPriceGroup" style="display:none; margin-top:10px;">
         <label>Unlock Price (₹)</label><input type="number" id="newMatPrice" placeholder="e.g. 49" min="0" step="1">
       </div>
-      <div class="form-group" id="newMatPreviewGroup" style="display:none; margin-top:10px;">
+      <div class="form-group admin-only" id="newMatPreviewGroup" style="display:none; margin-top:10px;">
         <label><i class="fas fa-eye"></i> Free Preview Percentage</label>
         <input type="number" id="newMatPreview" value="0" min="0" max="100" step="1" placeholder="e.g. 10">
         <span class="hint">Percentage of PDF pages free to read. <strong>0 = no preview.</strong> 10 = first 10% of pages.</span>
@@ -4662,7 +5088,7 @@ function renderNotificationList() {
   let html = '';
   notifs.forEach(n => {
     const ago = timeAgo(n.createdAt);
-    const icon = n.type === 'doubt-reply' ? 'fa-comment-dots' : 'fa-bell';
+    const icon = n.type === 'doubt-reply' ? 'fa-comment-dots' : n.type === 'help-reply' ? 'fa-headset' : 'fa-bell';
     html += `
       <div class="notif-item ${n.read ? '' : 'unread'}" onclick="openNotification('${n.id}')">
         <div class="notif-icon"><i class="fas ${icon}"></i></div>
@@ -4698,6 +5124,7 @@ async function openNotification(notifId) {
   }
 
   document.getElementById('notifWrap')?.classList.remove('open');
+  if (n.link && n.link.indexOf('help:') === 0) { openHelpDesk(n.link.slice(5)); return; }
   if (n.link) location.hash = n.link;
 }
 
@@ -4741,7 +5168,7 @@ function navigateStudent(dest) {
   window.currentSelectedCourseId = null;
   editingCourseId = null;
   currentMaterialFilter = 'all';
-  const pathMap = { courses: '#/courses', saved: '#/saved', analytics: '#/analytics', home: '#/home', ai: '#/ai' };
+  const pathMap = { courses: '#/courses', saved: '#/saved', analytics: '#/analytics', home: '#/home', ai: '#/ai', notes: '#/notes', practice: '#/practice' };
   pushHash(pathMap[dest] || '#/home');
   studentNav = dest;
 
@@ -4758,7 +5185,7 @@ function navigateStudent(dest) {
   // own finally-block will call renderApp() and paint the courses.
   // Only fire a new fetch when nothing is running. Force-fresh when
   // we have no data; respect the cache when we do.
-  const needsCourses = (dest === 'courses' || dest === 'saved' || dest === 'home');
+  const needsCourses = (dest === 'courses' || dest === 'saved' || dest === 'home' || dest === 'notes');
   if (needsCourses && !_coursesLoading) {
     fetchCoursesFromDB(liveCourses.length === 0).catch(function (err) {
       console.warn('[navigateStudent] auto-fetch failed:', err);
@@ -4810,6 +5237,17 @@ function goBackFromDetail() {
 function setMaterialFilter(type) {
   currentMaterialFilter = type;
   if (window.currentSelectedCourseId) renderCourseDetail(window.currentSelectedCourseId);
+  /* ⭐ the course list carries no doubts — load them when Q&A opens */
+  if (type === 'qa' && window.currentSelectedCourseId) refreshCourseDoubts(window.currentSelectedCourseId, 30000);
+}
+
+/* ⭐ 2026-10-11 — fresh doubts for one course (list data has none) */
+async function refreshCourseDoubts(courseId, maxAgeMs) {
+  const c = findCourse(courseId);
+  if (c && maxAgeMs && c._doubtsAt && Date.now() - c._doubtsAt < maxAgeMs) return;
+  const fresh = await fetchSingleCourse(courseId);
+  if (fresh) fresh._doubtsAt = Date.now();
+  if (currentCourseId === courseId && currentMaterialFilter === 'qa') renderCourseDetail(courseId);
 }
 
 /* ============================================================
@@ -4880,7 +5318,7 @@ function _enforceViewInvariant() {
 
   if (currentUser) {
     // ── Logged in ──
-    document.body.classList.remove('aero-logged-out');
+    document.body.classList.remove('aero-logged-out', 'aero-guest');
     if (loginView.classList.contains('active')) {
       loginView.classList.remove('active');
     }
@@ -4889,11 +5327,17 @@ function _enforceViewInvariant() {
     const submitBtn = document.querySelector('#loginForm button[type="submit"]');
     if (submitBtn && submitBtn.disabled) {
       submitBtn.disabled = false;
-      submitBtn.innerHTML = '<i class="fas fa-sign-in-alt"></i> Sign In';
+      submitBtn.innerHTML = _loginSubmitLabel();
     }
+  } else if (isGuestBrowsing()) {
+    // ── ⭐ Visitor browsing the course catalog (no account yet) ──
+    document.body.classList.add('aero-logged-out', 'aero-guest');
+    if (loginView.classList.contains('active')) loginView.classList.remove('active');
+    if (header) header.style.display = 'flex';
   } else {
     // ── Logged out ──
     document.body.classList.add('aero-logged-out');
+    document.body.classList.remove('aero-guest');
     if (!loginView.classList.contains('active')) {
       loginView.classList.add('active');
     }
@@ -4922,19 +5366,27 @@ window.addEventListener('hashchange', function () {
 });
 
 function _renderAppNow() {
-  ['loginView', 'adminView', 'adminEditView', 'studentAIHomeView', 'studentHomeView', 'studentCoursesView', 'studentSavedView', 'studentAnalyticsView', 'courseDetailView', 'adminAddCourseView', 'adminAddProfessorView', 'adminAddMaterialView', 'adminAddStudentView', 'adminQuizEditorView']
+  /* ⭐ leaving My Notes → save the open notebook and give its memory back */
+  if (_notesMounted && !(currentUser && studentNav === 'notes' && !currentCourseId)) {
+    _notesMounted = false;
+    try { if (window.AeroNotes) window.AeroNotes.suspend(); } catch (_) {}
+  }
+  ['loginView', 'adminView', 'adminEditView', 'professorView', 'studentAIHomeView', 'studentNotesView', 'studentHomeView', 'studentCoursesView', 'studentSavedView', 'studentAnalyticsView', 'studentPracticeView', 'courseDetailView', 'adminAddCourseView', 'adminAddProfessorView', 'adminAddMaterialView', 'adminAddStudentView', 'adminQuizEditorView']
     .forEach(id => { const el = $(id); if (el) el.classList.remove('active'); });
   $('appHeader').style.display = 'none';
   $('appFooter').style.display = 'none';
 
   if (!currentUser) {
+    /* ⭐ Visitor browsing the catalog (landing → Explore Courses) */
+    if (isGuestBrowsing()) { renderGuestApp(); return; }
     $('loginView').classList.add('active');
     document.body.classList.add('aero-logged-out');
+    document.body.classList.remove('aero-guest');
     $('appHeader').style.display = 'flex';
     return;
   }
 
-  document.body.classList.remove('aero-logged-out');
+  document.body.classList.remove('aero-logged-out', 'aero-guest');
   $('appHeader').style.display = 'flex';
   $('appFooter').style.display = 'block';
   $('userDisplay').textContent = currentUser.username;
@@ -4953,7 +5405,7 @@ function _renderAppNow() {
     if (userDropdownName) userDropdownName.textContent = currentUser.fullName || currentUser.username;
 
     if (roleBadgeDropdown) {
-      roleBadgeDropdown.textContent = currentUser.role === 'admin' ? 'Admin' : 'Student';
+      roleBadgeDropdown.textContent = currentUser.role === 'admin' ? 'Admin' : currentUser.role === 'professor' ? 'Professor' : 'Student';
       roleBadgeDropdown.className = 'role-badge ' + currentUser.role;
     }
   }
@@ -4977,17 +5429,21 @@ function _renderAppNow() {
   }
 
   renderNotificationBadge();
+  /* ⭐ professor mode: hides every delete / admin-only control (the
+     server refuses them anyway — this keeps the screen honest) */
+  document.body.classList.toggle('aero-prof', isProfessor(currentUser));
   buildNav();
-  if (quizEditingCourseId && quizEditingMaterialId && isAdmin(currentUser)) {
+  const _adminNow = isAdmin(currentUser);
+  if (quizEditingCourseId && quizEditingMaterialId && (_adminNow || profCanEdit(quizEditingCourseId))) {
     $('adminQuizEditorView').classList.add('active');
     renderQuizEditor();
     return;
   }
-  if (addingCourse)          { $('adminAddCourseView').classList.add('active');    renderAdminAddCourse(); return; }
-  if (addingProfessor)       { $('adminAddProfessorView').classList.add('active'); renderAdminAddProfessor(); return; }
-  if (addingMaterialCourseId){ $('adminAddMaterialView').classList.add('active');  renderAdminAddMaterial(addingMaterialCourseId); return; }
-  if (addingStudent)         { $('adminAddStudentView').classList.add('active');   renderAdminAddStudent(); return; }
-  if (editingCourseId && isAdmin(currentUser)) {
+  if (addingCourse && _adminNow)    { $('adminAddCourseView').classList.add('active');    renderAdminAddCourse(); return; }
+  if (addingProfessor && _adminNow) { $('adminAddProfessorView').classList.add('active'); renderAdminAddProfessor(); return; }
+  if (addingMaterialCourseId && (_adminNow || profCanEdit(addingMaterialCourseId))) { $('adminAddMaterialView').classList.add('active');  renderAdminAddMaterial(addingMaterialCourseId); return; }
+  if (addingStudent && _adminNow)   { $('adminAddStudentView').classList.add('active');   renderAdminAddStudent(); return; }
+  if (editingCourseId && (_adminNow || profCanEdit(editingCourseId))) {
     $('adminEditView').classList.add('active');
     renderCourseEditor(editingCourseId); return;
   }
@@ -4995,6 +5451,7 @@ function _renderAppNow() {
   // Case-insensitive role check — defends against legacy "Admin" values
   const _isAdminRole = String(currentUser.role || '').trim().toLowerCase() === 'admin';
   if (_isAdminRole) { $('adminView').classList.add('active'); renderAdminDashboard(); return; }
+  if (isProfessor(currentUser)) { $('professorView').classList.add('active'); renderProfessorDashboard(); return; }
 
   // ─── AI DOUBT SOLVER (default landing page for students) ───
   if (studentNav === 'ai') {
@@ -5013,6 +5470,18 @@ function _renderAppNow() {
     return;
   }
 
+  // ─── MY NOTES (handwritten notebooks — loaded on demand) ───
+  if (studentNav === 'notes') {
+    const notesView = ensureStudentNotesView();
+    if (notesView) {
+      notesView.classList.add('active');
+      _notesMounted = true;
+      renderStudentNotes(notesView);
+      return;
+    }
+  }
+
+  setTimeout(prefetchNotesModule, 2500);
   if (studentNav === 'home') {
     const homeView = $('studentHomeView');
     if (homeView) homeView.classList.add('active');
@@ -5028,6 +5497,12 @@ function _renderAppNow() {
     if (analyticsView) analyticsView.classList.add('active');
     renderStudentAnalytics();
   }
+  else if (studentNav === 'practice') {
+    /* ⭐ Practice — learning.js */
+    const practiceView = $('studentPracticeView');
+    if (practiceView) practiceView.classList.add('active');
+    if (typeof window.renderPractice === 'function') window.renderPractice();
+  }
   else {
     const coursesView = $('studentCoursesView');
     if (coursesView) coursesView.classList.add('active');
@@ -5035,9 +5510,95 @@ function _renderAppNow() {
   }
 }
 
+/* ============================================================
+   ⭐ HEADER FIT (2026-10-09) — tablets & small laptops
+   ------------------------------------------------------------
+   Between the phone menu (≤860px) and a wide desktop, the nav links,
+   search, notifications, theme switch, Get App, streak and profile
+   can need more room than the header has (iPad, Android tablets,
+   1024–1300px laptops) — they used to slide under each other.
+   The header now measures itself and steps down only as far as
+   needed:  1 → compact pills · 2 → icon-only links (the current page
+   and AI keep their label) · 3 → all links icon-only · 4 → hide the
+   streak chip & Get App pill. Every link keeps a tooltip/aria-label.
+   ============================================================ */
+const HEADER_FIT_LEVELS = ['hdr-fit-1', 'hdr-fit-2', 'hdr-fit-3', 'hdr-fit-4'];
+let _headerFitRaf = 0;
+/* ⭐ 2026-10-11 — the header used to "vibrate" when a nav link was
+   clicked: links animated their padding/width (transition: .2s), the fit
+   measured them half-way through the animation, picked a level, which
+   changed the widths again, the ResizeObserver fired, and so on.
+   Now: measuring happens with animations off, and the header is only
+   re-fitted when something real changed (window width, the nav links or
+   the text in the right-hand cluster) — never because of its own class
+   changes. */
+let _headerFitKey = '';
+function fitHeaderNav(force) {
+  const h = document.getElementById('appHeader'), nav = document.getElementById('mainNav');
+  if (!h || !nav) return;
+  const ui = h.querySelector('.user-info');
+  const key = window.innerWidth + '|' + nav.innerHTML.length + '|' + nav.textContent + '|' +
+              (nav.querySelector('a.active') ? nav.querySelector('a.active').textContent : '') + '|' + (ui ? ui.textContent : '');
+  if (!force && key === _headerFitKey) return;          // nothing that matters changed
+  _headerFitKey = key;
+  const before = h.className;
+  h.classList.add('hdr-measuring');                      // transitions off while measuring
+  h.classList.remove(...HEADER_FIT_LEVELS);
+  if (getComputedStyle(h).display === 'none' || getComputedStyle(nav).position === 'absolute') {   // hidden / phone menu mode
+    h.classList.remove('hdr-measuring');
+    return;
+  }
+  const tooWide = () => {
+    if (nav.scrollWidth > nav.clientWidth + 1) return true;
+    const hr = h.getBoundingClientRect();
+    const padR = parseFloat(getComputedStyle(h).paddingRight) || 0;
+    if (ui && ui.getBoundingClientRect().right > hr.right - padR + 1) return true;
+    const nr = nav.getBoundingClientRect(), br = h.querySelector('.brand');
+    if (br && br.getBoundingClientRect().right > nr.left + 1) return true;
+    return false;
+  };
+  for (const c of HEADER_FIT_LEVELS) { if (!tooWide()) break; h.classList.add(c); }
+  void h.offsetWidth;                                    // apply the final level with transitions still off
+  h.classList.remove('hdr-measuring');
+  if (h.className !== before) _headerFitKey = key;       // our own change must not trigger another fit
+}
+let _headerFitForce = false;
+function scheduleHeaderFit(force) {
+  if (force === true) _headerFitForce = true;
+  if (_headerFitRaf) return;
+  _headerFitRaf = requestAnimationFrame(() => {
+    _headerFitRaf = 0;
+    const f = _headerFitForce; _headerFitForce = false;
+    try { fitHeaderNav(f); } catch (_) {}
+  });
+}
+(function wireHeaderFit() {
+  try {
+    window.addEventListener('resize', scheduleHeaderFit, { passive: true });
+    window.addEventListener('orientationchange', scheduleHeaderFit);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => scheduleHeaderFit(true)).catch(() => {});
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(scheduleHeaderFit);
+      const hook = () => { const ui = document.querySelector('#appHeader .user-info'); if (ui) ro.observe(ui); };
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', hook); else hook();
+    }
+  } catch (_) {}
+})();
+
 function buildNav() {
   if (isAdmin(currentUser)) {
     $('mainNav').innerHTML = `<a href="#" class="active" onclick="event.preventDefault();">Dashboard</a>`;
+    scheduleHeaderFit();
+    return;
+  }
+  if (isProfessor(currentUser)) {
+    const onDash = !currentCourseId && !editingCourseId && !quizEditingCourseId;
+    $('mainNav').innerHTML = `
+      <a href="#" class="${onDash && professorNav === 'courses' ? 'active' : ''}" onclick="event.preventDefault();navigateProfessor('courses')"><i class="fas fa-chalkboard"></i> <span class="nav-label">My Courses</span></a>
+      <a href="#" class="${onDash && professorNav === 'grading' ? 'active' : ''}" onclick="event.preventDefault();navigateProfessor('grading')"><i class="fas fa-marker"></i> <span class="nav-label">Grading</span>${window._profToGrade ? ` <span class="nav-count">${window._profToGrade}</span>` : ''}</a>
+      <a href="#" class="${onDash && professorNav === 'requests' ? 'active' : ''}" onclick="event.preventDefault();navigateProfessor('requests')"><i class="fas fa-paper-plane"></i> <span class="nav-label">Course Requests</span></a>
+      <a href="#" class="${onDash && professorNav === 'profile' ? 'active' : ''}" onclick="event.preventDefault();navigateProfessor('profile')"><i class="fas fa-id-badge"></i> <span class="nav-label">My Profile</span></a>`;
+    scheduleHeaderFit();
     return;
   }
   const aiActive        = (studentNav === 'ai'        && !currentCourseId) ? 'active' : '';
@@ -5045,14 +5606,20 @@ function buildNav() {
   const coursesActive   = (studentNav === 'courses'   && !currentCourseId) ? 'active' : '';
   const savedActive     = (studentNav === 'saved'     && !currentCourseId) ? 'active' : '';
   const analyticsActive = (studentNav === 'analytics' && !currentCourseId) ? 'active' : '';
+  const notesActive     = (studentNav === 'notes'     && !currentCourseId) ? 'active' : '';
+  const practiceActive  = (studentNav === 'practice'  && !currentCourseId) ? 'active' : '';
+  const practiceDot     = window._learnSummary && (!window._learnSummary.dailyDone || window._learnSummary.assignmentsDue) ? ' <span class="nav-dot" aria-hidden="true"></span>' : '';
   const savedCount = (currentUser.bookmarks || []).length;
   $('mainNav').innerHTML = `
-    <a href="#" class="${homeActive}" onclick="event.preventDefault();navigateStudent('home')"><i class="fas fa-house"></i> Home</a>
-    <a href="#" class="${coursesActive}" onclick="event.preventDefault();navigateStudent('courses')"><i class="fas fa-graduation-cap"></i> Courses</a>
-    <a href="#" class="${savedActive}" onclick="event.preventDefault();navigateStudent('saved')"><i class="fas fa-bookmark"></i> Saved${savedCount > 0 ? ' <span class="nav-count">' + savedCount + '</span>' : ''}</a>
-    <a href="#" class="${analyticsActive}" onclick="event.preventDefault();navigateStudent('analytics')"><i class="fas fa-chart-line"></i> Analytics</a>
-    <a href="#" class="nav-ai-btn ${aiActive}" onclick="event.preventDefault();navigateStudent('ai')"><i class="fas fa-robot"></i> AI Solver</a>
+    <a href="#" class="${homeActive}" title="Home" aria-label="Home" onclick="event.preventDefault();navigateStudent('home')"><i class="fas fa-house"></i> <span class="nav-label">Home</span></a>
+    <a href="#" class="${coursesActive}" title="Courses" aria-label="Courses" onclick="event.preventDefault();navigateStudent('courses')"><i class="fas fa-graduation-cap"></i> <span class="nav-label">Courses</span></a>
+    <a href="#" class="${savedActive}" title="Saved" aria-label="Saved" onclick="event.preventDefault();navigateStudent('saved')"><i class="fas fa-bookmark"></i> <span class="nav-label">Saved</span>${savedCount > 0 ? ' <span class="nav-count">' + savedCount + '</span>' : ''}</a>
+    <a href="#" class="${practiceActive}" title="Practice" aria-label="Practice" onclick="event.preventDefault();navigateStudent('practice')"><i class="fas fa-bullseye"></i> <span class="nav-label">Practice</span>${practiceDot}</a>
+    <a href="#" class="${analyticsActive}" title="Analytics" aria-label="Analytics" onclick="event.preventDefault();navigateStudent('analytics')"><i class="fas fa-chart-line"></i> <span class="nav-label">Analytics</span></a>
+    <a href="#" class="${notesActive}" title="Notes" aria-label="Notes" onclick="event.preventDefault();navigateStudent('notes')"><i class="fas fa-book-open"></i> <span class="nav-label">Notes</span></a>
+    <a href="#" class="nav-ai-btn ${aiActive}" title="AI Solver" aria-label="AI Solver" onclick="event.preventDefault();navigateStudent('ai')"><i class="fas fa-robot"></i> <span class="nav-label">AI Solver</span></a>
   `;
+  scheduleHeaderFit();
 }
 
 /* ============================================================
@@ -5100,6 +5667,7 @@ function updateAdminTabUI() {
   const actionsEl = $('adminHeaderActions');
   const titleMap = {
     overview:      { icon: 'fa-tachometer-alt', text: 'Admin Dashboard' },
+    profaccess:    { icon: 'fa-user-shield',    text: 'Professor Access' },
     live:          { icon: 'fa-bolt',           text: 'Live Activity' },
     courses:       { icon: 'fa-graduation-cap', text: 'Manage Courses' },
     categories:    { icon: 'fa-compass',        text: 'Categories — Class 11, 12, JEE, NEET…' },
@@ -5116,7 +5684,7 @@ function updateAdminTabUI() {
     branding:      { icon: 'fa-palette',             text: 'Branding — Favicon & App Icons' },
     certificates:  { icon: 'fa-certificate',         text: 'Certificate Management' },
     popup:         { icon: 'fa-bullhorn',            text: 'Login Pop-up — Greetings & Announcements' },
-    mobileapp:     { icon: 'fa-mobile-screen',       text: 'Mobile App — Android' }
+    mobileapp:     { icon: 'fa-mobile-screen',       text: 'Apps — Android & Windows' }
   };
   const actionsMap = {
     overview: `<button class="btn btn-outline" onclick="switchAdminTab('courses')"><i class="fas fa-arrow-right"></i> Go to Courses</button>`,
@@ -5172,10 +5740,12 @@ function updateAdminTabUI() {
 
 function renderAdminDashboard() {
   updateAdminTabUI();
+  try { refreshProfAccessBadge(); } catch (e) {}
   if (adminTab === 'overview') renderAdminOverview();
   else if (adminTab === 'live')          renderAdminLiveActivity();
   else if (adminTab === 'courses') renderAdminCourses();
   else if (adminTab === 'professors') renderAdminProfessors();
+  else if (adminTab === 'profaccess') renderAdminProfAccess();
   else if (adminTab === 'students') renderAdminStudents();
   else if (adminTab === 'replies') renderAdminEmailReplies();
   else if (adminTab === 'subscriptions') renderAdminSubscriptions();
@@ -5221,6 +5791,13 @@ function renderAdminSecurityTab() {
           <span class="hint">All admin 2FA and recovery codes are sent here.</span>
         </div>
       </div>
+    </div>
+
+    <div class="editor-section">
+      <h3 class="editor-section-title"><i class="fas fa-laptop-mobile"></i> Signed-in devices</h3>
+      <p class="editor-hint">Your admin account can stay signed in on up to <strong id="adminDevMax">3</strong> devices at once.
+        Signing in on one more device signs out the one you used least recently.</p>
+      <div id="adminDeviceList" class="adm-dev-list"><div class="adm-dev-loading"><i class="fas fa-spinner fa-spin"></i> Loading devices…</div></div>
     </div>
 
     <div class="editor-section">
@@ -5286,6 +5863,56 @@ function renderAdminSecurityTab() {
       </p>
     </div>
   `;
+  loadAdminDevices();
+}
+
+/* ⭐ 2026-10-08 — admin: signed-in devices (max 3) */
+async function loadAdminDevices() {
+  const box = document.getElementById('adminDeviceList');
+  if (!box) return;
+  let d;
+  try { d = await fetchJSON(`${API_BASE}/admin/sessions?_t=${Date.now()}`, { cache: 'no-store' }); }
+  catch (e) { box.innerHTML = `<div class="adm-dev-empty">Could not load devices. <button class="btn btn-outline btn-sm" onclick="loadAdminDevices()">Retry</button></div>`; return; }
+  if (!d || !d.success) { box.innerHTML = `<div class="adm-dev-empty">${escapeHtml((d && d.message) || 'Could not load devices.')}</div>`; return; }
+  const maxEl = document.getElementById('adminDevMax'); if (maxEl) maxEl.textContent = d.max || 3;
+  const list = d.sessions || [];
+  const ago = (t) => {
+    if (!t) return '—';
+    const s = Math.max(0, (Date.now() - new Date(t).getTime()) / 1000);
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return new Date(t).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  };
+  const icon = (dev) => /Android|iOS|app/i.test(dev) ? 'fa-mobile-screen-button' : 'fa-laptop';
+  const others = list.filter(x => !x.current).length;
+  box.innerHTML = `
+    <div class="adm-dev-meter"><span style="width:${Math.min(100, (list.length / (d.max || 3)) * 100)}%"></span></div>
+    <div class="adm-dev-count">${list.length} of ${d.max || 3} device slots in use</div>
+    ${list.map(x => `
+      <div class="adm-dev ${x.current ? 'current' : ''}">
+        <div class="adm-dev-ic"><i class="fas ${icon(x.device)}"></i></div>
+        <div class="adm-dev-info">
+          <strong>${escapeHtml(x.device)}${x.current ? ' <span class="prof-chip ok">This device</span>' : ''}</strong>
+          <span>Signed in ${escapeHtml(ago(x.loginAt))} · active ${escapeHtml(ago(x.lastSeenAt))}${x.ip ? ' · ' + escapeHtml(x.ip) : ''}</span>
+        </div>
+        ${x.current ? '' : `<button class="btn btn-outline btn-sm" onclick="revokeAdminDevice('${escapeHtml(x.id)}')"><i class="fas fa-right-from-bracket"></i> Sign out</button>`}
+      </div>`).join('')}
+    ${others ? `<div class="adm-dev-actions"><button class="btn btn-outline btn-sm" onclick="revokeAdminDevice('others')"><i class="fas fa-user-lock"></i> Sign out all other devices</button></div>` : ''}`;
+}
+async function revokeAdminDevice(id) {
+  const all = id === 'others';
+  const ok = await aeroConfirm(all ? 'Sign out other devices?' : 'Sign out this device?',
+    all ? 'Every other device signed in to this admin account will be signed out immediately.' : 'That device will be signed out immediately.',
+    'Sign out', true);
+  if (!ok) return;
+  try {
+    const url = all ? `${API_BASE}/admin/sessions/revoke-others` : `${API_BASE}/admin/sessions/${encodeURIComponent(id)}/revoke`;
+    const d = await fetchJSON(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!d.success) throw new Error(d.message || 'Could not sign out.');
+    showToast(all ? 'Other devices signed out.' : 'Device signed out.', 'success');
+  } catch (e) { showToast(e.message || 'Could not sign out.', 'error'); }
+  loadAdminDevices();
 }
 
 async function updateAdminUsername() {
@@ -5422,7 +6049,7 @@ async function downloadCourseZip(courseId) {
   }
 }
 
-async function renderAdminOverview() {
+async function renderAdminOverview(opts) {
   const myGen = ++_overviewFetchGeneration;
 
   const courses    = getCourses();
@@ -5434,40 +6061,85 @@ async function renderAdminOverview() {
   );
   $('statProfessors').textContent = professors.length;
 
-  // Show a placeholder while we fetch — but never leave it stuck.
-  $('statStudents').textContent = '…';
+  /* ⚡ STUDENT COUNT (2026-10-07)
+     Before: the tile showed "…" and downloaded the WHOLE student list
+     (every student's record, uncached) just to count it — so it always
+     appeared long after the other three tiles.
+     Now: the last known number is painted together with the other
+     tiles, and a tiny count-only request (an index lookup on the
+     server) refreshes it. Re-renders within 15 s reuse the fresh value;
+     roster changes (SSE) always refetch. */
+  const statEl = $('statStudents');
+  const known = _adminStudentCountKnown();
+  statEl.textContent = known != null ? known : '…';
+  statEl.classList.toggle('is-stale', known != null && !_adminStudentCountFresh());
+  if (_adminStudentCountFresh() && !(opts && opts.force)) return;
 
   try {
-    // ⭐ Cache-buster + no-store → guaranteed fresh network read.
-    //    Without these, some browsers serve a cached 200 within
-    //    the same tab session and the count looks frozen.
-    const res = await fetch(`/api/students?_t=${Date.now()}`, {
-      cache: 'no-store'
-    });
-
-    // A newer render started while we were waiting → drop this result.
-    if (myGen !== _overviewFetchGeneration) return;
-
-    if (!res.ok) {
-      $('statStudents').textContent = '—';
-      return;
-    }
-
-    const data = await res.json();
-
-    // Re-check in case a newer render started during the JSON parse.
-    if (myGen !== _overviewFetchGeneration) return;
-
-    if (data && data.success && Array.isArray(data.students)) {
-      $('statStudents').textContent = data.students.length;
-    } else {
-      $('statStudents').textContent = '—';
-    }
+    const n = await _fetchAdminStudentCount();
+    if (myGen !== _overviewFetchGeneration) return;   // a newer render owns the tile
+    if (n == null) { if (known == null) statEl.textContent = '—'; return; }
+    statEl.textContent = n;
+    statEl.classList.remove('is-stale');
   } catch (e) {
     if (myGen !== _overviewFetchGeneration) return;
-    console.warn('[renderAdminOverview] student fetch failed:', e);
-    $('statStudents').textContent = '—';
+    console.warn('[renderAdminOverview] student count failed:', e);
+    if (known == null) statEl.textContent = '—';
+    statEl.classList.remove('is-stale');
   }
+}
+
+const ADMIN_STUDENT_COUNT_KEY = 'aero_admin_student_count';
+const ADMIN_STUDENT_COUNT_FRESH_MS = 15000;
+let _adminStudentCount = null;       // { n, at }
+let _adminStudentCountInflight = null;
+
+function _adminStudentCountKnown() {
+  if (_adminStudentCount) return _adminStudentCount.n;
+  try {
+    const v = JSON.parse(localStorage.getItem(ADMIN_STUDENT_COUNT_KEY) || 'null');
+    if (v && typeof v.n === 'number') { _adminStudentCount = { n: v.n, at: 0 }; return v.n; }
+  } catch (_) {}
+  if (Array.isArray(_allStudentsCache) && _allStudentsCache.length) return _allStudentsCache.length;
+  return null;
+}
+function _adminStudentCountFresh() {
+  return !!(_adminStudentCount && Date.now() - _adminStudentCount.at < ADMIN_STUDENT_COUNT_FRESH_MS);
+}
+function _rememberAdminStudentCount(n) {
+  if (typeof n !== 'number' || !isFinite(n)) return;
+  _adminStudentCount = { n, at: Date.now() };
+  try { localStorage.setItem(ADMIN_STUDENT_COUNT_KEY, JSON.stringify({ n })); } catch (_) {}
+}
+/* One request at a time; falls back to the full roster on a server
+   that does not have the count endpoint yet. */
+function _fetchAdminStudentCount() {
+  if (_adminStudentCountInflight) return _adminStudentCountInflight;
+  _adminStudentCountInflight = (async () => {
+    try {
+      const res = await fetch(`${API_BASE}/admin/stats/student-count`, { cache: 'no-store' });
+      if (res.ok) {
+        const d = await res.json().catch(() => null);
+        if (d && d.success && typeof d.count === 'number') { _rememberAdminStudentCount(d.count); return d.count; }
+      }
+      /* Signed-out / no permission → nothing to show. Anything else
+         (older server without this endpoint) → count the roster. */
+      if (res.status === 401 || res.status === 403 || res.status === 429) return null;
+      const r2 = await fetch(`/api/students?_t=${Date.now()}`, { cache: 'no-store' });
+      if (!r2.ok) return null;
+      const d2 = await r2.json().catch(() => null);
+      if (d2 && d2.success && Array.isArray(d2.students)) { _rememberAdminStudentCount(d2.students.length); return d2.students.length; }
+      return null;
+    } finally {
+      _adminStudentCountInflight = null;
+    }
+  })();
+  return _adminStudentCountInflight;
+}
+/* Start the count as soon as an admin session is known, so it is
+   already there when the dashboard paints. */
+function aeroPrefetchAdminStats() {
+  try { if (currentUser && isAdmin(currentUser) && !_adminStudentCountFresh()) _fetchAdminStudentCount().catch(() => {}); } catch (_) {}
 }
 
 /* ============================================================
@@ -5500,6 +6172,8 @@ function clearAdminCourseFilters() {
 }
 
 async function renderAdminCourses() {  
+  /* never rebuild the list under a course that is being dragged */
+  if (_cordDrag) { _cordDrag.rerender = true; return; }
   const courses = getCourses();
 
   // ⭐ FIX: show loading skeleton while courses are still being fetched
@@ -5539,7 +6213,11 @@ async function renderAdminCourses() {
     return m ? m[0] : s.toLowerCase();
   }
 
-  const filtered = courses.filter(c => {
+  /* ⭐ Same order the students see; #positions count the whole list */
+  const ordered = courses.slice().sort(courseDisplayCompare);
+  const posOf = new Map(ordered.map((c, i) => [c.id, i + 1]));
+
+  const filtered = ordered.filter(c => {
     if (searchTerm) {
       const hit = (c.name || '').toLowerCase().includes(searchTerm) ||
                   (c.code && c.code.toLowerCase().includes(searchTerm)) ||
@@ -5566,8 +6244,10 @@ async function renderAdminCourses() {
     return;
   }
 
-  let html = `<div class="course-grid">`;
-  filtered.forEach(c => {
+  const narrowed = filtered.length !== ordered.length;
+  let html = renderCourseOrderHint(ordered.length, narrowed) +
+             `<div class="course-grid" id="adminCourseGrid" data-cord-grid="1">`;
+  filtered.forEach((c, vi) => {
     const matCount = (c.materials || []).length;
     const plCount = c.playlistCount != null ? c.playlistCount : (c.playlists || []).length;
     const statusBadge = c.status === 'draft'
@@ -5594,8 +6274,24 @@ async function renderAdminCourses() {
 
     const thumbHtml = c.thumbnail ? `<div class="course-thumb"><img src="${c.thumbnail}" alt="" loading="lazy" decoding="async"></div>` : '';
 
+    const pos = posOf.get(c.id);
+    const orderBar = `
+        <div class="cord-bar" onclick="event.stopPropagation()">
+          <button type="button" class="cord-grip" title="Drag to move this course (or focus and use the arrow keys)"
+                  aria-label="Move ${escapeHtml(c.name)} — position ${pos} of ${ordered.length}. Drag, or use the arrow keys."
+                  onpointerdown="cordDragStart(event, '${c.id}')" onkeydown="cordGripKey(event, '${c.id}')">
+            <i class="fas fa-grip-vertical"></i>
+          </button>
+          <span class="cord-pos" title="Position in the course list">#${pos}</span>
+          <span class="cord-label">Order</span>
+          <button type="button" class="cord-btn" onclick="cordMove('${c.id}', -1)" ${vi === 0 ? 'disabled' : ''}
+                  title="Move up" aria-label="Move ${escapeHtml(c.name)} up"><i class="fas fa-arrow-up"></i></button>
+          <button type="button" class="cord-btn" onclick="cordMove('${c.id}', 1)" ${vi === filtered.length - 1 ? 'disabled' : ''}
+                  title="Move down" aria-label="Move ${escapeHtml(c.name)} down"><i class="fas fa-arrow-down"></i></button>
+        </div>`;
+
     html += `
-      <div class="course-card ${c.thumbnail ? 'has-thumb' : ''}" style="${accentStyle(c.code || c.name)}">
+      <div class="course-card ${c.thumbnail ? 'has-thumb' : ''}" data-cord-id="${c.id}" style="${accentStyle(c.code || c.name)}">
         ${thumbHtml}
         <button class="delete-course-btn" onclick="event.stopPropagation();deleteCourse('${c.id}')" title="Delete" aria-label="Delete course"><i class="fas fa-trash-alt"></i></button>
         <div class="course-code">${escapeHtml(c.code) || 'N/A'} ${premiumLabel} ${statusBadge} ${featuredBadge}</div>
@@ -5609,6 +6305,7 @@ async function renderAdminCourses() {
           ? acCourseTracks(c).map(k => { const cc = acFindCategory(k); return `<span class="ac-pill small">${escapeHtml(cc ? cc.name : k)}</span>`; }).join('')
           : '<span class="ac-warn"><i class="fas fa-eye-slash"></i> Not in any category — students can\'t find it</span>'}</div>
         <div class="material-count"><i class="fas fa-list-ol"></i> ${acChaptersOf(c).length} chapters · <i class="fas fa-layer-group"></i> ${matCount} materials${plCount > 0 ? ` · <i class="fas fa-list"></i> ${plCount} playlist${plCount === 1 ? '' : 's'}` : ''}</div>
+        ${orderBar}
         <div class="card-actions">
           <button class="btn btn-warning btn-sm" onclick="event.stopPropagation();openCourseEditor('${c.id}')"><i class="fas fa-edit"></i> Edit</button>
           ${c.status === 'draft'
@@ -5621,6 +6318,308 @@ async function renderAdminCourses() {
   });
   html += `</div>`;
   $('adminCourseList').innerHTML = html;
+  cordStateRestore();
+  cordRefocus();
+}
+
+/* ============================================================
+   ⭐ COURSE ORDER — Admin → Courses (2026-10-05)
+   ------------------------------------------------------------
+   Every course card has an "Order" strip:
+     ⋮⋮  drag handle (mouse, trackpad or touch) — drag the card to a
+         new place in the grid; the others make room as you move.
+         Keyboard: focus it and press ↑ ↓ (or ← →).
+     ↑ ↓ move one place up / down.
+   The new order shows at once (here and in the student catalog of
+   this browser), is saved to the database in the background
+   (PUT /api/admin/courses/order — rapid moves are combined into one
+   save, saves never overlap), and every open student page re-sorts
+   live through the 'courses:order' sync event.
+   With a search / filter active, the moves happen among the
+   visible courses; hidden courses keep their places.
+   ============================================================ */
+var _cordDrag = null;
+var _cordFocus = null;
+const _cordSave = { timer: 0, inflight: false, pending: null, failedAt: 0 };
+
+function renderCourseOrderHint(total, narrowed) {
+  if (total < 2) return '';
+  return `
+    <div class="cord-hint" id="cordHint">
+      <i class="fas fa-arrow-down-short-wide"></i>
+      <span>Drag <i class="fas fa-grip-vertical" aria-hidden="true"></i> or use <b>↑ ↓</b> to set the order students see the courses in.
+      ${narrowed ? '<em>Filter on — only the courses shown are moved; the rest keep their places.</em>' : ''}</span>
+      <span class="cord-state" id="cordState" aria-live="polite"></span>
+    </div>`;
+}
+
+/* The full display order (ids) — what the server stores */
+function cordFullOrder() {
+  return getCourses().slice().sort(courseDisplayCompare).map(c => String(c.id));
+}
+
+/* Put `visibleNew` (the shown courses in their new order) back into the
+   full list: the slots the shown courses occupied are refilled in the
+   new order, hidden courses do not move. */
+function cordMergeVisible(visibleNew) {
+  const full = cordFullOrder();
+  const vis = new Set(visibleNew);
+  let k = 0;
+  return full.map(id => (vis.has(id) ? visibleNew[k++] : id));
+}
+
+function cordVisibleIds() {
+  const grid = document.getElementById('adminCourseGrid');
+  return grid ? Array.from(grid.querySelectorAll(':scope > .course-card[data-cord-id]')).map(el => el.getAttribute('data-cord-id')) : [];
+}
+
+/* Apply locally (instant), repaint, and queue the save */
+function cordApply(fullIds) {
+  const before = cordFullOrder();
+  if (fullIds.join('|') === before.join('|')) return false;
+  const pos = new Map(fullIds.map((id, i) => [id, (i + 1) * 10]));
+  getCourses().forEach(c => { const p = pos.get(String(c.id)); if (p !== undefined) c.sortOrder = p; });
+  renderAdminCourses();
+  cordQueueSave(fullIds);
+  return true;
+}
+
+function cordMove(courseId, dir) {
+  if (_cordDrag) return;
+  const vis = cordVisibleIds();
+  const i = vis.indexOf(String(courseId));
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= vis.length) return;
+  [vis[i], vis[j]] = [vis[j], vis[i]];
+  /* keep focus on the button that was pressed, or on its neighbour at the ends */
+  const ae = document.activeElement;
+  if (ae && ae.closest && ae.closest('.cord-bar')) {
+    _cordFocus = { id: String(courseId), sel: ae.classList.contains('cord-grip') ? '.cord-grip' : null, dir, at: Date.now() };
+  }
+  if (cordApply(cordMergeVisible(vis))) cordFlash(courseId);
+}
+
+function cordGripKey(e, courseId) {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); return; }
+  const dir = (e.key === 'ArrowUp' || e.key === 'ArrowLeft') ? -1
+            : (e.key === 'ArrowDown' || e.key === 'ArrowRight') ? 1 : 0;
+  if (!dir) return;
+  e.preventDefault(); e.stopPropagation();
+  cordMove(courseId, dir);
+}
+
+/* After a repaint, put keyboard focus back on the moved course */
+function cordRefocus() {
+  const f = _cordFocus;
+  if (!f || Date.now() - f.at > 4000) { _cordFocus = null; return; }
+  const card = document.querySelector(`#adminCourseGrid .course-card[data-cord-id="${CSS.escape(f.id)}"]`);
+  if (!card) return;
+  let btn = null;
+  if (f.sel) btn = card.querySelector(f.sel);
+  else {
+    const [up, down] = card.querySelectorAll('.cord-btn');
+    btn = f.dir < 0 ? (up && !up.disabled ? up : down) : (down && !down.disabled ? down : up);
+  }
+  if (btn) {
+    try { btn.focus({ preventScroll: true }); } catch (e) { btn.focus(); }
+    const r = card.getBoundingClientRect();
+    if (r.top < 70 || r.bottom > window.innerHeight) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function cordFlash(courseId) {
+  requestAnimationFrame(() => {
+    const card = document.querySelector(`#adminCourseGrid .course-card[data-cord-id="${CSS.escape(String(courseId))}"]`);
+    if (!card) return;
+    card.classList.remove('cord-dropped'); void card.offsetWidth;
+    card.classList.add('cord-dropped');
+    setTimeout(() => card.classList.remove('cord-dropped'), 800);
+  });
+}
+
+/* ---------- Saving: debounced, one request at a time ---------- */
+function cordQueueSave(fullIds) {
+  _cordSave.pending = fullIds.slice();
+  cordState('saving');
+  clearTimeout(_cordSave.timer);
+  _cordSave.timer = setTimeout(cordFlushSave, 300);
+}
+
+async function cordFlushSave() {
+  if (_cordSave.inflight || !_cordSave.pending) return;
+  const ids = _cordSave.pending;
+  _cordSave.pending = null;
+  _cordSave.inflight = true;
+  /* our own change comes back as a live-sync event — ignore that echo */
+  window.__aeroCourseOrderSelfAt = Date.now();
+  let ok = false, msg = '', serverMsg = '';
+  try {
+    const res = await fetch(`${API_BASE}/admin/courses/order`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order: ids })
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) {}
+    ok = res.ok && data && data.success === true;
+    if (!ok) { serverMsg = (data && data.message) || ''; msg = 'HTTP ' + res.status; }
+  } catch (e) {
+    serverMsg = 'Could not save the course order — check your internet connection and try again.';
+  } finally {
+    window.__aeroCourseOrderSelfAt = Date.now();
+    _cordSave.inflight = false;
+  }
+  if (_cordSave.pending) { cordFlushSave(); return; }      // a newer order is waiting
+  if (ok) {
+    _cordSave.failedAt = 0;
+    cordState('saved');
+  } else {
+    _cordSave.failedAt = Date.now();
+    cordState('error');
+    showToast(serverMsg || ('Could not save the course order (' + msg + '). Please try again.'), 'error');
+    /* show the order the database really has */
+    fetchCoursesFromDB(true).catch(() => {});
+  }
+}
+
+function cordState(state) {
+  const el = document.getElementById('cordState');
+  if (!el) return;
+  clearTimeout(el._t);
+  if (state === 'saving') { el.className = 'cord-state run'; el.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…'; }
+  else if (state === 'saved') {
+    el.className = 'cord-state ok'; el.innerHTML = '<i class="fas fa-circle-check"></i> Order saved';
+    el._t = setTimeout(() => { el.className = 'cord-state'; el.innerHTML = ''; }, 2500);
+  } else if (state === 'error') { el.className = 'cord-state err'; el.innerHTML = '<i class="fas fa-triangle-exclamation"></i> Not saved'; }
+  else { el.className = 'cord-state'; el.innerHTML = ''; }
+}
+/* a repaint (e.g. after a save) recreates the hint — keep its state */
+function cordStateRestore() {
+  if (_cordSave.inflight || _cordSave.pending) cordState('saving');
+  else if (_cordSave.failedAt && Date.now() - _cordSave.failedAt < 6000) cordState('error');
+}
+
+/* ---------- Drag & drop (pointer events: mouse, pen and touch) ---------- */
+function cordDragStart(e, courseId) {
+  if (_cordDrag) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const handle = e.currentTarget;
+  const card = handle && handle.closest('.course-card');
+  const grid = card && card.parentElement;
+  if (!card || !grid || grid.id !== 'adminCourseGrid') return;
+  const startOrder = cordVisibleIds();
+  if (startOrder.length < 2) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const rect = card.getBoundingClientRect();
+  const ph = document.createElement('div');
+  ph.className = 'cord-ph';
+  ph.style.height = rect.height + 'px';
+  grid.insertBefore(ph, card);
+
+  card.classList.add('cord-dragging');
+  card.style.width = rect.width + 'px';
+  card.style.height = rect.height + 'px';
+  card.style.left = rect.left + 'px';
+  card.style.top = rect.top + 'px';
+  document.body.classList.add('cord-drag-on');
+  try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+
+  const cols = (getComputedStyle(grid).gridTemplateColumns || '').split(' ').filter(Boolean).length || 1;
+  _cordDrag = { courseId: String(courseId), card, grid, ph, handle, startOrder, cols,
+                offX: e.clientX - rect.left, offY: e.clientY - rect.top,
+                x: e.clientX, y: e.clientY, raf: 0, pointerId: e.pointerId, rerender: false };
+
+  const onMove = (ev) => {
+    if (!_cordDrag || ev.pointerId !== _cordDrag.pointerId) return;
+    ev.preventDefault();
+    _cordDrag.x = ev.clientX; _cordDrag.y = ev.clientY;
+    cordDragPlace();
+  };
+  const onUp = (ev) => {
+    if (!_cordDrag || (ev && ev.pointerId !== undefined && ev.pointerId !== _cordDrag.pointerId)) return;
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointercancel', onUp);
+    window.removeEventListener('keydown', onEsc, true);
+    cordDragFinish(!!(ev && ev.cancelled));
+  };
+  const onEsc = (ev) => {
+    if (ev.key !== 'Escape' || !_cordDrag) return;
+    ev.preventDefault(); ev.stopPropagation();
+    onUp({ cancelled: true });
+  };
+  window.addEventListener('pointermove', onMove, { passive: false });
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointercancel', onUp);
+  window.addEventListener('keydown', onEsc, true);
+
+  /* auto-scroll near the top / bottom of the window */
+  const tick = () => {
+    if (!_cordDrag) return;
+    const edge = 90, y = _cordDrag.y, h = window.innerHeight;
+    let dy = 0;
+    if (y < edge) dy = -Math.ceil((edge - y) / 5);
+    else if (y > h - edge) dy = Math.ceil((y - (h - edge)) / 5);
+    if (dy) { window.scrollBy(0, dy); cordDragPlace(); }
+    _cordDrag.raf = requestAnimationFrame(tick);
+  };
+  _cordDrag.raf = requestAnimationFrame(tick);
+}
+
+function cordDragPlace() {
+  const d = _cordDrag;
+  if (!d) return;
+  d.card.style.left = (d.x - d.offX) + 'px';
+  d.card.style.top = (d.y - d.offY) + 'px';
+  const cards = Array.from(d.grid.querySelectorAll(':scope > .course-card[data-cord-id]')).filter(c => c !== d.card);
+  if (!cards.length) return;
+  let target = null;
+  for (const c of cards) {
+    const r = c.getBoundingClientRect();
+    if (d.x >= r.left && d.x <= r.right && d.y >= r.top && d.y <= r.bottom) { target = c; break; }
+  }
+  if (target) {
+    const r = target.getBoundingClientRect();
+    const before = d.cols > 1 ? d.x < r.left + r.width / 2 : d.y < r.top + r.height / 2;
+    const ref = before ? target : target.nextSibling;
+    if (ref !== d.ph && d.ph.nextSibling !== ref) d.grid.insertBefore(d.ph, ref);
+    return;
+  }
+  /* above the first card / below the last one */
+  const first = cards[0].getBoundingClientRect();
+  const last = cards[cards.length - 1].getBoundingClientRect();
+  if (d.y < first.top) { if (d.grid.firstElementChild !== d.ph) d.grid.insertBefore(d.ph, d.grid.firstElementChild); }
+  else if (d.y > last.bottom) { if (d.grid.lastElementChild !== d.ph) d.grid.appendChild(d.ph); }
+}
+
+function cordDragFinish(cancelled) {
+  const d = _cordDrag;
+  if (!d) return;
+  cancelAnimationFrame(d.raf);
+  try { d.handle.releasePointerCapture(d.pointerId); } catch (e) {}
+  if (cancelled) {
+    const next = d.startOrder[d.startOrder.indexOf(d.courseId) + 1];
+    const ref = next ? d.grid.querySelector(`:scope > .course-card[data-cord-id="${CSS.escape(next)}"]`) : null;
+    d.grid.insertBefore(d.ph, ref);
+  }
+  d.grid.insertBefore(d.card, d.ph);
+  d.ph.remove();
+  d.card.classList.remove('cord-dragging');
+  d.card.style.width = d.card.style.height = d.card.style.left = d.card.style.top = '';
+  document.body.classList.remove('cord-drag-on');
+  _cordDrag = null;
+
+  const vis = cordVisibleIds();
+  const moved = vis.join('|') !== d.startOrder.join('|');
+  if (moved) {
+    _cordFocus = { id: d.courseId, sel: '.cord-grip', at: Date.now() };
+    cordApply(cordMergeVisible(vis));
+    cordFlash(d.courseId);
+  } else if (d.rerender) {
+    renderAdminCourses();
+  }
 }
 
 function renderAdminProfessors() {
@@ -7445,7 +8444,7 @@ function closeCourseEditor() {
   addingStudent = false;
   currentCourseId = null;
   window.currentSelectedCourseId = null;
-  pushHash('#/admin/courses');
+  pushHash(isProfessor(currentUser) ? '#/professor' : '#/admin/courses');
   renderApp();
 }
 function switchEditorTab(tab) { editingTab = tab; renderCourseEditor(editingCourseId); }
@@ -7537,7 +8536,7 @@ function renderEditorDetails(course) {
   return `
     <div class="editor-section">
       <h3 class="editor-section-title"><i class="fas fa-info-circle"></i> Basic Information</h3>
-      <div class="editor-grid-2">
+      <div class="editor-grid-2 admin-only">
         <div class="form-group"><label>Course Name *</label><input type="text" id="edName" value="${escapeHtml(course.name)}"></div>
         <div class="form-group"><label>Course Code *</label><input type="text" id="edCode" value="${escapeHtml(course.code)}"></div>
         <div class="form-group"><label>Subject *</label>
@@ -7565,10 +8564,10 @@ function renderEditorDetails(course) {
         <div class="form-group"><label>Duration</label>
           <input type="text" id="edDuration" value="${escapeHtml(course.duration) || ''}" placeholder="e.g. 12 hours">
         </div>
-        <div class="form-group"><label>Credits (Optional)</label>
+        <div class="form-group admin-only"><label>Credits (Optional)</label>
           <input type="number" id="edCredits" value="${course.credits || 0}" min="0" step="1">
         </div>
-        <div class="form-group"><label>Language (Optional)</label>
+        <div class="form-group admin-only"><label>Language (Optional)</label>
           <input type="text" id="edLanguage" value="${escapeHtml(course.language) || ''}" placeholder="e.g. English">
         </div>
       </div>
@@ -7578,7 +8577,7 @@ function renderEditorDetails(course) {
       <p class="editor-hint">One outcome per line.</p>
       <textarea id="edOutcomes" rows="5" placeholder="Master Newton's laws of motion&#10;Solve JEE-level problems on friction...">${escapeHtml(outcomes)}</textarea>
     </div>
-    <div class="editor-section">
+    <div class="editor-section admin-only">
       <h3 class="editor-section-title"><i class="fas fa-cog"></i> Status & Visibility</h3>
       <div class="editor-grid-3">
         <div class="form-group"><label>Status</label>
@@ -7605,7 +8604,7 @@ function renderEditorDetails(course) {
         <input type="number" id="edPrice" value="${course.price || 0}" min="0" step="1">
       </div>
     </div>
-    <div class="editor-section">
+    <div class="editor-section admin-only">
       <h3 class="editor-section-title"><i class="fas fa-certificate"></i> Certificate</h3>
       <p class="editor-hint">
         When enabled, students who meet the criteria below can download a
@@ -7693,8 +8692,10 @@ function renderEditorMaterials(course) {
     return html;
   }
 
-  /* Same chapter-by-chapter order students see */
-  let idx = 0;
+  /* Same chapter-by-chapter order students see. ⭐ Drag ⋮⋮ (or ↑ ↓) to change
+     the order inside a chapter — every chapter is its own list, and the saved
+     order is all of them one after another (see mordAllIds) */
+  html += renderMaterialOrderHint(mats.length);
   const groups = chapters.map((ch, i) => ({
     label: `${String(i + 1).padStart(2, '0')} · ${ch.title}`, chId: ch.id,
     list: mats.filter(m => String(m.chapterId || '') === ch.id)
@@ -7708,10 +8709,305 @@ function renderEditorMaterials(course) {
         <em>${g.list.length}</em>
         ${g.chId ? `<button type="button" class="acu-ghost" onclick="acOpenUploader('${course.id}', '${g.chId}')"><i class="fas fa-plus"></i> Add</button>` : ''}
       </div>`;
-    g.list.forEach(m => { html += renderMaterialEditorCard(course.id, m, idx++); });
+    html += `<div class="mord-list" data-course-id="${course.id}">`;
+    g.list.forEach((m, i) => { html += renderMaterialEditorCard(course.id, m, i, g.list.length); });
+    html += `</div>`;
   });
   return html;
 }
+/* ============================================================
+   ⭐ MATERIAL ORDER INSIDE A COURSE (2026-10-06)
+   ------------------------------------------------------------
+   Course editor → Materials: every material has a ⋮⋮ handle
+   (drag up / down with mouse, trackpad or touch; or focus it and
+   press ↑ ↓) and ↑ / ↓ buttons. The list changes at once — no
+   reload, so half-typed edits in open cards are kept — the order
+   is saved in the background (PUT …/materials/reorder; quick moves
+   are combined, saves never overlap) and students' course pages
+   re-sort live through the 'courses:material-order' sync event.
+   ============================================================ */
+var _mordDrag = null;
+const _mordSave = new Map();         // courseId → { timer, inflight, pending, saved }
+
+function renderMaterialOrderHint(total) {
+  if (!(total > 1)) return '';
+  return `
+    <div class="mord-hint">
+      <i class="fas fa-arrow-down-short-wide"></i>
+      <span>Drag <i class="fas fa-grip-vertical" aria-hidden="true"></i> or use <b>↑ ↓</b> to change the order students see these materials in.</span>
+      <span class="mord-state" id="mordState" aria-live="polite"></span>
+    </div>`;
+}
+
+function mordCards(list) {
+  return Array.from(list.querySelectorAll(':scope > .material-editor[data-mat-id]'));
+}
+function mordIds(list) {
+  return mordCards(list).map(el => el.getAttribute('data-mat-id'));
+}
+/* every list of the course (one per chapter), in screen order — the order that is saved */
+function mordLists(courseId) {
+  return Array.from(document.querySelectorAll('.mord-list')).filter(l => l.getAttribute('data-course-id') === String(courseId));
+}
+function mordAllIds(courseId) {
+  return mordLists(courseId).reduce((a, l) => a.concat(mordIds(l)), []);
+}
+
+/* #numbers and the first / last arrow states, without a re-render */
+function mordRefresh(list) {
+  const cards = mordCards(list);
+  cards.forEach((el, i) => {
+    const idx = el.querySelector(':scope > summary .me-index');
+    if (idx) idx.textContent = '#' + (i + 1);
+    const up = el.querySelector(':scope > summary [data-mord="up"]');
+    const down = el.querySelector(':scope > summary [data-mord="down"]');
+    if (up) up.disabled = i === 0;
+    if (down) down.disabled = i === cards.length - 1;
+  });
+}
+
+/* Put the course's materials array (in memory) in the given order */
+function mordApplyLocal(courseId, ids) {
+  const c = findCourse(courseId);
+  if (!c || !Array.isArray(c.materials)) return;
+  const key = m => String(m.id || m._id);
+  const byId = new Map(c.materials.map(m => [key(m), m]));
+  const listed = ids.map(id => byId.get(String(id))).filter(Boolean);
+  const set = new Set(ids.map(String));
+  const rest = c.materials.filter(m => !set.has(key(m)));
+  c.materials.splice(0, c.materials.length, ...listed, ...rest);
+}
+
+/* Put the cards on screen in the given order */
+function mordOrderDom(list, ids) {
+  const byId = new Map(mordCards(list).map(el => [el.getAttribute('data-mat-id'), el]));
+  ids.forEach(id => { const el = byId.get(String(id)); if (el) list.appendChild(el); });
+  mordRefresh(list);
+}
+
+function mordFlash(el) {
+  if (!el) return;
+  el.classList.remove('mord-dropped'); void el.offsetWidth;
+  el.classList.add('mord-dropped');
+  setTimeout(() => el.classList.remove('mord-dropped'), 800);
+}
+
+/* Called after every change on screen */
+function mordChanged(courseId, list, beforeIds) {
+  const ids = mordAllIds(courseId);
+  if (ids.join('|') === beforeIds.join('|')) return;
+  mordRefresh(list);
+  let st = _mordSave.get(courseId);
+  if (!st) { st = { timer: 0, inflight: false, pending: null, saved: null }; _mordSave.set(courseId, st); }
+  if (!st.saved) st.saved = beforeIds.slice();          // last order known to be in the database
+  mordApplyLocal(courseId, ids);
+  st.pending = ids;
+  mordState('saving');
+  clearTimeout(st.timer);
+  st.timer = setTimeout(() => mordFlush(courseId), 300);
+}
+
+/* ↑ / ↓ buttons and the handle's arrow keys. The NEIGHBOUR card is
+   moved, so the focused button / handle never loses focus. */
+function mordMove(courseId, matId, dir) {
+  if (_mordDrag) return;
+  const el = document.querySelector(`.mord-list > .material-editor[data-mat-id="${CSS.escape(String(matId))}"]`);
+  const list = el && el.parentElement;
+  if (!list) return;
+  const before = mordAllIds(courseId);
+  const cards = mordCards(list);
+  const i = cards.indexOf(el);
+  const other = cards[i + dir];
+  if (!other) return;
+  if (dir < 0) list.insertBefore(other, el.nextSibling);
+  else list.insertBefore(other, el);
+  mordChanged(courseId, list, before);
+  mordFlash(el);
+  /* a button that just became disabled can't keep focus → use its twin */
+  const ae = document.activeElement;
+  if (ae && ae.classList && ae.classList.contains('mord-btn') && ae.disabled) {
+    const twin = el.querySelector(`:scope > summary [data-mord="${dir < 0 ? 'down' : 'up'}"]`);
+    if (twin) twin.focus();
+  }
+  const r = el.getBoundingClientRect();
+  if (r.top < 70 || r.bottom > window.innerHeight) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function mordGripKey(e, courseId, matId) {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); return; }
+  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+  e.preventDefault(); e.stopPropagation();
+  mordMove(courseId, matId, e.key === 'ArrowUp' ? -1 : 1);
+}
+
+/* ---------- saving: debounced, one request at a time per course ---------- */
+async function mordFlush(courseId) {
+  const st = _mordSave.get(courseId);
+  if (!st || st.inflight || !st.pending) return;
+  const ids = st.pending;
+  st.pending = null;
+  st.inflight = true;
+  window.__aeroCourseOrderSelfAt = Date.now();      // ignore the echo of our own change
+  let ok = false, data = null, msg = '';
+  try {
+    const res = await fetch(`${API_BASE}/courses/${encodeURIComponent(courseId)}/materials/reorder`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order: ids })
+    });
+    try { data = await res.json(); } catch (e) {}
+    ok = res.ok && data && data.success === true;
+    if (!ok) msg = (data && data.message) || ('Could not save the new order (HTTP ' + res.status + '). Please try again.');
+  } catch (e) {
+    msg = 'Could not save the new order — check your internet connection and try again.';
+  } finally {
+    window.__aeroCourseOrderSelfAt = Date.now();
+    st.inflight = false;
+  }
+  if (st.pending) { mordFlush(courseId); return; }   // a newer order is waiting
+  const lists = mordLists(courseId);
+  if (ok) {
+    st.saved = Array.isArray(data.order) && data.order.length ? data.order.slice() : ids.slice();
+    mordState('saved');
+  } else {
+    /* go back to the order the database really has */
+    if (st.saved) {
+      mordApplyLocal(courseId, st.saved);
+      lists.forEach(l => mordOrderDom(l, st.saved));
+    }
+    mordState('error');
+    showToast(msg, 'error');
+  }
+}
+
+function mordState(state) {
+  const el = document.getElementById('mordState');
+  if (!el) return;
+  clearTimeout(el._t);
+  if (state === 'saving') { el.className = 'mord-state run'; el.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…'; }
+  else if (state === 'saved') {
+    el.className = 'mord-state ok'; el.innerHTML = '<i class="fas fa-circle-check"></i> Order saved';
+    el._t = setTimeout(() => { el.className = 'mord-state'; el.innerHTML = ''; }, 2500);
+  } else if (state === 'error') { el.className = 'mord-state err'; el.innerHTML = '<i class="fas fa-triangle-exclamation"></i> Not saved'; }
+  else { el.className = 'mord-state'; el.innerHTML = ''; }
+}
+
+/* ---------- drag & drop (pointer events: mouse, pen, touch) ---------- */
+function mordDragStart(e, courseId, matId) {
+  if (_mordDrag) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const handle = e.currentTarget;
+  const card = handle && handle.closest('.material-editor');
+  const list = card && card.parentElement;
+  if (!card || !list || !list.classList.contains('mord-list')) return;
+  const startOrder = mordIds(list), startAll = mordAllIds(courseId);
+  if (startOrder.length < 2) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  /* an open card is tall — fold it while it moves */
+  const wasOpen = card.open;
+  if (wasOpen) card.open = false;
+
+  const rect = card.getBoundingClientRect();
+  const ph = document.createElement('div');
+  ph.className = 'mord-ph';
+  ph.style.height = rect.height + 'px';
+  list.insertBefore(ph, card);
+
+  card.classList.add('mord-dragging');
+  card.style.width = rect.width + 'px';
+  card.style.left = rect.left + 'px';
+  card.style.top = rect.top + 'px';
+  document.body.classList.add('mord-drag-on');
+  try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+
+  _mordDrag = { courseId: String(courseId), matId: String(matId), card, list, ph, handle, wasOpen, startOrder,
+                startAll, offY: e.clientY - rect.top, y: e.clientY, raf: 0, pointerId: e.pointerId };
+
+  const onMove = (ev) => {
+    if (!_mordDrag || ev.pointerId !== _mordDrag.pointerId) return;
+    ev.preventDefault();
+    _mordDrag.y = ev.clientY;
+    mordDragPlace();
+  };
+  const onUp = (ev) => {
+    if (!_mordDrag || (ev && ev.pointerId !== undefined && ev.pointerId !== _mordDrag.pointerId)) return;
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointercancel', onUp);
+    window.removeEventListener('keydown', onEsc, true);
+    mordDragFinish(!!(ev && ev.cancelled));
+  };
+  const onEsc = (ev) => {
+    if (ev.key !== 'Escape' || !_mordDrag) return;
+    ev.preventDefault(); ev.stopPropagation();
+    onUp({ cancelled: true });
+  };
+  window.addEventListener('pointermove', onMove, { passive: false });
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointercancel', onUp);
+  window.addEventListener('keydown', onEsc, true);
+
+  const tick = () => {
+    if (!_mordDrag) return;
+    const edge = 90, y = _mordDrag.y, h = window.innerHeight;
+    let dy = 0;
+    if (y < edge) dy = -Math.ceil((edge - y) / 5);
+    else if (y > h - edge) dy = Math.ceil((y - (h - edge)) / 5);
+    if (dy) { window.scrollBy(0, dy); mordDragPlace(); }
+    _mordDrag.raf = requestAnimationFrame(tick);
+  };
+  _mordDrag.raf = requestAnimationFrame(tick);
+}
+
+function mordDragPlace() {
+  const d = _mordDrag;
+  if (!d) return;
+  d.card.style.top = (d.y - d.offY) + 'px';
+  const cards = mordCards(d.list).filter(c => c !== d.card);
+  let before = null;
+  for (const c of cards) {
+    const r = c.getBoundingClientRect();
+    if (d.y < r.top + r.height / 2) { before = c; break; }
+  }
+  if (before) { if (d.ph.nextSibling !== before) d.list.insertBefore(d.ph, before); }
+  else if (d.list.lastElementChild !== d.ph) d.list.appendChild(d.ph);
+  /* live numbers while dragging */
+  let n = 0;
+  Array.from(d.list.children).forEach(el => {
+    if (el === d.card) return;
+    const target = el === d.ph ? d.card : (el.classList.contains('material-editor') ? el : null);
+    if (!target) return;
+    n++;
+    const idx = target.querySelector(':scope > summary .me-index');
+    if (idx) idx.textContent = '#' + n;
+  });
+}
+
+function mordDragFinish(cancelled) {
+  const d = _mordDrag;
+  if (!d) return;
+  cancelAnimationFrame(d.raf);
+  try { d.handle.releasePointerCapture(d.pointerId); } catch (e) {}
+  if (cancelled) {
+    const next = d.startOrder[d.startOrder.indexOf(d.matId) + 1];
+    const ref = next ? d.list.querySelector(`:scope > .material-editor[data-mat-id="${CSS.escape(next)}"]`) : null;
+    d.list.insertBefore(d.ph, ref);
+  }
+  d.list.insertBefore(d.card, d.ph);
+  d.ph.remove();
+  d.card.classList.remove('mord-dragging');
+  d.card.style.width = d.card.style.left = d.card.style.top = '';
+  if (d.wasOpen) d.card.open = true;
+  document.body.classList.remove('mord-drag-on');
+  _mordDrag = null;
+  mordRefresh(d.list);
+  mordChanged(d.courseId, d.list, d.startAll);
+  if (mordIds(d.list).join('|') !== d.startOrder.join('|')) mordFlash(d.card);
+  try { d.handle.focus({ preventScroll: true }); } catch (e) {}
+}
+
 /* ============================================================
    COURSE EDITOR — "Quizzes" tab
    Lists every material with its quiz status + prominent buttons
@@ -7821,15 +9117,34 @@ function renderEditorQuizzes(course) {
   return html;
 }
 
-function renderMaterialEditorCard(courseId, m, idx) {
+function renderMaterialEditorCard(courseId, m, idx, total) {
   const quizCount = m.quizCount !== undefined ? m.quizCount : (m.quiz || []).length;
   const customId = 'meCustom-' + m.id;
   const isCustom = !isKnownMaterialType(m.type);
+  /* ⭐ order controls — only when the card is part of the course list */
+  const ordered = Number.isFinite(total) && total > 1;
+  const grip = ordered ? `
+          <button type="button" class="mord-grip" title="Drag to move (or focus and use ↑ ↓)"
+                  aria-label="Move ${escapeHtml(m.title)} — drag, or use the arrow keys"
+                  onpointerdown="mordDragStart(event, '${courseId}', '${m.id}')"
+                  onkeydown="mordGripKey(event, '${courseId}', '${m.id}')"
+                  onclick="event.preventDefault(); event.stopPropagation();">
+            <i class="fas fa-grip-vertical"></i>
+          </button>` : '';
+  const arrows = ordered ? `
+          <span class="mord-arrows">
+            <button type="button" class="mord-btn" data-mord="up" title="Move up" aria-label="Move ${escapeHtml(m.title)} up"
+                    onclick="event.preventDefault(); event.stopPropagation(); mordMove('${courseId}', '${m.id}', -1)" ${idx === 0 ? 'disabled' : ''}>
+              <i class="fas fa-arrow-up"></i></button>
+            <button type="button" class="mord-btn" data-mord="down" title="Move down" aria-label="Move ${escapeHtml(m.title)} down"
+                    onclick="event.preventDefault(); event.stopPropagation(); mordMove('${courseId}', '${m.id}', 1)" ${idx === total - 1 ? 'disabled' : ''}>
+              <i class="fas fa-arrow-down"></i></button>
+          </span>` : '';
 
   return `
     <details class="material-editor" data-mat-id="${m.id}">
       <summary>
-        <div class="me-summary-left">
+        <div class="me-summary-left">${grip}
           <span class="me-index">#${idx + 1}</span>
           <span class="mat-type ${materialTypeSlug(m.type)}">${escapeHtml(String(m.type || 'other').toUpperCase())}</span>
           <strong>${escapeHtml(m.title)}</strong>
@@ -7838,7 +9153,7 @@ function renderMaterialEditorCard(courseId, m, idx) {
             ? `<span class="mat-quiz-badge"><i class="fas fa-file-pen"></i> ${quizCount} question${quizCount === 1 ? '' : 's'}</span>`
             : `<span class="mat-quiz-badge empty"><i class="fas fa-file-circle-plus"></i> No paper</span>`}
         </div>
-        <div class="me-summary-right" style="gap:8px;">
+        <div class="me-summary-right" style="gap:8px;">${arrows}
           <button type="button"
                   class="btn btn-sm ${quizCount > 0 ? 'btn-warning' : 'btn-success'}"
                   onclick="event.preventDefault(); event.stopPropagation(); openQuizEditor('${courseId}', '${m.id}');"
@@ -7865,7 +9180,7 @@ function renderMaterialEditorCard(courseId, m, idx) {
         </div>
         <div class="form-group"><label>Description</label><textarea class="me-desc" rows="2">${escapeHtml(m.description) || ''}</textarea></div>
         <div class="form-group"><label>Link</label><input type="text" class="me-url" value="${escapeHtml(m.url) || ''}"></div>
-        <div class="editor-grid-2">
+        <div class="editor-grid-2 admin-only">
           <div class="form-group"><label>Access</label>
             <label class="toggle-box pro" style="margin-top:6px;">
               <input type="checkbox" class="me-premium" ${m.isPremium ? 'checked' : ''}>
@@ -7874,7 +9189,7 @@ function renderMaterialEditorCard(courseId, m, idx) {
           </div>
           <div class="form-group"><label>Price (₹)</label><input type="number" class="me-price" value="${m.price || 0}" min="0" step="1"></div>
         </div>
-        <div class="editor-grid-2">
+        <div class="editor-grid-2 admin-only">
           <div class="form-group">
             <label><i class="fas fa-eye"></i> Free Preview Percentage</label>
             <input type="number" class="me-preview" value="${m.previewPercent || 0}" min="0" max="100" step="1">
@@ -8656,6 +9971,11 @@ function getInitials(name) {
 function renderOwnerProfile() {
   const container = document.getElementById('ownerProfileContainer');
   if (!container) return;
+  /* ⭐ the whole "About the Founder" card stays hidden until the admin's
+     founder details have arrived — and stays hidden if there are none */
+  const sec = document.getElementById('aboutOwnerSection');
+  const hasFounder = _ownerProfileLoaded && !!(liveOwnerProfile && liveOwnerProfile.name) && liveOwnerProfile.visible !== false;
+  if (sec) sec.style.display = hasFounder ? '' : 'none';
 
   // 1. Agar data abhi load nahi hua hai, toh container ko khaali rakho.
   // Isse koi bhi static ya fake text flash nahi hoga.
@@ -9041,11 +10361,7 @@ async function startSubscriptionCheckout() {
       subscription_id: data.subscriptionId,
       name: 'RankerNode',
       description: data.title + ' — ₹' + data.amount + '/month',
-      prefill: {
-        name: currentUser.fullName || currentUser.username,
-        email: currentUser.email || 'student@rankernode.example',
-        contact: '9999999999'
-      },
+      prefill: premiumPrefill(),   // ⭐ only real details — a made-up email/phone sent the receipt nowhere
       theme: { color: '#4f46e5' },
       handler: async function (response) {
         showToast('Verifying subscription…', 'info');
@@ -9091,7 +10407,7 @@ async function startSubscriptionCheckout() {
    Step 2: submitCancelOtp()    → verify the code and finalize
    Step 3: closeCancelSubscriptionModal() → safe exit, no cancel
    ============================================================ */
-async function cancelSubscription() {
+async function cancelSubscription(confirmed) {
   if (!currentUser || !currentUser._id) {
     return showToast('Please log in first.', 'error');
   }
@@ -9099,7 +10415,8 @@ async function cancelSubscription() {
     return showToast('You do not have an active subscription.', 'info');
   }
 
-  const proceed = confirm(
+  /* ⭐ the Premium hub asks first in-page (confirm() does not work inside the Android app) */
+  const proceed = confirmed === true || confirm(
     'To prevent accidental cancellation, we will send a 6-digit verification code to your registered email.\n\n' +
     'Your subscription will only be cancelled AFTER you enter the correct code.\n\n' +
     'Continue?'
@@ -9175,7 +10492,7 @@ async function submitCancelOtp() {
       currentUser = data.user;
       saveSessionUser(currentUser);
       closeModal('cancelSubscriptionModal');
-      showToast('✅ Subscription cancelled. Access remains until the end of your billing period.', 'success');
+      showToast('✅ ' + (data.message || 'Auto-pay cancelled. Premium stays active until your end date.'), 'success');
       renderApp();
     } else {
       showToast(data.message || 'Verification failed.', 'error');
@@ -9287,11 +10604,8 @@ function renderStudentCourses() {
     return true;
   });
 
-  filtered.sort((a, b) => {
-    if (a.featured && !b.featured) return -1;
-    if (!a.featured && b.featured) return 1;
-    return (a.name || '').localeCompare(b.name || '');
-  });
+  /* ⭐ The admin's course order (featured, then A–Z until it is set) */
+  filtered.sort(courseDisplayCompare);
 
   /* Subject groups in the category's own order, then anything else */
   const subjects = (cat.subjects || []).slice();
@@ -9299,7 +10613,7 @@ function renderStudentCourses() {
   filtered.forEach(c => { counts[c.subject || ''] = (counts[c.subject || ''] || 0) + 1; });
   if (_acSubjectFilter && !subjects.some(x => x.key === _acSubjectFilter)) _acSubjectFilter = '';
 
-  let html = acSubjectTabsHTML(cat, counts);
+  let html = aeroGuestBannerHTML('catalog') + acSubjectTabsHTML(cat, counts);
 
   const groups = [];
   subjects.forEach(sub => groups.push({ key: sub.key, name: sub.name, list: filtered.filter(c => c.subject === sub.key) }));
@@ -9385,7 +10699,7 @@ function renderStudentCourseCard(c) {
       <div class="course-chips">
         ${c.difficulty ? `<span class="chip" style="background:${diff.bg};color:${diff.fg};"><i class="fas fa-signal"></i> ${c.difficulty}</span>` : ''}
         ${c.duration ? `<span class="chip"><i class="fas fa-clock"></i> ${escapeHtml(c.duration)}</span>` : ''}
-        ${c.isPremium ? `<span class="chip gold"><i class="fas fa-rupee-sign"></i> ${c.price || 0}</span>` : `<span class="chip green"><i class="fas fa-gift"></i> Free</span>`}
+        ${c.isPremium ? (AERO_PLAY_STORE ? `<span class="chip gold"><i class="fas fa-crown"></i> Premium</span>` : `<span class="chip gold"><i class="fas fa-rupee-sign"></i> ${c.price || 0}</span>`) : `<span class="chip green"><i class="fas fa-gift"></i> Free</span>`}
         ${acCourseChipsHTML(c)}
       </div>
       <p class="course-desc">${escapeHtml(c.description) || ''}</p>
@@ -9540,6 +10854,8 @@ function renderCourseDetail(courseId) {
     </div>
   `;
 
+  html += aeroGuestBannerHTML('course');      // ⭐ visitors only (empty for signed-in users)
+
   if (course.learningOutcomes && course.learningOutcomes.length > 0) {
     html += `<div class="learning-outcomes">
       <h3><i class="fas fa-bullseye"></i> What you'll learn</h3>
@@ -9558,7 +10874,7 @@ function renderCourseDetail(courseId) {
     </div>`;
   }
 
-  if (isPremiumCourse && currentUser.role === 'student' && !isPurchased && !isSubscribed) {
+  if (isPremiumCourse && (currentUser && currentUser.role) === 'student' && !isPurchased && !isSubscribed) {
     html += `<div class="premium-notice">
       <div><i class="fas fa-info-circle"></i> Premium materials locked.</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -9567,7 +10883,7 @@ function renderCourseDetail(courseId) {
     </div>`;
   }
 
-  if (liveSubscriptionSettings.enabled && currentUser.role === 'student' && !isSubscribed) {
+  if (liveSubscriptionSettings.enabled && (currentUser && currentUser.role) === 'student' && !isSubscribed) {
     html += `<div class="subscribe-cta">
       <div class="subscribe-cta-text">
         <i class="fas fa-repeat"></i>
@@ -9579,7 +10895,7 @@ function renderCourseDetail(courseId) {
     </div>`;
   }
 
-  if (currentUser.role === 'student') {
+  if ((currentUser && currentUser.role) === 'student') {
     const canAccess = !isPremiumCourse || isPurchased;
     const certEnabled = !!(course.certificate && course.certificate.enabled);
 
@@ -9640,8 +10956,10 @@ function renderCourseDetail(courseId) {
     .sort()
     .forEach(t => types.push(t));
 
-  /* Q&A always shown last (uses doubts, not materials) */
-  if ((course.doubts || []).length > 0) types.push('qa');
+  /* Q&A always shown last (uses doubts, not materials).
+     ⭐ 2026-10-11 — shown even before the first doubt, otherwise nobody
+     could ever ask the first one */
+  if (currentUser) types.push('qa');
 
   /* Labels */
   const typeLabels = {
@@ -9686,6 +11004,7 @@ function renderCourseDetail(courseId) {
   if (currentMaterialFilter === 'qa') {
     html += renderQASection(course);
     $('courseDetailContent').innerHTML = html;
+    try { renderMathIn($('courseDetailContent').querySelector('.qa-section')); } catch (_) {}
     return;
   }
 
@@ -9703,6 +11022,10 @@ function renderCourseDetail(courseId) {
 
   // ⭐ Hydrate cached PDF thumbnails on the newly-rendered cards
   setTimeout(() => hydrateMaterialThumbs(), 30);
+  // ⭐ A re-render during an open must not wipe the "Opening…" state
+  try { AeroOpening.reapply(); } catch (_) {}
+  // ⚡ Get the PDF engine ready while the student is still choosing
+  try { aeroIdleWarmPdfEngine(filtered); } catch (_) {}
 }
 
 function renderMaterialCard(course, m, isPurchased) {
@@ -9735,8 +11058,11 @@ function renderMaterialCard(course, m, isPurchased) {
 
   const courseLocked   = isCoursePremium && !isPurchased    && !isSubscribed;
   const materialLocked = isMatPremium    && !isMatPurchased && !isSubscribed;
-  const isLocked       = !isAdminUser && (courseLocked || materialLocked);
+  const isLocked       = !isAdminUser && !profCanEdit(course.id) && (courseLocked || materialLocked);
   const canAccess      = !isLocked;
+  /* ⭐ Visitor browsing the catalog without an account: every lesson is
+     listed but locked — clicking it asks them to register / sign in. */
+  const isGuestView    = !currentUser;
 
   const viewed    = isMaterialViewed(course.id, m.id);
   const quizCount = m.quizCount !== undefined ? m.quizCount : (m.quiz || []).length;
@@ -9755,7 +11081,7 @@ function renderMaterialCard(course, m, isPurchased) {
     if (cachedThumb) {
       thumbHtml = `<div class="material-thumb has-thumb" data-material-id="${m.id}">
         <img src="${cachedThumb}" alt="" loading="lazy" decoding="async">
-        ${isLocked ? '<div class="material-thumb-lock"><i class="fas fa-lock"></i></div>' : ''}
+        ${(isLocked || isGuestView) ? '<div class="material-thumb-lock"><i class="fas fa-lock"></i></div>' : ''}
       </div>`;
     } else {
       thumbHtml = `<div class="material-thumb" data-material-id="${m.id}"
@@ -9764,7 +11090,7 @@ function renderMaterialCard(course, m, isPurchased) {
           <i class="fas fa-file-pdf"></i>
           <span>${escapeHtml(String(m.type || 'PDF').toUpperCase())}</span>
         </div>
-        ${isLocked ? '<div class="material-thumb-lock"><i class="fas fa-lock"></i></div>' : ''}
+        ${(isLocked || isGuestView) ? '<div class="material-thumb-lock"><i class="fas fa-lock"></i></div>' : ''}
       </div>`;
     }
   }
@@ -9823,8 +11149,15 @@ function renderMaterialCard(course, m, isPurchased) {
     }
   }
 
+  if (isGuestView) {
+    fileActionHtml = `<button class="btn btn-primary btn-sm guest-open-btn"
+                        onclick="event.stopPropagation();aeroGuestGate('${course.id}', '${m.id}')">
+                        <i class="fas fa-lock"></i> Register free to open
+                      </button>`;
+  }
+
   let progressBtnHtml = '';
-  if (currentUser.role === 'student' && canAccess) {
+  if ((currentUser && currentUser.role) === 'student' && canAccess) {
     progressBtnHtml = `<button class="btn ${viewed ? 'btn-success' : 'btn-outline'} btn-sm"
                         onclick="event.stopPropagation();toggleMaterialViewed(event, '${course.id}', '${m.id}')">
                         <i class="fas ${viewed ? 'fa-check-circle' : 'fa-circle'}"></i>
@@ -9836,7 +11169,8 @@ function renderMaterialCard(course, m, isPurchased) {
 
       /* ⭐ Attempt-limit math — computed locally from data we
          already have, so no extra network call is needed. */
-      const cap       = Math.max(0, Number(cfg.maxAttempts) || 0);
+      const baseCap   = Math.max(0, Number(cfg.maxAttempts) || 0);
+      const cap       = baseCap > 0 ? baseCap + Math.max(0, Number(qr.extraAttempts) || 0) : 0;   // + attempts granted by the instructor
       const attempts  = Number(qr.attempts) || 0;
       const unlimited = (cap === 0);
       const exhausted = (!unlimited && attempts >= cap);
@@ -9870,6 +11204,18 @@ function renderMaterialCard(course, m, isPurchased) {
       } else {
         quizLabel = `<i class="fas fa-question-circle"></i> Take Quiz (${quizCount})${attemptBadge}`;
       }
+      /* ⭐ 2026-10-11 — assignments read as homework, with their due date */
+      if (cfg.kind === 'assignment' && !quizDisabled) {
+        const dueMs = cfg.dueAt ? new Date(cfg.dueAt).getTime() : null;
+        const dueTxt = dueMs ? new Date(dueMs).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+        if (dueMs && Date.now() > dueMs && cfg.allowLate === false && !(attempts > 0)) {
+          quizLabel = `<i class="fas fa-lock"></i> Assignment closed`; quizDisabled = true; quizTitle = 'The due date has passed.';
+        } else if (attempts > 0) {
+          quizLabel = `<i class="fas fa-book-open-reader"></i> Resubmit assignment${attemptBadge}`;
+        } else {
+          quizLabel = `<i class="fas fa-book-open-reader"></i> Open assignment${dueTxt ? ` · due ${dueTxt}` : ''}${dueMs && Date.now() > dueMs ? ' (late)' : ''}`;
+        }
+      }
 
       if (quizDisabled) {
         progressBtnHtml += ` <button class="btn btn-outline btn-sm" disabled
@@ -9880,6 +11226,13 @@ function renderMaterialCard(course, m, isPurchased) {
         progressBtnHtml += ` <button class="btn btn-accent btn-sm"
                               onclick="event.stopPropagation();openQuizPlayer('${course.id}', '${m.id}')">
                               ${quizLabel}
+                            </button>`;
+      }
+      /* ⭐ the student's own result — marks, grading of uploaded answers, feedback */
+      if (attempts > 0) {
+        progressBtnHtml += ` <button class="btn btn-outline btn-sm"
+                              onclick="event.stopPropagation();openMyQuizResult('${course.id}', '${m.id}')">
+                              <i class="fas fa-square-poll-vertical"></i> My result
                             </button>`;
       }
     }
@@ -9895,7 +11248,7 @@ function renderMaterialCard(course, m, isPurchased) {
     if (isAdminUser || isSubscribed || isMatPurchased) {
       badgeHtml = `<span class="mat-badge unlocked"><i class="fas fa-unlock"></i> UNLOCKED</span>`;
     } else {
-      badgeHtml = `<span class="mat-badge premium"><i class="fas fa-crown"></i> PRO (₹${matPrice})</span>`;
+      badgeHtml = `<span class="mat-badge premium"><i class="fas fa-crown"></i> PRO${AERO_PLAY_STORE ? '' : ` (₹${matPrice})`}</span>`;
     }
   } else {
     badgeHtml = `<span class="mat-badge free">FREE</span>`;
@@ -9905,8 +11258,29 @@ function renderMaterialCard(course, m, isPurchased) {
     ? `<span class="mat-quiz-badge"><i class="fas fa-question-circle"></i> ${quizCount}</span>`
     : '';
 
+  /* ⭐ Whole-card click (2026-10-07): the card does exactly what its
+     main button does — Read / Watch / Preview / Unlock. Inner buttons
+     keep their own actions (they all call event.stopPropagation()). */
+  let cardAction;
+  if (isGuestView) cardAction = 'guest';
+  else if (isLocked) {
+    const _pp = Math.max(0, Math.min(100, Number(m.previewPercent) || 0));
+    cardAction = (!isCoursePremium && _pp > 0) ? 'preview'
+               : (isCoursePremium ? 'buy-course' : 'buy-material');
+  } else if (m.type === 'video' && hasUrl && !hasFile) cardAction = 'video';
+  else cardAction = 'read';
+  const cardHint = { read: 'Open', video: 'Watch', preview: 'Preview',
+                     'buy-course': AERO_PLAY_STORE ? 'Locked' : 'Unlock', 'buy-material': AERO_PLAY_STORE ? 'Locked' : 'Unlock', guest: 'Open' }[cardAction];
+  const cardHintIcon = { read: 'fa-book-open', video: 'fa-play', preview: 'fa-eye',
+                         'buy-course': 'fa-lock', 'buy-material': 'fa-lock', guest: 'fa-lock' }[cardAction];
+  if (thumbHtml) {
+    thumbHtml = thumbHtml.replace(/<\/div>\s*$/, `<span class="mat-open-hint" aria-hidden="true"><i class="fas ${cardHintIcon}"></i> ${cardHint}</span></div>`);
+  }
+
   return `
-    <div class="material-item ${isLocked ? 'locked-mat' : ''}">
+    <div class="material-item mat-clickable ${isLocked ? 'locked-mat' : ''}${isGuestView ? ' guest-locked' : ''}"${isGuestView ? ` data-gmid="${m.id}"` : ''}
+         data-mid="${m.id}" data-cid="${course.id}" data-card-action="${cardAction}"
+         onclick="aeroMaterialCardClick(event, '${course.id}', '${m.id}', '${cardAction}')">
       ${thumbHtml}
       <div class="mat-head">
         <div class="mat-type ${materialTypeSlug(m.type)}">${escapeHtml(String(m.type || 'other').toUpperCase())}</div>
@@ -9915,24 +11289,37 @@ function renderMaterialCard(course, m, isPurchased) {
       </div>
       <h4>${escapeHtml(m.title)}</h4>
       <div class="mat-desc">${escapeHtml(m.description) || ''}</div>
-      ${(m.type === 'video' && canAccess && currentUser.role === 'student') ? videoProgressStripHtml(m.id) : ''}
-      <div class="mat-actions">${fileActionHtml}${progressBtnHtml}${isAdminUser ? `<button class="btn btn-outline btn-sm" onclick="event.stopPropagation();openMaterialViewers('${course.id}', '${m.id}', ${jsStr(m.title || '')})" title="Who opened this material (invisible access log)"><i class="fas fa-users-viewfinder"></i> Viewers</button>` : ''}</div>
+      ${(m.type === 'video' && canAccess && (currentUser && currentUser.role) === 'student') ? videoProgressStripHtml(m.id) : ''}
+      <div class="mat-actions">${fileActionHtml}${progressBtnHtml}${(currentUser && currentUser.role) === 'student' && canAccess ? `<button class="btn btn-outline btn-sm mat-ask-btn" onclick="event.stopPropagation();askAboutMaterial('${course.id}', '${m.id}')" title="Ask a doubt about this"><i class="fas fa-circle-question"></i> <span>Ask doubt</span></button>` : ''}${isAdminUser ? `<button class="btn btn-outline btn-sm" onclick="event.stopPropagation();openMaterialViewers('${course.id}', '${m.id}', ${jsStr(m.title || '')})" title="Who opened this material (invisible access log)"><i class="fas fa-users-viewfinder"></i> Viewers</button>` : ''}</div>
     </div>
   `;
 }
 
 function renderQASection(course) {
-  const doubts = [...(course.doubts || [])];
+  /* ⭐ 2026-10-11 — votes, material links, sort / filter, professors answer too */
+  const me = currentUser ? currentUser.username : '';
+  const role = String((currentUser && currentUser.role) || '').toLowerCase();
+  const sortKey = (window._qaSort && window._qaSort[course.id]) || 'top';
+  const all = [...(course.doubts || [])];
+  const mats = (course.materials || []).filter(m => m && m.title);
+  const pre = (window._qaAskMaterial && window._qaAskMaterial.courseId === course.id) ? window._qaAskMaterial.materialId : '';
+
   let html = `<div class="qa-section"><h3><i class="fas fa-comments"></i> Course Q&A / Doubts</h3>`;
 
-  if (currentUser.role === 'student') {
+  if (role === 'student') {
     html += `<div class="qa-ask-box">
-      <label>Ask a New Doubt</label>
-      <textarea id="newDoubtText" placeholder="Type your doubt here..."></textarea>
+      <label for="newDoubtText">Ask a new doubt</label>
+      <div class="qa-ask-about">
+        <span><i class="fas fa-link"></i> About</span>
+        <select id="newDoubtMaterial">
+          <option value="">The course in general</option>
+          ${mats.map(m => `<option value="${escapeHtml(m.id)}" ${pre === m.id ? 'selected' : ''}>${escapeHtml(m.title)}</option>`).join('')}
+        </select>
+      </div>
+      <textarea id="newDoubtText" placeholder="Type your doubt here… LaTeX works: $v = \\sqrt{2gh}$"></textarea>
       <button class="btn btn-primary" onclick="askDoubt('${course.id}')"><i class="fas fa-paper-plane"></i> Submit Doubt</button>
     </div>`;
 
-    // ====== AI DOUBT SOLVER BOX ======
     html += `<div class="ai-doubt-box">
       <div class="ai-doubt-header">
         <div class="ai-doubt-icon"><i class="fas fa-robot"></i></div>
@@ -9941,7 +11328,7 @@ function renderQASection(course) {
           <p>Get an instant answer while you wait for a human reply</p>
         </div>
       </div>
-      <textarea id="aiDoubtInput-${course.id}" 
+      <textarea id="aiDoubtInput-${course.id}"
                 placeholder="e.g. Explain Bernoulli's equation with an example…"
                 rows="3"></textarea>
       <div class="ai-doubt-actions">
@@ -9954,79 +11341,125 @@ function renderQASection(course) {
       </div>
       <div class="ai-doubt-answer" id="aiDoubtAnswer-${course.id}" style="display:none;"></div>
     </div>`;
-    // ====== END AI BOX ======
-}
-
-  if (doubts.length === 0) {
-    html += `<div class="empty-state" style="padding:20px;"><i class="fas fa-check-circle"></i><p>No doubts asked yet.</p></div>`;
-  } else {
-    doubts.sort((a, b) => {
-      const aHas = hasAnyAnswer(a); const bHas = hasAnyAnswer(b);
-      if (!aHas && bHas) return -1;
-      if (aHas && !bHas) return 1;
-      return new Date(b.date) - new Date(a.date);
-    });
-
-    doubts.forEach(d => {
-      const answered = hasAnyAnswer(d);
-      const statusBadge = answered ? `<span class="qa-status solved">ANSWERED</span>` : `<span class="qa-status pending">OPEN</span>`;
-      const dateText = d.date ? new Date(d.date).toLocaleDateString() : 'Recent';
-      const emailText = d.studentEmail ? escapeHtml(d.studentEmail) : '';
-      const usernameText = d.studentUsername ? `@${escapeHtml(d.studentUsername)}` : '';
-      const isAsker = d.studentUsername === currentUser.username;
-      const isAdminUser = isAdmin(currentUser);
-      const canReply = isAdminUser || currentUser.role === 'student';
-
-      const replies = d.replies || [];
-      let repliesHtml = '';
-      if (replies.length > 0) {
-        repliesHtml = `<div class="qa-replies">`;
-        replies.forEach(r => {
-          const rDate = r.date ? new Date(r.date).toLocaleDateString() : '';
-          const isAdminReply = r.authorRole === 'admin';
-          const canAccept = (isAsker || isAdmin) && !r.isAccepted;
-          repliesHtml += `<div class="qa-reply ${isAdminReply ? 'admin-reply' : ''} ${r.isAccepted ? 'accepted' : ''}">
-            <div class="qa-reply-head">
-              <strong><i class="fas ${isAdminReply ? 'fa-user-shield' : 'fa-user-circle'}"></i> ${escapeHtml(r.authorName || r.authorUsername)}</strong>
-              ${isAdminReply ? '<span class="qa-reply-tag">Instructor</span>' : ''}
-              ${r.isAccepted ? '<span class="qa-reply-tag accepted-tag"><i class="fas fa-check-circle"></i> Accepted</span>' : ''}
-              <span class="qa-reply-date">${rDate}</span>
-            </div>
-            <div class="qa-reply-text">${escapeHtml(r.text)}</div>
-            ${canAccept ? `<button class="qa-accept-btn" onclick="acceptReply('${course.id}', '${d._id}', '${r._id}')"><i class="fas fa-check"></i> Accept</button>` : ''}
-          </div>`;
-        });
-        repliesHtml += `</div>`;
-      }
-
-      const legacyAnswerHtml = (!replies.length && d.answer)
-        ? `<div class="qa-answer"><i class="fas fa-chalkboard-teacher"></i> <strong>Admin:</strong> ${escapeHtml(d.answer)}</div>` : '';
-
-      const replyFormHtml = canReply ? `
-        <div class="qa-reply-form" id="replyForm-${d._id}">
-          <textarea id="replyText-${d._id}" placeholder="${isAdmin ? 'Write an official answer...' : 'Share what you know...'}"></textarea>
-          <button class="btn ${isAdmin ? 'btn-success' : 'btn-primary'} btn-sm" onclick="postReply('${course.id}', '${d._id}')">
-            <i class="fas fa-reply"></i> ${isAdmin ? 'Post Answer' : 'Post Reply'}
-          </button>
-        </div>` : '';
-
-      html += `<div class="qa-item ${answered ? 'solved' : 'pending'}">
-        <div class="qa-head">
-          <div>
-            <strong><i class="fas fa-user-circle"></i> ${escapeHtml(d.studentName)} <span class="qa-username">${usernameText}</span></strong>
-            ${(isAdminUser && emailText) ? `<div class="qa-email"><i class="fas fa-envelope"></i> ${emailText}</div>` : ''}
-          </div>
-          <div>${statusBadge} <span class="qa-date">${dateText}</span></div>
-        </div>
-        <p class="qa-question"><strong>Q:</strong> ${escapeHtml(d.question)}</p>
-        ${legacyAnswerHtml}
-        ${repliesHtml}
-        ${replyFormHtml}
-      </div>`;
-    });
   }
+
+  if (all.length === 0) {
+    html += `<div class="empty-state" style="padding:20px;"><i class="fas fa-check-circle"></i><p>No doubts asked yet${role === 'student' ? ' — be the first.' : '.'}</p></div></div>`;
+    return html;
+  }
+
+  const open = all.filter(d => !hasAnyAnswer(d)).length;
+  const mine = all.filter(d => d.studentUsername === me).length;
+  let doubts = all;
+  if (sortKey === 'open') doubts = all.filter(d => !hasAnyAnswer(d));
+  if (sortKey === 'mine') doubts = all.filter(d => d.studentUsername === me);
+  const votes = (d) => (d.upvotes || []).length;
+  doubts = doubts.slice().sort((a, b) => sortKey === 'new'
+    ? new Date(b.date) - new Date(a.date)
+    : (sortKey === 'top' ? (votes(b) - votes(a)) || (hasAnyAnswer(a) - hasAnyAnswer(b)) || (new Date(b.date) - new Date(a.date))
+                         : new Date(b.date) - new Date(a.date)));
+
+  html += `<div class="qa-toolbar">
+    ${[['top', `<i class="fas fa-fire"></i> Top`], ['new', `<i class="fas fa-clock"></i> Newest`], ['open', `<i class="fas fa-circle-question"></i> Unanswered (${open})`]]
+      .concat(role === 'student' ? [['mine', `<i class="fas fa-user"></i> Mine (${mine})`]] : [])
+      .map(([k, l]) => `<button class="qs-filter ${sortKey === k ? 'on' : ''}" onclick="setQaSort('${course.id}','${k}')">${l}</button>`).join('')}
+  </div>`;
+  if (!doubts.length) html += `<div class="empty-state" style="padding:18px;"><p>Nothing here.</p></div>`;
+
+  doubts.forEach(d => {
+    const answered = hasAnyAnswer(d);
+    const statusBadge = answered ? `<span class="qa-status solved">ANSWERED</span>` : `<span class="qa-status pending">OPEN</span>`;
+    const dateText = d.date ? new Date(d.date).toLocaleDateString() : 'Recent';
+    const usernameText = d.studentUsername ? `@${escapeHtml(d.studentUsername)}` : '';
+    const isAsker = d.studentUsername === me;
+    const isAdminUser = isAdmin(currentUser);
+    const canReply = !!currentUser;
+    const voted = (d.upvotes || []).includes(me);
+
+    const replies = d.replies || [];
+    let repliesHtml = '';
+    if (replies.length > 0) {
+      repliesHtml = `<div class="qa-replies">`;
+      replies.forEach(r => {
+        const rDate = r.date ? new Date(r.date).toLocaleDateString() : '';
+        const isStaffReply = r.authorRole === 'admin' || r.authorRole === 'professor';
+        const canAccept = (isAsker || isAdminUser) && !r.isAccepted;
+        repliesHtml += `<div class="qa-reply ${isStaffReply ? 'admin-reply' : ''} ${r.isAccepted ? 'accepted' : ''}">
+          <div class="qa-reply-head">
+            <strong><i class="fas ${isStaffReply ? 'fa-user-shield' : 'fa-user-circle'}"></i> ${escapeHtml(r.authorName || r.authorUsername)}</strong>
+            ${isStaffReply ? `<span class="qa-reply-tag">${r.authorRole === 'professor' ? 'Professor' : 'Instructor'}</span>` : ''}
+            ${r.isAccepted ? '<span class="qa-reply-tag accepted-tag"><i class="fas fa-check-circle"></i> Accepted</span>' : ''}
+            <span class="qa-reply-date">${rDate}</span>
+          </div>
+          <div class="qa-reply-text latex-content">${escapeHtml(r.text)}</div>
+          ${canAccept ? `<button class="qa-accept-btn" onclick="acceptReply('${course.id}', '${d._id}', '${r._id}')"><i class="fas fa-check"></i> Accept</button>` : ''}
+        </div>`;
+      });
+      repliesHtml += `</div>`;
+    }
+
+    const legacyAnswerHtml = (!replies.length && d.answer)
+      ? `<div class="qa-answer"><i class="fas fa-chalkboard-teacher"></i> <strong>${escapeHtml(d.answeredBy || 'Instructor')}:</strong> <span class="latex-content">${escapeHtml(d.answer)}</span></div>` : '';
+
+    const staff = isAdminUser || role === 'professor';
+    const replyFormHtml = canReply ? `
+      <div class="qa-reply-form" id="replyForm-${d._id}">
+        <textarea id="replyText-${d._id}" placeholder="${staff ? 'Write an answer as the instructor…' : 'Share what you know…'}"></textarea>
+        <button class="btn ${staff ? 'btn-success' : 'btn-primary'} btn-sm" onclick="postReply('${course.id}', '${d._id}')">
+          <i class="fas fa-reply"></i> ${staff ? 'Post Answer' : 'Post Reply'}
+        </button>
+      </div>` : '';
+
+    html += `<div class="qa-item ${answered ? 'solved' : 'pending'}">
+      <div class="qa-head">
+        <div>
+          <strong><i class="fas fa-user-circle"></i> ${escapeHtml(d.studentName || d.studentUsername || 'Student')} <span class="qa-username">${usernameText}</span></strong>
+          ${(isAdminUser && d.studentEmail) ? `<div class="qa-email"><i class="fas fa-envelope"></i> ${escapeHtml(d.studentEmail)}</div>` : ''}
+        </div>
+        <div>${statusBadge} <span class="qa-date">${dateText}</span></div>
+      </div>
+      ${d.materialTitle ? `<div class="qa-about"><i class="fas fa-link"></i> ${escapeHtml(d.materialTitle)}</div>` : ''}
+      <div class="qa-body">
+        <button type="button" class="qa-vote ${voted ? 'on' : ''}" ${role === 'student' && !isAsker ? `onclick="voteDoubt('${course.id}','${d._id}')"` : 'disabled'} title="${isAsker ? 'Your own doubt' : 'I have the same doubt'}">
+          <i class="fas fa-arrow-up"></i><b>${votes(d)}</b>
+        </button>
+        <p class="qa-question latex-content"><strong>Q:</strong> ${escapeHtml(d.question)}</p>
+      </div>
+      ${legacyAnswerHtml}
+      ${repliesHtml}
+      ${replyFormHtml}
+    </div>`;
+  });
   html += `</div>`;
   return html;
+}
+function setQaSort(courseId, key) {
+  window._qaSort = Object.assign({}, window._qaSort, { [courseId]: key });
+  const c = findCourse(courseId);
+  if (c) renderCourseDetail(courseId);
+}
+async function voteDoubt(courseId, doubtId) {
+  try {
+    const d = await fetchJSON(`/api/courses/${courseId}/doubts/${doubtId}/upvote`, { method: 'POST' });
+    if (!d || !d.success) return showToast((d && d.message) || 'Could not vote.', 'error');
+    const c = findCourse(courseId);
+    const dt = c && (c.doubts || []).find(x => String(x._id) === String(doubtId));
+    if (dt) {
+      dt.upvotes = (dt.upvotes || []).filter(u => u !== currentUser.username);
+      if (d.voted) dt.upvotes.push(currentUser.username);
+      renderCourseDetail(courseId);
+    }
+  } catch (e) { showToast('Network error.', 'error'); }
+}
+/* "Ask a doubt" on a material card → the Q&A tab with that material picked */
+function askAboutMaterial(courseId, materialId) {
+  window._qaAskMaterial = { courseId, materialId };
+  currentMaterialFilter = 'qa';
+  if (typeof setMaterialFilter === 'function') setMaterialFilter('qa'); else renderCourseDetail(courseId);
+  setTimeout(() => {
+    const t = document.getElementById('newDoubtText');
+    if (t) { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); t.focus(); }
+  }, 120);
 }
 
 /* ============================================================
@@ -10067,7 +11500,7 @@ function renderCoursePlaylists(course) {
             ${firstThree}
             ${more}
           </ul>
-          ${plProg.total && currentUser.role === 'student' ? `
+          ${plProg.total && (currentUser && currentUser.role) === 'student' ? `
           <div class="vprog playlist ${plProg.done === plProg.total ? 'done' : ''}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${plProg.pct}" aria-label="Playlist progress">
             <div class="vprog-bar"><span style="width:${plProg.pct}%"></span></div>
             <div class="vprog-label">${plProg.done} of ${plProg.total} watched · ${plProg.pct}%</div>
@@ -10084,6 +11517,7 @@ function renderCoursePlaylists(course) {
 }
 
 async function openPlaylistPlayer(courseId, playlistId, startIndex = 0) {
+  if (!currentUser && isGuestBrowsing()) return aeroGuestGate(courseId, null);
   if (!currentUser) return showToast('Please log in first.', 'error');
   const course = findCourse(courseId);
   if (!course) return;
@@ -10151,6 +11585,7 @@ let quizEditingCourseId   = null;
 let quizEditingMaterialId = null;
 let quizPaperConfig = { subject: '', paperCode: '', totalTime: '', totalMarks: 0 };
 let quizDraft = [];
+let _quizDraftSavedJSON = '';   // the paper as last loaded from / saved to the server (dirty check)
 
 /* ============================================================
    MathJax v3 — SINGLE CLEAN IMPLEMENTATION
@@ -10164,8 +11599,24 @@ window.__mathjaxReady   = false;
 window.__mathjaxLoading = false;
 window.__mathjaxQueue   = window.__mathjaxQueue || [];
 
+const TEX_TEXT_SEL = '.latex-content, .latex-preview, .quiz-play-question, .quiz-play-text, .quiz-explain';
 function renderMathIn(el) {
   if (!el || !el.isConnected) return;
+
+  /* ⭐ 2026-10-10: quiz text is LaTeX — lists, tables, sections, TikZ … are
+     turned into a page first (tex-render.js); MathJax then does the math */
+  if (window.AeroTeX && !el.__texPrepped) {
+    try {
+      const targets = el.matches && el.matches(TEX_TEXT_SEL) ? [el] : Array.from(el.querySelectorAll ? el.querySelectorAll(TEX_TEXT_SEL) : []);
+      targets.forEach(t => {
+        const before = t.__texOut;
+        window.AeroTeX.prepare(t);
+        if (before !== undefined && before !== t.__texOut && window.MathJax && window.MathJax.typesetClear) {
+          try { window.MathJax.typesetClear([t]); } catch (e) {}
+        }
+      });
+    } catch (e) { console.warn('[tex] render failed:', e && e.message); }
+  }
 
   // ---- Not ready yet: queue the element + trigger loader ----
   if (!window.__mathjaxReady ||
@@ -10198,6 +11649,9 @@ function renderMathIn(el) {
 
   // ---- Ready: typeset this element ----
   try {
+    /* ⭐ equation numbers & \\label names start fresh for each block of quiz
+       text (a re-rendered preview must not report "label multiply defined") */
+    if (window.MathJax.texReset) { try { window.MathJax.typesetClear([el]); window.MathJax.texReset(); } catch (e) {} }
     window.MathJax.typesetPromise([el]).catch(err => {
       console.warn('[MathJax] typeset error:', err && err.message);
     });
@@ -10321,6 +11775,70 @@ function persistQuizAnswers() {
   try {
     localStorage.setItem('aero_quiz_answers_' + st.materialId, JSON.stringify(st.answers));
   } catch {}
+  _scheduleQuizServerSave();
+}
+
+/* ============================================================
+   ⭐ SERVER AUTOSAVE (2026-10-10)
+   A few seconds after every change the answers go to the server
+   too. If the final submit is late (network down at time-up) or
+   never happens (tab closed, phone died), the attempt is graded
+   from this copy instead of being lost — and the student can
+   continue on another device.
+   ============================================================ */
+let _quizServerSaveTimer = null;
+function _quizProctorLog(st) {
+  return { strikes: st.strikes || 0, events: (st.violations || []).slice(-50) };
+}
+function _scheduleQuizServerSave(delayMs) {
+  const st = quizPlayerState;
+  if (!st || st.previewMode || st.submitted || !st.serverSession) return;
+  clearTimeout(_quizServerSaveTimer);
+  _setQuizSaveState('pending');
+  _quizServerSaveTimer = setTimeout(() => flushQuizServerSave(), delayMs || 2500);
+}
+async function flushQuizServerSave(leaving) {
+  const st = quizPlayerState;
+  clearTimeout(_quizServerSaveTimer);
+  if (!st || st.previewMode || st.submitted || !st.serverSession || !currentUser) return;
+  const body = JSON.stringify({
+    userId: currentUser._id,
+    answers: st.answers.map((a, i) => st.quiz[i].type === 'subjective' && Array.isArray(a) ? a.filter(u => u && u.url) : a),
+    timeSpentPerQuestion: st.timeSpentPerQuestion,
+    proctor: _quizProctorLog(st)
+  });
+  if (body === st._lastServerSaveBody) { _setQuizSaveState('saved'); return; }
+  _setQuizSaveState('saving');
+  try {
+    const res = await fetch(`/api/user/quiz/${st.courseId}/${st.materialId}/autosave`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      keepalive: !!leaving && body.length < 60000          // still delivered while the page goes away
+    });
+    if (leaving) return;
+    const d = await res.json().catch(() => ({}));
+    if (quizPlayerState !== st || st.submitted) return;
+    if (d.success) { st._lastServerSaveBody = body; st.serverSavedAt = d.savedAt; _setQuizSaveState('saved'); }
+    else if (d.code === 'RATE_LIMITED') _scheduleQuizServerSave(15000);
+    else _setQuizSaveState('device');
+  } catch (_) {
+    if (quizPlayerState === st && !st.submitted) { _setQuizSaveState('device'); _scheduleQuizServerSave(10000); }
+  }
+}
+function _setQuizSaveState(state) {
+  if (quizPlayerState) quizPlayerState._saveState = state;
+  const el = document.getElementById('quizSaveState');
+  if (!el) return;
+  const map = {
+    idle:    ['fa-cloud', 'Auto-save on', ''],
+    pending: ['fa-pen', 'Editing…', ''],
+    saving:  ['fa-arrows-rotate fa-spin', 'Saving…', ''],
+    saved:   ['fa-cloud', 'Saved', 'ok'],
+    device:  ['fa-wifi', 'Offline — saved on this device', 'warn']
+  };
+  const m = map[state] || map.saved;
+  el.className = 'quiz-save-state ' + m[2];
+  el.innerHTML = `<i class="fas ${m[0]}"></i><span>${m[1]}</span>`;
+  el.title = state === 'device' ? 'Your answers are kept on this device and will be sent when the connection is back.' : '';
 }
 function restoreQuizAnswers(materialId) {
   try {
@@ -10355,23 +11873,23 @@ function formatDuration(sec) {
   return (h > 0 ? String(h).padStart(2, '0') + ':' : '')
        + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
 }
+/* ⭐ 2026-10-10: the countdown follows the SERVER's deadline (startedAt +
+   duration, corrected for clock skew) — it used to count from a start
+   time kept in this browser, so a resumed attempt could show more time
+   than the server allows and the final submit was then rejected. */
+function _examRemainingSeconds(st) {
+  if (!st || !st.durationSeconds) return null;
+  const deadline = Number(st.serverStartedAt) + st.durationSeconds * 1000;
+  return Math.max(0, Math.floor((deadline - (Date.now() + _examClockOffsetMs)) / 1000));
+}
 function startQuizTimer() {
   stopQuizTimer();
   const st = quizPlayerState;
-  if (!st || st.previewMode || st.submitted) return;
-  const duration = parseQuizTime(st.paperConfig && st.paperConfig.totalTime);
-  if (!duration) return;
-
-  const startKey = 'aero_quiz_start_' + st.materialId;
-  let startedAt = parseInt(localStorage.getItem(startKey), 10);
-  if (!startedAt) {
-    startedAt = Date.now();
-    localStorage.setItem(startKey, String(startedAt));
-  }
-
+  if (!st || st.previewMode || st.submitted || !st.durationSeconds) return;
   const tick = () => {
-    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-    const remaining = Math.max(0, duration - elapsed);
+    const cur = quizPlayerState;
+    if (!cur || cur.submitted) return stopQuizTimer();
+    const remaining = _examRemainingSeconds(cur);
     const el = document.getElementById('quizTimerDisplay');
     if (el) {
       el.textContent = formatDuration(remaining);
@@ -10380,17 +11898,56 @@ function startQuizTimer() {
     }
     if (remaining === 0) {
       stopQuizTimer();
-      try { showToast('⏰ Time is up!', 'error'); } catch (e) {}
-      submitQuiz();
+      /* time-up submits whatever is answered — it must never be blocked by "please answer Q3" */
+      submitQuiz({ auto: true, reason: 'time' });
     }
   };
   tick();
   _quizTimerHandle = setInterval(tick, 1000);
+  /* every 20 s: re-sync with the server clock, and submit if the server says time is over */
+  _examSessionPoll = setInterval(async () => {
+    const cur = quizPlayerState;
+    if (!cur || cur.submitted || cur.previewMode) return;
+    try {
+      const d = await fetchJSON(`/api/user/quiz/${cur.courseId}/${cur.materialId}/heartbeat?userId=${encodeURIComponent(currentUser._id)}`);
+      if (d && d.success && d.serverNow) _examClockOffsetMs = Number(d.serverNow) - Date.now();
+      if (d && d.success && d.expired && !cur.submitted) { stopQuizTimer(); submitQuiz({ auto: true, reason: 'time' }); }
+    } catch (e) { /* offline for a moment — the local countdown carries on */ }
+  }, 20000);
 }
 function stopQuizTimer() {
   if (_quizTimerHandle) { clearInterval(_quizTimerHandle); _quizTimerHandle = null; }
+  if (_examSessionPoll) { clearInterval(_examSessionPoll); _examSessionPoll = null; }
   const el = document.getElementById('quizTimerDisplay');
   if (el) el.classList.remove('warning', 'expired');
+}
+
+/* ⭐ In-page confirm (window.confirm() does not work reliably inside the
+   Android app and drops the exam out of full screen). Resolves true/false. */
+function quizConfirm(opts) {
+  opts = opts || {};
+  return new Promise(resolve => {
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay active aero-confirm-ov';
+    ov.innerHTML = `
+      <div class="modal-box aero-confirm" role="alertdialog" aria-modal="true" aria-labelledby="aeroConfirmTitle">
+        <h3 id="aeroConfirmTitle">${opts.icon ? `<i class="fas ${opts.icon}"></i> ` : ''}${escapeHtml(opts.title || 'Are you sure?')}</h3>
+        ${opts.html ? `<div class="aero-confirm-body">${opts.html}</div>` : `<p class="modal-sub">${escapeHtml(opts.text || '')}</p>`}
+        <div class="modal-actions">
+          ${opts.extra ? `<button type="button" class="btn btn-outline" data-r="extra">${escapeHtml(opts.extra)}</button>` : ''}
+          ${opts.cancel === false ? '' : `<button type="button" class="btn btn-outline" data-r="no">${escapeHtml(opts.cancel || 'Cancel')}</button>`}
+          <button type="button" class="btn ${opts.danger ? 'btn-danger' : 'btn-primary'}" data-r="yes">${escapeHtml(opts.ok || 'OK')}</button>
+        </div>
+      </div>`;
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-r]');
+      if (b) done(b.dataset.r === 'yes' ? true : b.dataset.r === 'extra' ? 'extra' : false);
+      else if (e.target === ov) done(false);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => { const b = ov.querySelector('[data-r="yes"]'); if (b) b.focus(); }, 30);
+  });
 }
 
 /* ---------- Preview HTML escaper ---------- */
@@ -10456,10 +12013,11 @@ async function openQuizEditor(courseId, materialId) {
   let useSaved = false;
   if (saved && Array.isArray(saved.quiz) && saved.quiz.length > 0) {
     const ageMin = Math.round((Date.now() - saved.savedAt) / 60000);
-    useSaved = confirm(
-      `An unsaved draft was autosaved ${ageMin} minute${ageMin === 1 ? '' : 's'} ago.\n\n` +
-      `Restore it?\n\n[OK] Restore draft\n[Cancel] Discard and use the last SAVED version`
-    );
+    useSaved = (await quizConfirm({
+      title: 'Restore unsaved draft?',
+      text: `An unsaved draft was autosaved ${ageMin} minute${ageMin === 1 ? '' : 's'} ago. Restore it, or open the last saved version?`,
+      ok: 'Restore draft', cancel: 'Use saved version', icon: 'fa-clock-rotate-left'
+    })) === true;
   }
 
   if (useSaved) {
@@ -10477,7 +12035,9 @@ async function openQuizEditor(courseId, materialId) {
       resultPublishMode:       sc.resultPublishMode   || 'immediate',
       resultPublishAt:         sc.resultPublishAt     || null,
       resultPublishDelayHours: Number(sc.resultPublishDelayHours) || 0,
-      resultsPublished:        sc.resultsPublished === true
+      resultsPublished:        sc.resultsPublished === true,
+      kind: sc.kind === 'assignment' ? 'assignment' : 'test', dueAt: sc.dueAt || null,
+      allowLate: sc.allowLate !== false, showLeaderboard: sc.showLeaderboard === true
     };
   } else {
     const rawQuiz = Array.isArray(mat.quiz) ? mat.quiz : [];
@@ -10495,9 +12055,13 @@ async function openQuizEditor(courseId, materialId) {
       resultPublishMode:       cfg.resultPublishMode   || 'immediate',
       resultPublishAt:         cfg.resultPublishAt     || null,
       resultPublishDelayHours: Number(cfg.resultPublishDelayHours) || 0,
-      resultsPublished:        cfg.resultsPublished === true
+      resultsPublished:        cfg.resultsPublished === true,
+      kind: cfg.kind === 'assignment' ? 'assignment' : 'test', dueAt: cfg.dueAt || null,
+      allowLate: cfg.allowLate !== false, showLeaderboard: cfg.showLeaderboard === true
     };
   }
+
+  _quizDraftSavedJSON = useSaved ? '' : JSON.stringify(quizDraft);
 
   addingCourse = false; addingProfessor = false;
   addingMaterialCourseId = null; addingStudent = false;
@@ -10508,10 +12072,26 @@ async function openQuizEditor(courseId, materialId) {
   renderApp();
 }
 
-function closeQuizEditor() {
-  const hasDraft = quizDraft.length > 0;
-  if (hasDraft) {
-    const ok = confirm('Close the paper editor?\n\nYour unsaved changes are autosaved locally and will be offered for restore next time.');
+/* Test ⇄ Assignment in the paper editor */
+function onQuizKindChange() {
+  const kind = (document.querySelector('input[name="qpKind"]:checked') || {}).value;
+  const box = document.getElementById('qpAssignmentBox');
+  if (box) box.style.display = kind === 'assignment' ? 'grid' : 'none';
+  if (kind === 'assignment') {
+    const t = document.getElementById('qpTime');
+    if (t && t.value) showToast('Assignments have no timer — the time limit is ignored.', 'info');
+  }
+}
+
+async function closeQuizEditor() {
+  /* ask only when something changed since the last save */
+  const dirty = quizDraft.length > 0 && JSON.stringify(quizDraft) !== _quizDraftSavedJSON;
+  if (dirty) {
+    const ok = await quizConfirm({
+      title: 'Close the paper editor?',
+      text: 'Your unsaved changes are autosaved on this device and will be offered for restore next time.',
+      ok: 'Close', icon: 'fa-pen-ruler'
+    });
     if (!ok) return;
   }
   stopQuizAutosave();
@@ -10520,7 +12100,7 @@ function closeQuizEditor() {
   quizEditingMaterialId = null;
   quizDraft = [];
   if (cid) openCourseEditor(cid);
-  else { pushHash('#/admin/courses'); renderApp(); }
+  else { pushHash(isProfessor(currentUser) ? '#/professor' : '#/admin/courses'); renderApp(); }
 }
 
 function normalizeQuestion(q) {
@@ -10559,7 +12139,11 @@ function normalizeQuestion(q) {
           { text: '', correctIndex: 2 }, { text: '', correctIndex: 3 } ],
 
     marks:         typeof q.marks === 'number' ? q.marks : 4,
-    negativeMarks: typeof q.negativeMarks === 'number' ? q.negativeMarks : -1
+    negativeMarks: typeof q.negativeMarks === 'number' ? q.negativeMarks : -1,
+
+    /* ⭐ 2026-10-11 — topic-wise analytics, practice, question bank */
+    topic:      q.topic || '',
+    difficulty: q.difficulty || ''
   };
 }
 
@@ -10602,15 +12186,957 @@ function onQuizResultModeChange() {
 
 /* Admin override — release results now, bypassing any schedule.
    Calls POST /api/admin/quiz/:courseId/:materialId/publish-now  */
+/* ⭐ Student: my result for one test — total, written-answer marks and
+   the grader's feedback (before, once attempts were used up there was
+   no way to see any of it). */
+async function openMyQuizResult(courseId, materialId) {
+  if (!currentUser) return;
+  let d;
+  try {
+    const res = await fetch(`/api/user/quiz/${courseId}/${materialId}/my-result?userId=${encodeURIComponent(currentUser._id)}&_t=${Date.now()}`, { cache: 'no-store' });
+    d = await res.json();
+  } catch (_) { return showToast('Network error — try again.', 'error'); }
+  if (!d || !d.success) return showToast((d && d.message) || 'Could not load your result.', 'error');
+  if (!d.visible) {
+    return quizConfirm({
+      title: 'Result not published yet', icon: 'fa-hourglass-half', ok: 'OK', cancel: false,
+      text: d.publishAt ? `Your answers are recorded. Results will be published on ${new Date(d.publishAt).toLocaleString()}.` : 'Your answers are recorded. Your instructor will publish the results.'
+    });
+  }
+  const pct = d.finalMax > 0 ? Math.round(d.finalMarks / d.finalMax * 100) : 0;
+  const written = (d.written || []).map(w => `
+    <div class="myres-q">
+      <div class="myres-q-head">
+        <span class="qs-chip">Q${w.number}</span>
+        ${w.awardedMarks === null ? '<span class="qs-chip warn"><i class="fas fa-hourglass-half"></i> Being graded</span>'
+          : `<span class="qs-chip ok">${w.awardedMarks} / ${w.maxMarks}</span>`}
+      </div>
+      <div class="latex-content myres-q-text">${escapeHtml(w.question)}</div>
+      ${w.feedback ? `<div class="myres-fb"><i class="fas fa-comment-dots"></i> ${escapeHtml(w.feedback)}</div>` : ''}
+    </div>`).join('');
+  await quizConfirm({
+    title: 'My result', icon: 'fa-square-poll-vertical', ok: 'Close', cancel: false,
+    html: `
+      <div class="myres-total"><b>${d.finalMarks}</b><span>/ ${d.finalMax}</span><em>${pct}%</em></div>
+      <div class="myres-split">
+        <span>Auto-graded <b>${d.autoMarks} / ${d.autoMax}</b></span>
+        ${d.writtenMax ? `<span>Written <b>${d.writtenMarks} / ${d.writtenMax}</b></span>` : ''}
+        <span>Attempt <b>${d.attempts}</b></span>
+      </div>
+      ${d.standing && d.standing.rank ? `<div class="myres-standing">
+        <div><b>#${d.standing.rank}</b><span>rank of ${d.standing.of}</span></div>
+        <div><b>${d.standing.percentile === null ? '—' : d.standing.percentile}</b><span>percentile</span></div>
+        <div><b>${d.standing.classAvg}%</b><span>class average</span></div>
+      </div>` : ''}
+      ${Array.isArray(d.leaderboard) && d.leaderboard.length ? `<div class="myres-board"><div class="myres-board-h"><i class="fas fa-trophy"></i> Top ${d.leaderboard.length}</div>
+        ${d.leaderboard.map(x => `<div class="myres-board-row ${x.me ? 'me' : ''}"><span class="myres-medal r${x.rank}">${x.rank}</span><span>${escapeHtml(x.name)}${x.me ? ' <em>(you)</em>' : ''}</span><b>${x.pct}%</b></div>`).join('')}
+      </div>` : ''}
+      ${d.pendingEvaluation ? '<p class="modal-sub"><i class="fas fa-hourglass-half"></i> Some written answers are still being graded — the total will change.</p>' : ''}
+      ${d.endedNote ? `<p class="modal-sub"><i class="fas fa-clock"></i> ${escapeHtml(d.endedNote)}</p>` : ''}
+      ${written ? `<div class="myres-written">${written}</div>` : ''}`
+  });
+}
+
+/* ============================================================
+   ⭐ SUBMISSIONS & GRADING (2026-10-10)
+   ------------------------------------------------------------
+   Every student's attempt at this paper — marks, warnings,
+   how it ended — the attempts running right now, and grading of
+   uploaded answer sheets (photos / PDFs). The grading API
+   existed, but nothing in the app called it, so uploaded answers
+   could never be marked and stayed "pending" forever.
+   ============================================================ */
+let _quizSubs = null;            // { courseId, materialId, data, gradingUserId, filter }
+
+async function openQuizSubmissions(courseId, materialId) {
+  courseId = courseId || quizEditingCourseId;
+  materialId = materialId || quizEditingMaterialId;
+  if (!courseId || !materialId) return showToast('No test is open.', 'error');
+  _quizSubs = { courseId, materialId, data: null, gradingUserId: null, filter: 'all' };
+  let ov = document.getElementById('quizSubsOverlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'quizSubsOverlay';
+    ov.className = 'quiz-subs-ov';
+    ov.addEventListener('click', (e) => { if (e.target === ov) closeQuizSubmissions(); });
+    document.body.appendChild(ov);
+  }
+  ov.innerHTML = `<div class="quiz-subs"><div class="quiz-subs-loading"><i class="fas fa-spinner fa-spin"></i> Loading submissions…</div></div>`;
+  document.body.classList.add('quiz-subs-open');
+  await _loadQuizSubmissions();
+}
+function closeQuizSubmissions() {
+  const ov = document.getElementById('quizSubsOverlay');
+  if (ov) ov.remove();
+  document.body.classList.remove('quiz-subs-open');
+  clearInterval(_quizSubs && _quizSubs.liveTimer);
+  _quizSubs = null;
+}
+async function _loadQuizSubmissions() {
+  const S = _quizSubs; if (!S) return;
+  try {
+    const res = await fetch(`/api/admin/quiz/${S.courseId}/${S.materialId}/submissions?_t=${Date.now()}`, { cache: 'no-store' });
+    const d = await res.json();
+    if (_quizSubs !== S) return;
+    if (!d.success) throw new Error(d.message || 'Could not load submissions.');
+    S.data = d;
+    _renderQuizSubmissions();
+    /* the "running now" list refreshes by itself while open */
+    clearInterval(S.liveTimer);
+    if (d.running && d.running.length) S.liveTimer = setInterval(() => { if (_quizSubs === S && !S.gradingUserId) _loadQuizSubmissions(); }, 20000);
+  } catch (e) {
+    const box = document.querySelector('#quizSubsOverlay .quiz-subs');
+    if (box) box.innerHTML = `<div class="quiz-subs-loading"><i class="fas fa-triangle-exclamation"></i> ${escapeHtml(e.message)}
+      <button class="btn btn-outline btn-sm" onclick="closeQuizSubmissions()">Close</button></div>`;
+  }
+}
+function _qsFmtDate(d) {
+  if (!d) return '—';
+  try { return new Date(d).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch (_) { return '—'; }
+}
+function _qsFmtSecs(s) {
+  s = Math.max(0, Number(s) || 0);
+  const m = Math.floor(s / 60), r = s % 60;
+  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}:${String(r).padStart(2, '0')}`;
+}
+function _renderQuizSubmissions() {
+  const S = _quizSubs; if (!S || !S.data) return;
+  if (S.gradingUserId) return _renderQuizGrading();
+  const d = S.data;
+  const subs = d.submissions || [];
+  const toGrade = subs.filter(r => r.pendingEvaluation).length;
+  const flagged = subs.filter(r => (r.proctor && r.proctor.strikes > 0) || r.autoSubmitted).length;
+  const list = subs.filter(r => S.filter === 'grade' ? r.pendingEvaluation : S.filter === 'flagged' ? ((r.proctor && r.proctor.strikes > 0) || r.autoSubmitted) : true);
+  const avg = subs.length ? Math.round(subs.reduce((s, r) => s + (r.finalMarksPossible ? r.finalMarksEarned / r.finalMarksPossible : 0), 0) / subs.length * 100) : 0;
+
+  const running = (d.running || []).map(r => `
+    <div class="qs-live-row">
+      <span class="qs-live-dot"></span>
+      <strong>${escapeHtml(r.name)}</strong>
+      <span class="qs-chip">${r.remainingSeconds === null ? 'No time limit' : _qsFmtSecs(r.remainingSeconds) + ' left'}</span>
+      <span class="qs-chip">${r.answered} answered</span>
+      ${r.strikes ? `<span class="qs-chip bad"><i class="fas fa-shield-halved"></i> ${r.strikes} warning${r.strikes === 1 ? '' : 's'}</span>` : ''}
+      <span class="qs-muted">${r.savedAt ? 'saved ' + _qsFmtDate(r.savedAt) : 'not saved yet'}</span>
+    </div>`).join('');
+
+  const rows = list.map(r => {
+    const strikes = (r.proctor && r.proctor.strikes) || 0;
+    const status = r.pendingEvaluation
+      ? `<span class="qs-chip warn"><i class="fas fa-hourglass-half"></i> ${r.subjectiveTotal - r.subjectiveGraded} to grade</span>`
+      : r.subjectiveTotal ? `<span class="qs-chip ok"><i class="fas fa-check"></i> Graded</span>` : `<span class="qs-chip ok"><i class="fas fa-check"></i> Auto-graded</span>`;
+    const ended = r.finalizedBy === 'server' ? `<span class="qs-chip bad" title="Time ran out before a submit reached the server — graded from the autosaved answers"><i class="fas fa-clock"></i> Time ran out</span>`
+      : r.autoSubmitted ? `<span class="qs-chip bad" title="Submitted automatically (time-up or warnings)"><i class="fas fa-robot"></i> Auto-submitted</span>` : '';
+    return `
+      <tr>
+        <td><div class="qs-name">${escapeHtml(r.fullName || r.username)}</div><div class="qs-muted">@${escapeHtml(r.username || '')}</div></td>
+        <td><strong>${r.finalMarksEarned}</strong> <span class="qs-muted">/ ${r.finalMarksPossible}</span>
+            ${r.subjectiveTotal ? `<div class="qs-muted">auto ${r.marksEarned} + written ${r.subjectiveMarksAwarded}</div>` : ''}</td>
+        <td>${status} ${ended}</td>
+        <td data-label="Warnings">${strikes ? `<button class="qs-chip bad qs-link" onclick="showQuizProctorLog('${escapeHtml(r.userId)}')"><i class="fas fa-shield-halved"></i> ${strikes}</button>` : '<span class="qs-muted">0</span>'}</td>
+        <td class="qs-muted" data-label="Time">${r.timeSpentTotalSeconds ? _qsFmtSecs(r.timeSpentTotalSeconds) : '—'}</td>
+        <td class="qs-muted" data-label="Submitted">${_qsFmtDate(r.lastAttemptAt)}<div>attempt ${r.attempts}</div></td>
+        <td>${r.subjectiveTotal ? `<button class="btn btn-sm ${r.pendingEvaluation ? 'btn-primary' : 'btn-outline'}" onclick="openQuizGrading('${escapeHtml(r.userId)}')"><i class="fas fa-pen-to-square"></i> ${r.pendingEvaluation ? 'Grade' : 'Review'}</button>` : ''}</td>
+      </tr>`;
+  }).join('');
+
+  const box = document.querySelector('#quizSubsOverlay .quiz-subs');
+  if (!box) return;
+  box.innerHTML = `
+    <div class="qs-head">
+      <div>
+        <h2><i class="fas fa-inbox"></i> Submissions</h2>
+        <div class="qs-muted">${escapeHtml(d.title)} · results ${escapeHtml(d.resultPublishMode)}</div>
+      </div>
+      <div class="qs-head-actions">
+        <button class="btn btn-outline btn-sm" onclick="_loadQuizSubmissions()" title="Refresh"><i class="fas fa-rotate"></i></button>
+        <button class="btn btn-outline btn-sm" onclick="exportQuizSubmissionsCsv()" ${subs.length ? '' : 'disabled'}><i class="fas fa-file-csv"></i> CSV</button>
+        <button class="btn btn-outline btn-sm" onclick="closeQuizSubmissions()" aria-label="Close"><i class="fas fa-xmark"></i></button>
+      </div>
+    </div>
+    <div class="qs-stats">
+      <div class="qs-stat"><b>${subs.length}</b><span>submitted</span></div>
+      <div class="qs-stat ${toGrade ? 'warn' : ''}"><b>${toGrade}</b><span>to grade</span></div>
+      <div class="qs-stat ${flagged ? 'bad' : ''}"><b>${flagged}</b><span>flagged</span></div>
+      <div class="qs-stat live"><b>${(d.running || []).length}</b><span>writing now</span></div>
+      <div class="qs-stat"><b>${avg}%</b><span>average</span></div>
+    </div>
+    ${running ? `<div class="qs-live"><div class="qs-section-title"><i class="fas fa-circle-play"></i> Writing now</div>${running}</div>` : ''}
+    <div class="qs-filters">
+      ${[['all', 'All'], ['grade', `To grade (${toGrade})`], ['flagged', `Flagged (${flagged})`]].map(([k, l]) =>
+        `<button class="qs-filter ${S.filter === k ? 'on' : ''}" onclick="_quizSubs.filter='${k}';_renderQuizSubmissions()">${l}</button>`).join('')}
+    </div>
+    ${list.length ? `<div class="qs-table-wrap"><table class="qs-table">
+      <thead><tr><th>Student</th><th>Marks</th><th>Status</th><th>Warnings</th><th>Time</th><th>Submitted</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`
+      : `<div class="qs-empty"><i class="fas fa-inbox"></i><p>${subs.length ? 'Nothing in this filter.' : 'No submissions yet.'}</p></div>`}`;
+}
+
+function showQuizProctorLog(userId) {
+  const r = _quizSubs && _quizSubs.data && _quizSubs.data.submissions.find(x => x.userId === userId);
+  if (!r) return;
+  const ev = ((r.proctor && r.proctor.events) || []).slice().sort((a, b) => (a.at || 0) - (b.at || 0));
+  quizConfirm({
+    title: `Proctoring log — ${r.fullName || r.username}`, icon: 'fa-shield-halved', ok: 'Close', cancel: false,
+    html: ev.length ? `<ul class="qs-log">${ev.map(e => `<li class="${e.strike === false ? '' : 'bad'}">
+        <span>${e.at ? new Date(e.at).toLocaleTimeString() : ''}</span> ${escapeHtml(e.reason || '')}
+        ${e.strike === false ? '<em>(not a warning)</em>' : ''}</li>`).join('')}</ul>`
+      : '<p class="modal-sub">No events recorded.</p>'
+  });
+}
+
+function openQuizGrading(userId) {
+  if (!_quizSubs) return;
+  _quizSubs.gradingUserId = userId;
+  _renderQuizGrading();
+}
+function _renderQuizGrading() {
+  const S = _quizSubs; if (!S || !S.data) return;
+  const r = S.data.submissions.find(x => x.userId === S.gradingUserId);
+  const box = document.querySelector('#quizSubsOverlay .quiz-subs');
+  if (!r || !box) { S.gradingUserId = null; return _renderQuizSubmissions(); }
+  const qText = (qi) => ((S.data.questions || [])[qi] || {}).question || '';
+  const pendingIds = S.data.submissions.filter(x => x.pendingEvaluation && x.userId !== r.userId).map(x => x.userId);
+
+  const cards = Object.keys(r.subjectiveQuestionMeta || {}).sort((a, b) => a - b).map(qi => {
+    const meta = r.subjectiveQuestionMeta[qi] || {};
+    const files = (r.subjectiveAnswers || {})[qi] || [];
+    const ev = (r.subjectiveEvaluations || {})[qi];
+    const fileHtml = files.length ? files.map(f => {
+      const isPdf = f.isPdf || /\.pdf($|\?)/i.test(f.url || '');
+      const href = withAuthToken(f.url);
+      return isPdf
+        ? `<a class="qs-file pdf" href="${escapeHtml(href)}" target="_blank" rel="noopener" onclick="return aeroOpenPdfUrl(event, ${jsStr(f.url || '')}, ${jsStr(f.fileName || 'Answer sheet')})"><i class="fas fa-file-pdf"></i><span>${escapeHtml(f.fileName || 'answer.pdf')}</span></a>`
+        : `<a class="qs-file img" href="${escapeHtml(href)}" target="_blank" rel="noopener"><img src="${escapeHtml(href)}" alt="" loading="lazy"><span>${escapeHtml(f.fileName || 'photo')}</span></a>`;
+    }).join('') : '<div class="qs-muted"><i class="fas fa-circle-exclamation"></i> No file was uploaded for this question.</div>';
+    return `
+      <div class="qs-grade-card" data-qi="${escapeHtml(qi)}">
+        <div class="qs-grade-q"><span class="qs-chip">Q${Number(qi) + 1}</span> <span class="latex-content">${escapeHtml(qText(qi))}</span></div>
+        ${meta.instructions ? `<div class="qs-muted">${escapeHtml(meta.instructions)}</div>` : ''}
+        <div class="qs-files">${fileHtml}</div>
+        <div class="qs-grade-form">
+          <label><span>Marks <span class="qs-muted">(max ${Number(meta.maxMarks) || 0})</span></span>
+            <input type="number" min="0" max="${Number(meta.maxMarks) || 0}" step="0.5" class="qs-marks" value="${ev ? escapeHtml(String(ev.awardedMarks)) : (files.length ? '' : '0')}" placeholder="0–${Number(meta.maxMarks) || 0}">
+          </label>
+          <label class="qs-fb"><span>Feedback for the student <span class="qs-muted">(optional)</span></span>
+            <textarea rows="2" maxlength="1000" class="qs-feedback" placeholder="What was good, what was missing…">${ev ? escapeHtml(ev.feedback || '') : ''}</textarea>
+          </label>
+          <button class="btn btn-primary btn-sm" onclick="saveQuizGrade(this)"><i class="fas fa-check"></i> ${ev ? 'Update' : 'Save'}</button>
+          ${ev ? `<span class="qs-chip ok"><i class="fas fa-check"></i> graded ${_qsFmtDate(ev.evaluatedAt)}</span>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div class="qs-head">
+      <div>
+        <button class="back-link" onclick="_quizSubs.gradingUserId=null;_renderQuizSubmissions()"><i class="fas fa-arrow-left"></i> All submissions</button>
+        <h2>${escapeHtml(r.fullName || r.username)}</h2>
+        <div class="qs-muted">Auto-graded ${r.marksEarned} / ${r.marksPossible} · written ${r.subjectiveMarksAwarded} / ${r.subjectiveMaxTotal} · total <strong>${r.finalMarksEarned} / ${r.finalMarksPossible}</strong></div>
+      </div>
+      <div class="qs-head-actions">
+        ${pendingIds.length ? `<button class="btn btn-outline btn-sm" onclick="openQuizGrading('${escapeHtml(pendingIds[0])}')">Next to grade <i class="fas fa-arrow-right"></i></button>` : ''}
+        <button class="btn btn-outline btn-sm" onclick="closeQuizSubmissions()" aria-label="Close"><i class="fas fa-xmark"></i></button>
+      </div>
+    </div>
+    <div class="qs-grade-list">${cards}</div>`;
+  try { renderMathIn(box); } catch (_) {}
+}
+async function saveQuizGrade(btn) {
+  const S = _quizSubs; if (!S) return;
+  const card = btn.closest('.qs-grade-card');
+  const qi = card.dataset.qi;
+  const marksEl = card.querySelector('.qs-marks');
+  const raw = marksEl.value.trim();
+  const max = Number(marksEl.max) || 0;
+  const marks = Number(raw);
+  if (raw === '' || !isFinite(marks) || marks < 0 || marks > max) {
+    marksEl.focus();
+    return showToast(`Enter marks between 0 and ${max}.`, 'error');
+  }
+  btn.disabled = true;
+  const orig = btn.innerHTML;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
+  try {
+    const res = await fetch(`/api/admin/quiz/${S.courseId}/${S.materialId}/evaluate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: S.gradingUserId, questionIndex: Number(qi), awardedMarks: marks, feedback: card.querySelector('.qs-feedback').value })
+    });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.message || 'Could not save.');
+    showToast(`Q${Number(qi) + 1}: ${marks} mark${marks === 1 ? '' : 's'} saved.`, 'success');
+    /* refresh this student's row in place */
+    const row = S.data.submissions.find(x => x.userId === S.gradingUserId);
+    if (row && d.result) {
+      row.subjectiveEvaluations = d.result.subjectiveEvaluations || {};
+      row.subjectiveMarksAwarded = Number(d.result.subjectiveMarksAwarded) || 0;
+      row.subjectiveGraded = Object.keys(row.subjectiveEvaluations).length;
+      row.pendingEvaluation = row.subjectiveGraded < row.subjectiveTotal;
+      row.finalMarksEarned = row.marksEarned + row.subjectiveMarksAwarded;
+    }
+    _renderQuizGrading();
+  } catch (e) {
+    showToast(e.message, 'error');
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+function exportQuizSubmissionsCsv() {
+  const S = _quizSubs; if (!S || !S.data) return;
+  const q = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+  const lines = [['Name', 'Username', 'Email', 'Attempts', 'Auto marks', 'Auto max', 'Written marks', 'Written max', 'Total', 'Max', 'Percent', 'Warnings', 'Ended', 'Time spent (s)', 'Submitted at'].map(q).join(',')];
+  S.data.submissions.forEach(r => {
+    lines.push([r.fullName, r.username, r.email, r.attempts, r.marksEarned, r.marksPossible, r.subjectiveMarksAwarded, r.subjectiveMaxTotal,
+      r.finalMarksEarned, r.finalMarksPossible, r.finalMarksPossible ? Math.round(r.finalMarksEarned / r.finalMarksPossible * 100) : 0,
+      (r.proctor && r.proctor.strikes) || 0, r.finalizedBy === 'server' ? 'time ran out' : r.autoSubmitted ? 'auto-submitted' : 'submitted',
+      r.timeSpentTotalSeconds, r.lastAttemptAt ? new Date(r.lastAttemptAt).toISOString() : ''].map(q).join(','));
+  });
+  const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+  const fname = `${(S.data.title || 'test').replace(/[^\w\- ]+/g, '').trim() || 'test'} - submissions.csv`;
+  if (window.__aeroSaveBlob) return window.__aeroSaveBlob(blob, fname);     // Android app
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = fname;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+/* ============================================================
+   ⭐ GRADING SECTION (2026-10-10) — admin dashboard tab "Grading"
+   ------------------------------------------------------------
+   Overview  → to-grade queue, live attempts, every test by course
+   Test      → course + paper details, class statistics, score
+               spread, question-by-question analysis, submissions
+   Attempt   → one student's paper: every answer next to the key,
+               marks + time per question, uploaded sheets with
+               grading, proctoring timeline, earlier attempts,
+               "grant another attempt"
+   Professors get the same screens for their own courses.
+   ============================================================ */
+const GR = { view: 'home', home: null, test: null, attempt: null, testKey: null, attemptKey: null,
+             q: '', course: 'all', show: 'all', subFilter: 'all', subQ: '', qSort: 'order', host: null };
+
+(function ensureGradingAdminTab() {
+  const tabsEl = document.querySelector('.admin-tabs');
+  if (!tabsEl || tabsEl.querySelector('[data-tab="grading"]')) return;
+  const btn = document.createElement('button');
+  btn.className = 'admin-tab'; btn.dataset.tab = 'grading';
+  btn.setAttribute('onclick', "switchAdminTab('grading')");
+  btn.innerHTML = '<i class="fas fa-marker"></i> Grading <span class="ahd-badge" id="grBadge" hidden></span>';
+  const anchor = tabsEl.querySelector('[data-tab="students"]');
+  if (anchor && anchor.nextSibling) anchor.parentNode.insertBefore(btn, anchor.nextSibling); else tabsEl.appendChild(btn);
+  if (!document.getElementById('adminTabGrading')) {
+    const c = document.createElement('div');
+    c.className = 'admin-tab-content'; c.id = 'adminTabGrading';
+    c.innerHTML = '<div id="adminGradingContent" class="gr-root"></div>';
+    const view = document.getElementById('adminView'); if (view) view.appendChild(c);
+  }
+})();
+const _grOrigUpdateAdminTabUI = window.updateAdminTabUI;
+window.updateAdminTabUI = function () {
+  if (typeof _grOrigUpdateAdminTabUI === 'function') _grOrigUpdateAdminTabUI.apply(this, arguments);
+  if (adminTab === 'grading') {
+    const t = document.getElementById('adminPageTitle'); if (t) t.innerHTML = '<i class="fas fa-marker"></i> Grading & Results';
+    const a = document.getElementById('adminHeaderActions');
+    if (a) a.innerHTML = `<button class="btn btn-outline" onclick="switchAdminTab('overview')"><i class="fas fa-chart-pie"></i> <span class="btn-text">Overview</span></button>
+      <button class="btn btn-primary" onclick="grRefresh()"><i class="fas fa-rotate"></i> <span class="btn-text">Refresh</span></button>`;
+  }
+};
+const _grOrigRenderAdminDashboard = window.renderAdminDashboard;
+window.renderAdminDashboard = function () {
+  if (adminTab === 'grading') { try { updateAdminTabUI(); } catch (e) {} GR.host = document.getElementById('adminGradingContent'); return grRender(); }
+  if (typeof _grOrigRenderAdminDashboard === 'function') return _grOrigRenderAdminDashboard.apply(this, arguments);
+};
+
+/* Professors: the same section in a full-screen panel */
+function openGradingPanel() {
+  let ov = document.getElementById('grOverlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'grOverlay'; ov.className = 'gr-overlay';
+    ov.innerHTML = `<div class="gr-overlay-bar"><strong><i class="fas fa-marker"></i> Grading & Results</strong>
+      <span><button class="btn btn-outline btn-sm" onclick="grRefresh()"><i class="fas fa-rotate"></i></button>
+      <button class="btn btn-outline btn-sm" onclick="closeGradingPanel()" aria-label="Close"><i class="fas fa-xmark"></i></button></span></div>
+      <div class="gr-root" id="grOverlayContent"></div>`;
+    document.body.appendChild(ov);
+  }
+  document.body.classList.add('quiz-subs-open');
+  GR.host = document.getElementById('grOverlayContent');
+  GR.view = 'home';
+  grRender();
+}
+function closeGradingPanel() {
+  const ov = document.getElementById('grOverlay'); if (ov) ov.remove();
+  document.body.classList.remove('quiz-subs-open');
+  GR.host = null;
+}
+
+/* ---------- helpers ---------- */
+const _grN = (v) => { const n = Math.round((Number(v) || 0) * 100) / 100; return String(n); };
+function _grAgo(d) { try { return d ? timeAgo(d) : '—'; } catch (_) { return _qsFmtDate(d); } }
+function _grPctTone(p) { return p >= 75 ? 'ok' : p >= 40 ? 'mid' : 'bad'; }
+function _grLetter(i) { return String.fromCharCode(65 + i); }
+const _GR_RIGHT = ['P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y'];
+function _grSpin(msg) { return `<div class="gr-loading"><i class="fas fa-spinner fa-spin"></i> ${escapeHtml(msg || 'Loading…')}</div>`; }
+function _grHost() { return GR.host || document.getElementById('adminGradingContent'); }
+function _grCrumbs(items) {
+  return `<nav class="gr-crumbs">${items.map((it, i) => i < items.length - 1
+    ? `<button type="button" onclick="${it.go}">${escapeHtml(it.label)}</button><i class="fas fa-chevron-right"></i>`
+    : `<span>${escapeHtml(it.label)}</span>`).join('')}</nav>`;
+}
+
+/* professor: "to grade" count on the nav link and the dashboard tab */
+function _grSetProfBadge(n) {
+  n = Number(n) || 0;
+  if (window._profToGrade === n) return;
+  window._profToGrade = n;
+  try { buildNav(); } catch (_) {}
+  document.querySelectorAll('.pw-tabs button').forEach(b => {
+    if (!/navigateProfessor\('grading'\)/.test(b.getAttribute('onclick') || '')) return;
+    let c = b.querySelector('.nav-count');
+    if (!n) { if (c) c.remove(); return; }
+    if (!c) { c = document.createElement('span'); c.className = 'nav-count'; b.appendChild(document.createTextNode(' ')); b.appendChild(c); }
+    c.textContent = n;
+  });
+}
+
+async function grRefresh() {
+  if (GR.view === 'attempt' && GR.attemptKey) return grOpenAttempt(...GR.attemptKey, true);
+  if (GR.view === 'test' && GR.testKey) return grOpenTest(...GR.testKey, true);
+  GR.home = null;
+  return grRender();
+}
+function grGoHome() { GR.view = 'home'; grRender(); }
+
+async function grRender() {
+  const host = _grHost(); if (!host) return;
+  if (GR.view === 'test' && GR.test) return grRenderTest();
+  if (GR.view === 'attempt' && GR.attempt) return grRenderAttempt();
+  GR.view = 'home';
+  if (!GR.home) host.innerHTML = _grSpin('Loading tests and submissions…');
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/grading/overview?_t=${Date.now()}`, { cache: 'no-store' });
+    if (!d || !d.success) throw new Error((d && d.message) || 'Could not load.');
+    GR.home = d;
+    const b = document.getElementById('grBadge'); if (b) { b.textContent = d.totals.toGrade; b.hidden = !d.totals.toGrade; }
+    if (d.role === 'professor') _grSetProfBadge(d.totals.toGrade);
+  } catch (e) {
+    if (!GR.home) { host.innerHTML = `<div class="gr-loading"><i class="fas fa-triangle-exclamation"></i> ${escapeHtml(e.message)}</div>`; return; }
+  }
+  if (GR.view === 'home') grRenderHome();
+}
+
+/* ============================ HOME ============================ */
+function grRenderHome() {
+  const host = _grHost(); const d = GR.home; if (!host || !d) return;
+  const T = d.totals;
+  const courses = [...new Map(d.tests.map(t => [t.courseId, { id: t.courseId, name: t.courseName, code: t.courseCode }])).values()]
+    .sort((a, b) => (a.code || a.name).localeCompare(b.code || b.name));
+  const q = GR.q.trim().toLowerCase();
+  const tests = d.tests.filter(t =>
+    (GR.course === 'all' || t.courseId === GR.course) &&
+    (GR.show === 'all' || (GR.show === 'grade' && t.toGrade) || (GR.show === 'live' && t.running) || (GR.show === 'subs' && t.submissions)) &&
+    (!q || (t.title + ' ' + t.courseName + ' ' + t.courseCode).toLowerCase().includes(q)));
+  const byCourse = new Map();
+  tests.forEach(t => { if (!byCourse.has(t.courseId)) byCourse.set(t.courseId, []); byCourse.get(t.courseId).push(t); });
+
+  const queue = d.queue.slice(0, 12).map(it => `
+    <button type="button" class="gr-queue-item" onclick="grOpenAttempt('${it.courseId}','${it.materialId}','${it.userId}')">
+      <span class="gr-avatar">${escapeHtml((it.name || '?').charAt(0).toUpperCase())}</span>
+      <span class="gr-queue-main">
+        <b>${escapeHtml(it.name)}</b>
+        <span class="qs-muted">${escapeHtml(it.testTitle)} · ${escapeHtml(it.courseCode || it.courseName)}</span>
+      </span>
+      <span class="gr-queue-meta">
+        <span class="qs-chip warn">${it.pending} to grade</span>
+        <span class="qs-muted"><i class="fas fa-paperclip"></i> ${it.files} · ${_grAgo(it.submittedAt)}</span>
+      </span>
+      <i class="fas fa-chevron-right gr-go"></i>
+    </button>`).join('');
+
+  const groups = [...byCourse.entries()].map(([cid, list]) => {
+    const c = courses.find(x => x.id === cid) || {};
+    const rows = list.map(t => `
+      <button type="button" class="gr-test" onclick="grOpenTest('${t.courseId}','${t.materialId}')">
+        <span class="gr-test-main">
+          <b>${escapeHtml(t.title)}</b>
+          <span class="gr-test-meta">
+            <span><i class="fas fa-list-ol"></i> ${t.questions} Q</span>
+            <span><i class="fas fa-star"></i> ${_grN(t.totalMarks)} marks</span>
+            ${t.timeLimit ? `<span><i class="fas fa-clock"></i> ${escapeHtml(t.timeLimit)}</span>` : ''}
+            <span><i class="fas fa-rotate-right"></i> ${t.maxAttempts ? t.maxAttempts + ' attempt' + (t.maxAttempts === 1 ? '' : 's') : 'unlimited'}</span>
+            ${t.subjectiveQuestions ? `<span><i class="fas fa-file-pen"></i> ${t.subjectiveQuestions} written</span>` : ''}
+            <span class="gr-mode gr-mode-${escapeHtml(t.publishMode)}">${escapeHtml(t.publishMode)}</span>
+          </span>
+        </span>
+        <span class="gr-test-stats">
+          ${t.running ? `<span class="qs-chip ok"><span class="qs-live-dot"></span> ${t.running} writing</span>` : ''}
+          ${t.toGrade ? `<span class="qs-chip warn"><i class="fas fa-hourglass-half"></i> ${t.toGrade} to grade</span>` : ''}
+          ${t.flagged ? `<span class="qs-chip bad"><i class="fas fa-shield-halved"></i> ${t.flagged}</span>` : ''}
+          <span class="gr-subs"><b>${t.submissions}</b> submitted</span>
+          <span class="gr-avg" title="Class average">
+            <span class="gr-bar"><span class="gr-bar-fill ${_grPctTone(t.avgPct)}" style="width:${Math.min(100, t.avgPct)}%"></span></span>
+            <b>${t.submissions ? _grN(t.avgPct) + '%' : '—'}</b>
+          </span>
+        </span>
+        <i class="fas fa-chevron-right gr-go"></i>
+      </button>`).join('');
+    return `<section class="gr-course">
+      <header><span class="gr-code">${escapeHtml(c.code || '')}</span><h3>${escapeHtml(c.name || 'Course')}</h3>
+        <span class="qs-muted">${list.length} test${list.length === 1 ? '' : 's'}</span></header>
+      ${rows}</section>`;
+  }).join('');
+
+  host.innerHTML = `
+    <div class="gr-kpis">
+      <div class="gr-kpi ${T.toGrade ? 'warn' : ''}"><i class="fas fa-hourglass-half"></i><b>${T.toGrade}</b><span>answer sheets to grade</span></div>
+      <div class="gr-kpi live"><i class="fas fa-circle-play"></i><b>${T.running}</b><span>writing right now</span></div>
+      <div class="gr-kpi"><i class="fas fa-inbox"></i><b>${T.submissions}</b><span>submissions</span></div>
+      <div class="gr-kpi ${T.flagged ? 'bad' : ''}"><i class="fas fa-shield-halved"></i><b>${T.flagged}</b><span>flagged attempts</span></div>
+      <div class="gr-kpi"><i class="fas fa-file-lines"></i><b>${T.tests}</b><span>tests${T.last24h ? ` · ${T.last24h} active today` : ''}</span></div>
+    </div>
+
+    ${d.queue.length ? `<section class="gr-card">
+      <div class="gr-card-head"><h3><i class="fas fa-list-check"></i> Grading queue <span class="qs-muted">oldest first</span></h3>
+        <button class="btn btn-primary btn-sm" onclick="grOpenAttempt('${d.queue[0].courseId}','${d.queue[0].materialId}','${d.queue[0].userId}')"><i class="fas fa-play"></i> Start grading</button></div>
+      <div class="gr-queue">${queue}</div>
+      ${d.queue.length > 12 ? `<div class="qs-muted gr-more">+ ${d.queue.length - 12} more — they come up one after another as you grade.</div>` : ''}
+    </section>` : `<section class="gr-card gr-allclear"><i class="fas fa-circle-check"></i><div><b>All caught up</b><span class="qs-muted">No answer sheets are waiting for marks.</span></div></section>`}
+
+    <section class="gr-card">
+      <div class="gr-card-head"><h3><i class="fas fa-layer-group"></i> Tests by course</h3></div>
+      <div class="gr-toolbar">
+        <div class="gr-search"><i class="fas fa-magnifying-glass"></i><input type="search" placeholder="Search tests or courses…" value="${escapeHtml(GR.q)}" oninput="GR.q=this.value;grRenderHomeDebounced()"></div>
+        <select onchange="GR.course=this.value;grRenderHome()">
+          <option value="all">All courses</option>
+          ${courses.map(c => `<option value="${c.id}" ${GR.course === c.id ? 'selected' : ''}>${escapeHtml((c.code ? c.code + ' — ' : '') + c.name)}</option>`).join('')}
+        </select>
+        <div class="qs-filters">${[['all', 'All'], ['grade', 'Needs grading'], ['live', 'Live now'], ['subs', 'Has submissions']].map(([k, l]) =>
+          `<button class="qs-filter ${GR.show === k ? 'on' : ''}" onclick="GR.show='${k}';grRenderHome()">${l}</button>`).join('')}</div>
+      </div>
+      ${groups || `<div class="qs-empty"><i class="fas fa-folder-open"></i><p>${d.tests.length ? 'No test matches.' : 'No tests yet — add a Quiz / Test material to a course.'}</p></div>`}
+    </section>
+    <div id="grSeriesBox"></div>`;
+  if (typeof window.renderSeriesManager === 'function') window.renderSeriesManager();
+  const inp = host.querySelector('.gr-search input');
+  if (inp && GR._refocus) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); GR._refocus = false; }
+}
+let _grDeb = null;
+function grRenderHomeDebounced() { clearTimeout(_grDeb); _grDeb = setTimeout(() => { GR._refocus = true; grRenderHome(); }, 180); }
+
+/* ============================ TEST ============================ */
+async function grOpenTest(courseId, materialId, keep) {
+  const host = _grHost(); if (!host) return;
+  GR.view = 'test'; GR.testKey = [courseId, materialId];
+  if (!keep || !GR.test) { GR.subFilter = 'all'; GR.subQ = ''; host.innerHTML = _grSpin('Loading the test…'); }
+  try {
+    const res = await fetch(`/api/admin/quiz/${courseId}/${materialId}/submissions?_t=${Date.now()}`, { cache: 'no-store' });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.message || 'Could not load the test.');
+    d.courseId = courseId; d.materialId = materialId;
+    GR.test = d;
+    if (GR.view === 'test') grRenderTest();
+  } catch (e) {
+    host.innerHTML = `<div class="gr-loading"><i class="fas fa-triangle-exclamation"></i> ${escapeHtml(e.message)} <button class="btn btn-outline btn-sm" onclick="grGoHome()">Back</button></div>`;
+  }
+}
+function grRenderTest() {
+  const host = _grHost(); const d = GR.test; if (!host || !d) return;
+  const S = d.stats || {}; const C = d.config || {};
+  const subs = d.submissions || [];
+  const isAdminUser = GR.home ? GR.home.role === 'admin' : isAdmin(currentUser);
+  const maxBar = Math.max(1, ...(S.distribution || [0]));
+  const hist = (S.distribution || []).map((n, i) => `
+    <div class="gr-hist-col" title="${i * 10}–${i === 9 ? 100 : i * 10 + 9}%: ${n} student${n === 1 ? '' : 's'}">
+      <span class="gr-hist-n">${n || ''}</span>
+      <span class="gr-hist-bar ${_grPctTone(i * 10 + 5)}" style="height:${Math.round(n / maxBar * 100)}%"></span>
+      <span class="gr-hist-l">${i * 10}</span>
+    </div>`).join('');
+
+  let qs = (d.questionStats || []).slice();
+  if (GR.qSort === 'hard') qs.sort((a, b) => (a.correctPct ?? 101) - (b.correctPct ?? 101));
+  if (GR.qSort === 'time') qs.sort((a, b) => (b.avgTimeSeconds || 0) - (a.avgTimeSeconds || 0));
+  const hardest = (d.questionStats || []).filter(x => x.correctPct !== null && x.responses >= 3).sort((a, b) => a.correctPct - b.correctPct).slice(0, 2).map(x => x.index);
+  const qRows = qs.map(x => `
+    <tr>
+      <td><span class="qs-chip">Q${x.index + 1}</span></td>
+      <td class="gr-qtext"><span class="latex-content">${escapeHtml(x.question || '')}</span>
+        <div class="qs-muted">${escapeHtml(x.type)}${hardest.includes(x.index) ? ' · <b class="gr-hard">hardest</b>' : ''}</div></td>
+      <td>${x.attemptedPct === null ? '—' : x.attemptedPct + '%'}</td>
+      <td>${x.correctPct === null ? '<span class="qs-muted">—</span>' : `<span class="gr-mini"><span class="gr-bar"><span class="gr-bar-fill ${_grPctTone(x.correctPct)}" style="width:${x.correctPct}%"></span></span><b>${x.correctPct}%</b></span>`}</td>
+      <td class="qs-muted">${x.avgTimeSeconds ? _qsFmtSecs(x.avgTimeSeconds) : '—'}</td>
+    </tr>`).join('');
+
+  const sq = GR.subQ.trim().toLowerCase();
+  const list = subs.filter(r =>
+    (GR.subFilter === 'all' || (GR.subFilter === 'grade' && r.pendingEvaluation) || (GR.subFilter === 'flagged' && ((r.proctor && r.proctor.strikes > 0) || r.autoSubmitted))) &&
+    (!sq || ((r.fullName || '') + ' ' + r.username + ' ' + r.email).toLowerCase().includes(sq)));
+  const subRows = list.map(r => {
+    const pct = r.finalMarksPossible > 0 ? Math.round(r.finalMarksEarned / r.finalMarksPossible * 1000) / 10 : 0;
+    const strikes = (r.proctor && r.proctor.strikes) || 0;
+    const cap = C.maxAttempts ? C.maxAttempts + (r.extraAttempts || 0) : 0;
+    return `<tr class="gr-row" onclick="grOpenAttempt('${d.courseId}','${d.materialId}','${escapeHtml(r.userId)}')">
+      <td><div class="gr-who"><span class="gr-avatar">${escapeHtml((r.fullName || r.username || '?').charAt(0).toUpperCase())}</span>
+        <span><b>${escapeHtml(r.fullName || r.username)}</b><span class="qs-muted">@${escapeHtml(r.username || '')}</span></span></div></td>
+      <td data-label="Marks"><b>${_grN(r.finalMarksEarned)}</b><span class="qs-muted"> / ${_grN(r.finalMarksPossible)}</span>
+        <div class="gr-mini"><span class="gr-bar"><span class="gr-bar-fill ${_grPctTone(pct)}" style="width:${Math.min(100, pct)}%"></span></span><span class="qs-muted">${pct}%</span></div></td>
+      <td data-label="Status">${r.pendingEvaluation ? `<span class="qs-chip warn">${r.subjectiveTotal - r.subjectiveGraded} to grade</span>` : '<span class="qs-chip ok">Done</span>'}
+        ${r.finalizedBy === 'server' ? '<span class="qs-chip bad">Time ran out</span>' : r.autoSubmitted ? '<span class="qs-chip bad">Auto-submitted</span>' : ''}${r.late ? '<span class="qs-chip warn">Late</span>' : ''}</td>
+      <td data-label="Warnings">${strikes ? `<span class="qs-chip bad"><i class="fas fa-shield-halved"></i> ${strikes}</span>` : '<span class="qs-muted">0</span>'}</td>
+      <td data-label="Attempts" class="qs-muted">${r.attempts}${cap ? ' / ' + cap : ''}${r.extraAttempts ? ` <span title="extra granted">(+${r.extraAttempts})</span>` : ''}</td>
+      <td data-label="Time" class="qs-muted">${r.timeSpentTotalSeconds ? _qsFmtSecs(r.timeSpentTotalSeconds) : '—'}</td>
+      <td data-label="Submitted" class="qs-muted">${_grAgo(r.lastAttemptAt)}</td>
+      <td><i class="fas fa-chevron-right gr-go"></i></td>
+    </tr>`;
+  }).join('');
+  const toGrade = subs.filter(r => r.pendingEvaluation).length;
+  const flagged = subs.filter(r => (r.proctor && r.proctor.strikes > 0) || r.autoSubmitted).length;
+  const running = (d.running || []).map(r => `
+    <div class="qs-live-row"><span class="qs-live-dot"></span><strong>${escapeHtml(r.name)}</strong>
+      <span class="qs-chip">${r.remainingSeconds === null ? 'no time limit' : _qsFmtSecs(r.remainingSeconds) + ' left'}</span>
+      <span class="qs-chip">${r.answered} answered</span>
+      ${r.strikes ? `<span class="qs-chip bad"><i class="fas fa-shield-halved"></i> ${r.strikes}</span>` : ''}
+      <span class="qs-muted">last saved ${r.savedAt ? _grAgo(r.savedAt) : '—'}</span></div>`).join('');
+
+  host.innerHTML = `
+    ${_grCrumbs([{ label: 'Grading', go: 'grGoHome()' }, { label: (d.course.code ? d.course.code + ' · ' : '') + d.course.name, go: 'grGoHome()' }, { label: d.title }])}
+    <div class="gr-head">
+      <div><h2>${escapeHtml(d.title)}</h2>
+        <div class="gr-test-meta">
+          <span><i class="fas fa-book"></i> ${escapeHtml((d.course.code ? d.course.code + ' — ' : '') + d.course.name)}</span>
+          <span><i class="fas fa-list-ol"></i> ${C.questionCount} questions</span>
+          <span><i class="fas fa-star"></i> ${_grN(C.totalMarks)} marks</span>
+          <span><i class="fas fa-clock"></i> ${escapeHtml(C.totalTime || 'no time limit')}</span>
+          <span><i class="fas fa-rotate-right"></i> ${C.maxAttempts ? C.maxAttempts + ' attempt' + (C.maxAttempts === 1 ? '' : 's') : 'unlimited attempts'}</span>
+          <span><i class="fas ${C.allowBackNavigation ? 'fa-arrows-left-right' : 'fa-lock'}"></i> ${C.allowBackNavigation ? 'free navigation' : 'forward-only'}</span>
+          <span class="gr-mode gr-mode-${escapeHtml(C.resultPublishMode)}">results: ${escapeHtml(C.resultPublishMode)}</span>
+        </div></div>
+      <div class="gr-head-actions">
+        <button class="btn btn-outline btn-sm" onclick="grOpenTest('${d.courseId}','${d.materialId}',true)" title="Refresh"><i class="fas fa-rotate"></i></button>
+        <button class="btn btn-outline btn-sm" onclick="grExportCsv()" ${subs.length ? '' : 'disabled'}><i class="fas fa-file-csv"></i> CSV</button>
+        <button class="btn btn-outline btn-sm" onclick="${GR.host && GR.host.id === 'grOverlayContent' ? 'closeGradingPanel();' : ''}openQuizEditor('${d.courseId}','${d.materialId}')"><i class="fas fa-pen-ruler"></i> Edit paper</button>
+        ${C.resultPublishMode !== 'immediate' ? `<button class="btn btn-primary btn-sm" onclick="grPublishNow()"><i class="fas fa-bullhorn"></i> Publish results</button>` : ''}
+      </div>
+    </div>
+
+    <div class="gr-kpis gr-kpis-6">
+      <div class="gr-kpi"><b>${S.count || 0}</b><span>submitted</span></div>
+      <div class="gr-kpi"><b>${_grN(S.avgPct)}%</b><span>average</span></div>
+      <div class="gr-kpi"><b>${_grN(S.medianPct)}%</b><span>median</span></div>
+      <div class="gr-kpi ok"><b>${_grN(S.highestPct)}%</b><span>highest</span></div>
+      <div class="gr-kpi bad"><b>${_grN(S.lowestPct)}%</b><span>lowest</span></div>
+      <div class="gr-kpi"><b>${S.passPct || 0}%</b><span>scored 40%+</span></div>
+    </div>
+
+    ${running ? `<section class="qs-live"><div class="qs-section-title"><i class="fas fa-circle-play"></i> Writing now (${(d.running || []).length})</div>${running}</section>` : ''}
+
+    <div class="gr-split">
+      <section class="gr-card">
+        <div class="gr-card-head"><h3><i class="fas fa-chart-column"></i> Score spread</h3><span class="qs-muted">% of total marks</span></div>
+        ${S.count ? `<div class="gr-hist">${hist}</div>` : '<div class="qs-empty"><p>No submissions yet.</p></div>'}
+      </section>
+      <section class="gr-card">
+        <div class="gr-card-head"><h3><i class="fas fa-magnifying-glass-chart"></i> Question analysis</h3>
+          <select onchange="GR.qSort=this.value;grRenderTest()">
+            <option value="order" ${GR.qSort === 'order' ? 'selected' : ''}>Paper order</option>
+            <option value="hard" ${GR.qSort === 'hard' ? 'selected' : ''}>Hardest first</option>
+            <option value="time" ${GR.qSort === 'time' ? 'selected' : ''}>Slowest first</option>
+          </select></div>
+        ${qRows ? `<div class="qs-table-wrap gr-qtable"><table class="qs-table"><thead><tr><th>#</th><th>Question</th><th>Attempted</th><th>Correct</th><th>Avg time</th></tr></thead><tbody>${qRows}</tbody></table></div>` : ''}
+      </section>
+    </div>
+
+    <section class="gr-card">
+      <div class="gr-card-head"><h3><i class="fas fa-users"></i> Submissions</h3>
+        ${toGrade ? `<button class="btn btn-primary btn-sm" onclick="grGradeNextInTest()"><i class="fas fa-play"></i> Grade next</button>` : ''}</div>
+      <div class="gr-toolbar">
+        <div class="gr-search"><i class="fas fa-magnifying-glass"></i><input type="search" placeholder="Search students…" value="${escapeHtml(GR.subQ)}" oninput="GR.subQ=this.value;clearTimeout(_grDeb);_grDeb=setTimeout(()=>{grRenderTest();const i=document.querySelector('.gr-sub-search input');if(i){i.focus();i.setSelectionRange(i.value.length,i.value.length);}},180)"></div>
+        <div class="qs-filters">${[['all', `All (${subs.length})`], ['grade', `To grade (${toGrade})`], ['flagged', `Flagged (${flagged})`]].map(([k, l]) =>
+          `<button class="qs-filter ${GR.subFilter === k ? 'on' : ''}" onclick="GR.subFilter='${k}';grRenderTest()">${l}</button>`).join('')}</div>
+      </div>
+      ${subRows ? `<div class="qs-table-wrap"><table class="qs-table gr-subs-table"><thead><tr><th>Student</th><th>Marks</th><th>Status</th><th>Warnings</th><th>Attempts</th><th>Time</th><th>Submitted</th><th></th></tr></thead><tbody>${subRows}</tbody></table></div>`
+        : `<div class="qs-empty"><i class="fas fa-inbox"></i><p>${subs.length ? 'Nobody matches.' : 'No submissions yet.'}</p></div>`}
+    </section>`;
+  const si = host.querySelectorAll('.gr-search')[0]; if (si) si.classList.add('gr-sub-search');
+  try { renderMathIn(host.querySelector('.gr-qtable')); } catch (_) {}
+}
+function grGradeNextInTest() {
+  const d = GR.test; if (!d) return;
+  const next = (d.submissions || []).filter(r => r.pendingEvaluation).sort((a, b) => new Date(a.lastAttemptAt || 0) - new Date(b.lastAttemptAt || 0))[0];
+  if (next) grOpenAttempt(d.courseId, d.materialId, next.userId);
+}
+async function grPublishNow() {
+  const d = GR.test; if (!d) return;
+  if (!(await quizConfirm({ title: 'Publish results now?', icon: 'fa-bullhorn', ok: 'Publish now',
+    text: 'Every submitted result is released and every student is notified. The paper switches to "Immediate" mode.' }))) return;
+  try {
+    const res = await fetch(`/api/admin/quiz/${d.courseId}/${d.materialId}/publish-now`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    const j = await res.json();
+    if (!j.success) throw new Error(j.message || 'Could not publish.');
+    showToast('✅ ' + (j.message || 'Results published.'), 'success');
+    grOpenTest(d.courseId, d.materialId, true);
+  } catch (e) { showToast(e.message, 'error'); }
+}
+function grExportCsv() {
+  const d = GR.test; if (!d) return;
+  _quizSubs = { data: d };
+  try { exportQuizSubmissionsCsv(); } finally { _quizSubs = null; }
+}
+
+/* ============================ ATTEMPT ============================ */
+async function grOpenAttempt(courseId, materialId, userId, keep) {
+  const host = _grHost(); if (!host) return;
+  GR.view = 'attempt'; GR.attemptKey = [courseId, materialId, userId];
+  if (!keep) host.innerHTML = _grSpin('Opening the answer sheet…');
+  try {
+    const res = await fetch(`/api/admin/quiz/${courseId}/${materialId}/attempt/${userId}?_t=${Date.now()}`, { cache: 'no-store' });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.message || 'Could not open the attempt.');
+    d.courseId = courseId; d.materialId = materialId;
+    GR.attempt = d;
+    if (GR.view === 'attempt') grRenderAttempt();
+    if (!keep) { const h = _grHost(); if (h) (h.closest('.gr-overlay') || window).scrollTo({ top: 0 }); }
+  } catch (e) {
+    host.innerHTML = `<div class="gr-loading"><i class="fas fa-triangle-exclamation"></i> ${escapeHtml(e.message)} <button class="btn btn-outline btn-sm" onclick="grGoHome()">Back</button></div>`;
+  }
+}
+function _grAnswerHtml(q, resp, r) {
+  const a = resp ? resp.a : undefined;
+  if (q.type === 'single' || q.type === 'multiple') {
+    const chosen = Array.isArray(a) ? a.map(Number) : (a === null || a === undefined ? [] : [Number(a)]);
+    return `<div class="gr-opts">${q.options.map((o, oi) => {
+      const isKey = q.correctIndexes.map(Number).includes(oi), isPick = chosen.includes(oi);
+      const cls = isPick && isKey ? 'pick-ok' : isPick ? 'pick-bad' : isKey ? 'key' : '';
+      return `<div class="gr-opt ${cls}"><span class="gr-opt-l">${_grLetter(oi)}</span><span class="latex-content">${escapeHtml(o)}</span>
+        <span class="gr-opt-tags">${isPick ? `<span class="qs-chip ${isKey ? 'ok' : 'bad'}">${isKey ? '<i class="fas fa-check"></i>' : '<i class="fas fa-xmark"></i>'} student</span>` : ''}${isKey ? '<span class="qs-chip ok">answer key</span>' : ''}</span></div>`;
+    }).join('')}</div>`;
+  }
+  if (q.type === 'integer' || q.type === 'numerical') {
+    const key = q.type === 'integer'
+      ? `${_grN(q.integerAnswer)}${q.integerTolerance ? ` (± ${_grN(q.integerTolerance)})` : ''}`
+      : `${_grN(q.rangeMin)} to ${_grN(q.rangeMax)}`;
+    return `<div class="gr-num">
+      <div><span class="qs-muted">Student answered</span><b class="${resp && resp.c ? 'ok' : (a === null || a === undefined ? '' : 'bad')}">${a === null || a === undefined ? '<em>not answered</em>' : escapeHtml(String(a))}</b></div>
+      <div><span class="qs-muted">Correct</span><b class="ok">${escapeHtml(key)}</b></div></div>`;
+  }
+  if (q.type === 'matrix') {
+    const picks = Array.isArray(a) ? a : [];
+    return `<table class="gr-matrix"><thead><tr><th>List I</th><th>Student</th><th>Correct</th></tr></thead><tbody>${(q.matrixLeftItems || []).map((item, li) => {
+      const row = (q.matrixRows || [])[li] || {};
+      const p = picks[li], ok = p !== null && p !== undefined && Number(p) === Number(row.correctIndex);
+      const lab = (i) => i === null || i === undefined || i === '' ? '—' : `${_GR_RIGHT[i] || i + 1}. ${escapeHtml(String((q.matrixRightItems || [])[i] || '').slice(0, 60))}`;
+      return `<tr><td><b>${_grLetter(li)}.</b> <span class="latex-content">${escapeHtml(item)}</span></td>
+        <td class="${p === null || p === undefined ? '' : ok ? 'ok' : 'bad'}">${lab(p)}</td><td class="ok">${lab(row.correctIndex)}</td></tr>`;
+    }).join('')}</tbody></table>`;
+  }
+  return '';
+}
+function grRenderAttempt() {
+  const host = _grHost(); const d = GR.attempt; if (!host || !d) return;
+  const r = d.result || {}; const st = d.student; const cfg = (d.test && d.test.config) || {};
+  const responses = Array.isArray(r.responses) && r.responses.length === d.quiz.length ? r.responses : null;
+  const tsp = r.timeSpentPerQuestion || {};
+  const evals = r.subjectiveEvaluations || {};
+  const strikes = (r.proctor && r.proctor.strikes) || 0;
+  const cap = Number(cfg.maxAttempts) > 0 ? Number(cfg.maxAttempts) + (Number(r.extraAttempts) || 0) : 0;
+  const timeTaken = Number(r.timeSpentTotalSeconds) || Object.values(tsp).reduce((s, v) => s + (Number(v) || 0), 0);
+  const pending = _grPendingCount(r);
+
+  /* per-question summary counts */
+  let nRight = 0, nWrong = 0, nSkip = 0;
+  d.quiz.forEach((q, i) => {
+    if (q.type === 'subjective' || !responses) return;
+    const x = responses[i]; if (x.c) nRight++; else if (x.at) nWrong++; else nSkip++;
+  });
+
+  /* where to go next: same test list, else the global queue */
+  const subs = GR.test && GR.test.materialId === d.materialId ? GR.test.submissions : null;
+  const idx = subs ? subs.findIndex(x => x.userId === st.id) : -1;
+  const prevS = idx > 0 ? subs[idx - 1] : null, nextS = idx >= 0 && idx < subs.length - 1 ? subs[idx + 1] : null;
+  const qNext = GR.home ? GR.home.queue.find(x => !(x.userId === st.id && x.materialId === d.materialId)) : null;
+
+  const cards = d.quiz.map((q, i) => {
+    const t = Number(tsp[i]) || 0;
+    let chip = '';
+    if (q.type === 'subjective') {
+      const ev = evals[i] || evals[String(i)];
+      chip = ev ? `<span class="qs-chip ok">${_grN(ev.awardedMarks)} / ${_grN(q.subjectiveMaxMarks)}</span>` : `<span class="qs-chip warn"><i class="fas fa-hourglass-half"></i> to grade</span>`;
+    } else if (responses) {
+      const x = responses[i];
+      chip = x.c ? `<span class="qs-chip ok"><i class="fas fa-check"></i> +${_grN(x.g)}</span>`
+        : x.at ? `<span class="qs-chip bad"><i class="fas fa-xmark"></i> ${_grN(x.g)}</span>` : `<span class="qs-chip">skipped · 0</span>`;
+    }
+    let body;
+    if (q.type === 'subjective') body = _grSubjectiveHtml(q, i, r);
+    else if (responses) body = _grAnswerHtml(q, responses[i], r);
+    else body = `<div class="qs-muted gr-legacy"><i class="fas fa-circle-info"></i> Answer details are recorded for attempts submitted from today on. This attempt only has its total.</div>`;
+    return `<article class="gr-q ${q.type === 'subjective' && !(evals[i] || evals[String(i)]) ? 'is-pending' : ''}" id="grQ${i}">
+      <header><span class="qs-chip">Q${i + 1}</span><span class="qs-muted">${escapeHtml(q.type)} · ${q.type === 'subjective' ? '+' + _grN(q.subjectiveMaxMarks) : `+${_grN(q.marks)}${q.negativeMarks ? ' / ' + _grN(q.negativeMarks) : ''}`}</span>
+        ${t ? `<span class="qs-muted"><i class="fas fa-stopwatch"></i> ${_qsFmtSecs(t)}</span>` : ''}<span class="gr-q-chip">${chip}</span></header>
+      <div class="gr-q-text latex-content">${escapeHtml(q.question)}</div>
+      ${body}
+      ${q.explanation ? `<details class="gr-expl"><summary>Explanation</summary><div class="latex-content">${escapeHtml(q.explanation)}</div></details>` : ''}
+    </article>`;
+  }).join('');
+
+  const timeline = ((r.proctor && r.proctor.events) || []).slice().sort((a, b) => (a.at || 0) - (b.at || 0)).map(e => `
+    <li class="${e.strike === false ? '' : 'bad'}"><span>${e.at ? new Date(e.at).toLocaleTimeString() : ''}</span>${escapeHtml(e.reason || '')}${e.strike === false ? ' <em>(not a warning)</em>' : ''}</li>`).join('');
+  const history = (Array.isArray(r.history) ? r.history : []).slice().reverse().map(h => `
+    <tr><td>#${h.attempt}</td><td>${_grN(h.marksEarned)} / ${_grN(h.marksPossible)}</td><td>${h.strikes || 0}</td>
+      <td>${h.finalizedBy === 'server' ? 'time ran out' : h.autoSubmitted ? 'auto-submitted' : 'submitted'}</td><td class="qs-muted">${_qsFmtDate(h.at)}</td></tr>`).join('');
+
+  const backLabel = subs ? d.test.title : 'Grading';
+  host.innerHTML = `
+    ${_grCrumbs([{ label: 'Grading', go: 'grGoHome()' }, { label: d.test.title, go: `grOpenTest('${d.courseId}','${d.materialId}')` }, { label: st.fullName || st.username }])}
+    <div class="gr-attempt">
+      <aside class="gr-side">
+        <section class="gr-card gr-student">
+          <span class="gr-avatar lg">${escapeHtml((st.fullName || st.username || '?').charAt(0).toUpperCase())}</span>
+          <h2>${escapeHtml(st.fullName || st.username)}</h2>
+          <div class="qs-muted">@${escapeHtml(st.username || '')}</div>
+          <ul class="gr-facts">
+            ${st.email ? `<li><i class="fas fa-envelope"></i><a href="mailto:${escapeHtml(st.email)}">${escapeHtml(st.email)}</a></li>` : ''}
+            ${st.phone ? `<li><i class="fas fa-phone"></i>${escapeHtml(st.phone)}</li>` : ''}
+            <li><i class="fas fa-book"></i>${escapeHtml((d.course.code ? d.course.code + ' — ' : '') + d.course.name)}</li>
+            <li><i class="fas fa-file-pen"></i>${escapeHtml(d.test.title)}</li>
+            ${st.joinedAt ? `<li><i class="fas fa-user-clock"></i>joined ${_qsFmtDate(st.joinedAt)}</li>` : ''}
+          </ul>
+        </section>
+        <section class="gr-card gr-score">
+          <div class="gr-score-big"><b>${_grN(d.final.earned)}</b><span>/ ${_grN(d.final.possible)}</span></div>
+          <div class="gr-bar lg"><span class="gr-bar-fill ${_grPctTone(d.final.pct)}" style="width:${Math.min(100, d.final.pct)}%"></span></div>
+          <div class="gr-score-row"><span>${_grN(d.final.pct)}%</span><span>rank <b>#${d.rank || '—'}</b> of ${d.of}</span><span>class avg ${_grN(d.classAvgPct)}%</span></div>
+          <ul class="gr-facts">
+            <li><i class="fas fa-robot"></i>Auto-graded <b>${_grN(r.marksEarned)} / ${_grN(r.marksPossible)}</b></li>
+            ${Number(r.subjectiveMaxTotal) ? `<li><i class="fas fa-pen-nib"></i>Written <b>${_grN(r.subjectiveMarksAwarded)} / ${_grN(r.subjectiveMaxTotal)}</b>${pending ? ` <span class="qs-chip warn">${pending} to grade</span>` : ''}</li>` : ''}
+            ${responses ? `<li><i class="fas fa-list-check"></i><span class="ok-t">${nRight} right</span> · <span class="bad-t">${nWrong} wrong</span> · ${nSkip} skipped</li>` : ''}
+            <li><i class="fas fa-stopwatch"></i>Time taken <b>${timeTaken ? _qsFmtSecs(timeTaken) : '—'}</b>${r.durationSeconds ? ` of ${_qsFmtSecs(r.durationSeconds)}` : ''}</li>
+            <li><i class="fas fa-calendar-check"></i>Submitted ${_qsFmtDate(r.lastAttemptAt)}</li>
+            ${r.kind === 'assignment' ? `<li><i class="fas fa-book-open-reader"></i>Assignment${r.late ? ' — <span class="bad-t">submitted late</span>' : ' — on time'}</li>` : ''}
+            <li><i class="fas fa-flag-checkered"></i>${r.finalizedBy === 'server' ? '<span class="bad-t">Time ran out — graded from autosave</span>' : r.autoSubmitted ? '<span class="bad-t">Auto-submitted</span>' : 'Submitted by the student'}</li>
+            <li><i class="fas fa-shield-halved"></i>${strikes ? `<span class="bad-t">${strikes} proctoring warning${strikes === 1 ? '' : 's'}</span>` : 'No warnings'}</li>
+            <li><i class="fas fa-rotate-right"></i>Attempt <b>${r.attempts}</b>${cap ? ` of ${cap}` : ''}${r.extraAttempts ? ` <span class="qs-muted">(+${r.extraAttempts} granted)</span>` : ''}</li>
+          </ul>
+          ${cap ? `<button class="btn btn-outline btn-sm btn-block" onclick="grGrantAttempt()"><i class="fas fa-plus"></i> Grant another attempt</button>` : ''}
+          <button class="btn btn-outline btn-sm btn-block" onclick="downloadReportCard('${escapeHtml(st.id)}')"><i class="fas fa-file-pdf"></i> Report card (PDF)</button>
+        </section>
+        ${timeline ? `<section class="gr-card"><h3 class="gr-h3"><i class="fas fa-shield-halved"></i> Proctoring timeline</h3><ul class="qs-log">${timeline}</ul></section>` : ''}
+        ${history ? `<section class="gr-card"><h3 class="gr-h3"><i class="fas fa-clock-rotate-left"></i> Earlier attempts</h3>
+          <div class="qs-table-wrap"><table class="qs-table gr-hist-table"><thead><tr><th>#</th><th>Marks</th><th>Warn.</th><th>Ended</th><th>When</th></tr></thead><tbody>${history}</tbody></table></div></section>` : ''}
+      </aside>
+
+      <div class="gr-main">
+        <div class="gr-attempt-bar">
+          <div class="gr-jump">${d.quiz.map((q, i) => {
+            let cls = '';
+            if (q.type === 'subjective') cls = (evals[i] || evals[String(i)]) ? 'ok' : 'warn';
+            else if (responses) cls = responses[i].c ? 'ok' : responses[i].at ? 'bad' : '';
+            return `<button type="button" class="${cls}" onclick="document.getElementById('grQ${i}').scrollIntoView({behavior:'smooth',block:'start'})">${i + 1}</button>`;
+          }).join('')}</div>
+          <div class="gr-nav">
+            ${prevS ? `<button class="btn btn-outline btn-sm" onclick="grOpenAttempt('${d.courseId}','${d.materialId}','${prevS.userId}')" title="Previous student"><i class="fas fa-chevron-left"></i></button>` : ''}
+            ${nextS ? `<button class="btn btn-outline btn-sm" onclick="grOpenAttempt('${d.courseId}','${d.materialId}','${nextS.userId}')" title="Next student"><i class="fas fa-chevron-right"></i></button>` : ''}
+            ${!pending && qNext ? `<button class="btn btn-primary btn-sm" onclick="grOpenAttempt('${qNext.courseId}','${qNext.materialId}','${qNext.userId}')">Next in queue <i class="fas fa-arrow-right"></i></button>` : ''}
+          </div>
+        </div>
+        ${cards}
+      </div>
+    </div>`;
+  try { renderMathIn(host.querySelector('.gr-main')); } catch (_) {}
+}
+function _grPendingCount(r) {
+  const total = Object.keys(r.subjectiveQuestionMeta || {}).length;
+  return Math.max(0, total - Object.keys(r.subjectiveEvaluations || {}).length);
+}
+function _grSubjectiveHtml(q, i, r) {
+  const files = (r.subjectiveAnswers || {})[i] || (r.subjectiveAnswers || {})[String(i)] || [];
+  const meta = (r.subjectiveQuestionMeta || {})[i] || (r.subjectiveQuestionMeta || {})[String(i)] || {};
+  const ev = (r.subjectiveEvaluations || {})[i] || (r.subjectiveEvaluations || {})[String(i)];
+  const max = Number(meta.maxMarks) || Number(q.subjectiveMaxMarks) || 0;
+  const fileHtml = files.length ? files.map(f => {
+    const isPdf = f.isPdf || /\.pdf($|\?)/i.test(f.url || '');
+    const href = withAuthToken(f.url);
+    return isPdf
+      ? `<a class="qs-file pdf" href="${escapeHtml(href)}" target="_blank" rel="noopener" onclick="return aeroOpenPdfUrl(event, ${jsStr(f.url || '')}, ${jsStr(f.fileName || 'Answer sheet')})"><i class="fas fa-file-pdf"></i><span>${escapeHtml(f.fileName || 'answer.pdf')}</span></a>`
+      : `<a class="qs-file img" href="${escapeHtml(href)}" target="_blank" rel="noopener"><img src="${escapeHtml(href)}" alt="" loading="lazy"><span>${escapeHtml(f.fileName || 'photo')}</span></a>`;
+  }).join('') : '<div class="qs-muted"><i class="fas fa-circle-exclamation"></i> No file was uploaded for this question.</div>';
+  const quick = max > 0 ? [0, 0.25, 0.5, 0.75, 1].map(f => Math.round(max * f * 2) / 2) : [];
+  return `
+    ${meta.instructions ? `<div class="qs-muted">${escapeHtml(meta.instructions)}</div>` : ''}
+    <div class="qs-files">${fileHtml}</div>
+    <div class="qs-grade-form gr-grade" data-qi="${i}" data-max="${max}">
+      <label><span>Marks <span class="qs-muted">(max ${_grN(max)})</span></span>
+        <input type="number" min="0" max="${max}" step="0.5" class="qs-marks" value="${ev ? escapeHtml(String(ev.awardedMarks)) : (files.length ? '' : '0')}" placeholder="0–${_grN(max)}"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();grSaveGrade(this);}">
+      </label>
+      <div class="gr-quick">${[...new Set(quick)].map(v => `<button type="button" onclick="this.closest('.gr-grade').querySelector('.qs-marks').value='${v}'">${_grN(v)}</button>`).join('')}</div>
+      <label class="qs-fb"><span>Feedback for the student <span class="qs-muted">(optional)</span></span>
+        <textarea rows="2" maxlength="1000" class="qs-feedback" placeholder="What was good, what was missing…">${ev ? escapeHtml(ev.feedback || '') : ''}</textarea>
+      </label>
+      <button class="btn btn-primary btn-sm" onclick="grSaveGrade(this)"><i class="fas fa-check"></i> ${ev ? 'Update' : 'Save marks'}</button>
+      ${ev ? `<span class="qs-chip ok"><i class="fas fa-check"></i> graded ${_qsFmtDate(ev.evaluatedAt)}</span>` : ''}
+    </div>`;
+}
+async function grSaveGrade(el) {
+  const d = GR.attempt; if (!d) return;
+  const box = el.closest('.gr-grade');
+  const qi = Number(box.dataset.qi), max = Number(box.dataset.max) || 0;
+  const mEl = box.querySelector('.qs-marks');
+  const raw = mEl.value.trim(), marks = Number(raw);
+  if (raw === '' || !isFinite(marks) || marks < 0 || marks > max) { mEl.focus(); return showToast(`Enter marks between 0 and ${_grN(max)}.`, 'error'); }
+  const btn = box.querySelector('.btn-primary'); if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…'; }
+  try {
+    const res = await fetch(`/api/admin/quiz/${d.courseId}/${d.materialId}/evaluate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: d.student.id, questionIndex: qi, awardedMarks: marks, feedback: box.querySelector('.qs-feedback').value })
+    });
+    const j = await res.json();
+    if (!j.success) throw new Error(j.message || 'Could not save.');
+    showToast(`Q${qi + 1}: ${_grN(marks)} mark${marks === 1 ? '' : 's'} saved.`, 'success');
+    GR.home = null; GR.test = GR.test && GR.test.materialId === d.materialId ? GR.test : GR.test;
+    const scrollY = (document.querySelector('.gr-overlay') || document.scrollingElement || document.documentElement).scrollTop;
+    await grOpenAttempt(d.courseId, d.materialId, d.student.id, true);
+    try { (document.querySelector('.gr-overlay') || document.scrollingElement || document.documentElement).scrollTop = scrollY; } catch (_) {}
+    /* refresh the lists in the background (counts, queue) */
+    fetchJSON(`${API_BASE}/admin/grading/overview?_t=${Date.now()}`, { cache: 'no-store' }).then(h => {
+      if (h && h.success) { GR.home = h; const b = document.getElementById('grBadge'); if (b) { b.textContent = h.totals.toGrade; b.hidden = !h.totals.toGrade; } if (h.role === 'professor') _grSetProfBadge(h.totals.toGrade); if (GR.view === 'attempt') grRenderAttempt(); }
+    }).catch(() => {});
+    if (GR.test && GR.test.materialId === d.materialId) {
+      fetch(`/api/admin/quiz/${d.courseId}/${d.materialId}/submissions?_t=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).then(t => {
+        if (t && t.success) { t.courseId = d.courseId; t.materialId = d.materialId; GR.test = t; }
+      }).catch(() => {});
+    }
+  } catch (e) {
+    showToast(e.message, 'error');
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-check"></i> Save marks'; }
+  }
+}
+async function grGrantAttempt() {
+  const d = GR.attempt; if (!d) return;
+  const ok = await quizConfirm({
+    title: 'Grant another attempt?', icon: 'fa-rotate-right', ok: 'Grant 1 attempt',
+    text: `${d.student.fullName || d.student.username} will be able to take "${d.test.title}" one more time (for example after a network or power failure). Their current result stays until they submit again.`
+  });
+  if (!ok) return;
+  try {
+    const res = await fetch(`/api/admin/quiz/${d.courseId}/${d.materialId}/grant-attempt`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: d.student.id, count: 1 })
+    });
+    const j = await res.json();
+    if (!j.success) throw new Error(j.message || 'Could not grant.');
+    showToast(j.message, 'success');
+    grOpenAttempt(d.courseId, d.materialId, d.student.id, true);
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
 async function publishQuizResultsNow() {
   if (!quizEditingCourseId || !quizEditingMaterialId) {
     return showToast('No quiz is open.', 'error');
   }
-  if (!confirm(
-    'Release every submitted result NOW and notify every student?\n\n' +
-    'This also switches this paper back to "Immediate" mode, so any ' +
-    'student who submits later sees their score straight away.'
-  )) return;
+  if (!(await quizConfirm({
+    title: 'Publish results now?',
+    text: 'Every submitted result is released and every student is notified. The paper also switches to "Immediate" mode, so anyone who submits later sees their score straight away.',
+    ok: 'Publish now', icon: 'fa-bullhorn'
+  }))) return;
 
   const btn = document.querySelector('button[onclick="publishQuizResultsNow()"]');
   const orig = btn ? btn.innerHTML : '';
@@ -10681,6 +13207,7 @@ async function renderQuizEditor() {
     const saved = getSavedQuizDraft(quizEditingMaterialId);
     if (saved && Array.isArray(saved.quiz) && saved.quiz.length > 0) {
       quizDraft = saved.quiz.map(q => normalizeQuestion(q));
+      _quizDraftSavedJSON = '';
       const sc = saved.config || {};
       quizPaperConfig = {
         subject:    sc.subject    || '',
@@ -10693,10 +13220,13 @@ async function renderQuizEditor() {
         resultPublishMode:       sc.resultPublishMode   || 'immediate',
         resultPublishAt:         sc.resultPublishAt     || null,
         resultPublishDelayHours: Number(sc.resultPublishDelayHours) || 0,
-        resultsPublished:        sc.resultsPublished === true
+        resultsPublished:        sc.resultsPublished === true,
+      kind: sc.kind === 'assignment' ? 'assignment' : 'test', dueAt: sc.dueAt || null,
+      allowLate: sc.allowLate !== false, showLeaderboard: sc.showLeaderboard === true
       };
     } else {
       quizDraft = (mat.quiz || []).map(q => normalizeQuestion(q));
+      _quizDraftSavedJSON = JSON.stringify(quizDraft);
       const cfg = mat.examConfig || {};
       quizPaperConfig = {
         subject:    cfg.subject    || course.name || '',
@@ -10709,7 +13239,9 @@ async function renderQuizEditor() {
         resultPublishMode:       cfg.resultPublishMode   || 'immediate',
         resultPublishAt:         cfg.resultPublishAt     || null,
         resultPublishDelayHours: Number(cfg.resultPublishDelayHours) || 0,
-        resultsPublished:        cfg.resultsPublished === true
+        resultsPublished:        cfg.resultsPublished === true,
+      kind: cfg.kind === 'assignment' ? 'assignment' : 'test', dueAt: cfg.dueAt || null,
+      allowLate: cfg.allowLate !== false, showLeaderboard: cfg.showLeaderboard === true
       };
     }
   }
@@ -10729,6 +13261,9 @@ async function renderQuizEditor() {
         </button>
         <button class="btn btn-outline" onclick="previewQuizPaper()">
           <i class="fas fa-eye"></i> Preview as Student
+        </button>
+        <button class="btn btn-outline" onclick="openQuizSubmissions()">
+          <i class="fas fa-inbox"></i> Submissions &amp; Grading
         </button>
         <button class="btn btn-primary" onclick="saveQuizPaper()" id="quizSaveBtn">
           <i class="fas fa-save"></i> Save Paper
@@ -10764,6 +13299,37 @@ async function renderQuizEditor() {
           <span class="hint">Auto-computed from questions: <strong id="qpAutoHint">${autoTotal}</strong></span>
         </div>
       </div>
+    </div>
+
+    <!-- ⭐ 2026-10-11 — test or assignment, leaderboard -->
+    <div class="editor-section">
+      <div class="editor-section-title"><i class="fas fa-shapes"></i> Paper Type</div>
+      <div class="qe-kind">
+        <label class="qe-kind-opt">
+          <input type="radio" name="qpKind" value="test" ${quizPaperConfig.kind !== 'assignment' ? 'checked' : ''} onchange="onQuizKindChange()">
+          <span><b><i class="fas fa-stopwatch"></i> Test</b><small>Timed, full screen, proctored</small></span>
+        </label>
+        <label class="qe-kind-opt">
+          <input type="radio" name="qpKind" value="assignment" ${quizPaperConfig.kind === 'assignment' ? 'checked' : ''} onchange="onQuizKindChange()">
+          <span><b><i class="fas fa-book-open-reader"></i> Assignment</b><small>Homework with a due date — no timer, no proctoring</small></span>
+        </label>
+      </div>
+      <div class="editor-grid-2" id="qpAssignmentBox" style="margin-top:12px;display:${quizPaperConfig.kind === 'assignment' ? 'grid' : 'none'};">
+        <div class="form-group">
+          <label>Due date &amp; time</label>
+          <input type="datetime-local" id="qpDueAt" value="${toDateTimeLocalValue(quizPaperConfig.dueAt)}">
+          <span class="hint">Students see a countdown to this time. Leave empty for no deadline.</span>
+        </div>
+        <div class="form-group">
+          <label>After the due date</label>
+          <label class="qe-check"><input type="checkbox" id="qpAllowLate" ${quizPaperConfig.allowLate !== false ? 'checked' : ''}>
+            <span>Accept late submissions (marked <b>Late</b>)</span></label>
+        </div>
+      </div>
+      <label class="qe-check" style="margin-top:12px;">
+        <input type="checkbox" id="qpShowLeaderboard" ${quizPaperConfig.showLeaderboard ? 'checked' : ''}>
+        <span><b>Show a leaderboard</b> — students see the top 10 of this paper (first name + initial) with their result</span>
+      </label>
     </div>
 
     <!-- ⭐ ATTEMPT LIMITS & SCHEDULED RESULT PUBLICATION -->
@@ -10907,11 +13473,23 @@ async function renderQuizEditor() {
         </div>
       </div>
 
+      <!-- ⭐ 2026-10-11 — build the paper from the Question Bank -->
+      <div class="qe-bank-bar">
+        <span><i class="fas fa-box-archive"></i> <b>Question Bank</b> <span class="qs-muted">reuse saved questions</span></span>
+        <span class="qe-bank-actions">
+          <button class="btn btn-outline btn-sm" onclick="openBankPicker()"><i class="fas fa-magnifying-glass-plus"></i> Add from bank</button>
+          <button class="btn btn-outline btn-sm" onclick="openAutoPaper()"><i class="fas fa-wand-magic-sparkles"></i> Auto-generate</button>
+          <button class="btn btn-outline btn-sm" onclick="saveAllQuestionsToBank()" ${quizDraft.length ? '' : 'disabled'}><i class="fas fa-cloud-arrow-up"></i> Save all to bank</button>
+        </span>
+      </div>
+
       <p class="editor-hint">
         <strong>Overleaf-standard LaTeX is supported.</strong>
         Inline math: <code>$E = mc^2$</code> · Display math: <code>$$\\int_0^1 x^2\\,dx$$</code> ·
-        Also supports <code>\\begin{align}</code>, <code>\\begin{pmatrix}</code>, <code>\\ce{H2O}</code>, <code>\\textcolor</code>, and all amsmath/physics macros.
-        Live preview appears below every input.
+        Text LaTeX works too — <code>\\textbf</code>, lists, <code>tabular</code> tables, sections, theorem boxes, code — and
+        <strong>diagrams are compiled by real LaTeX</strong>: TikZ, pgfplots, circuitikz, chemfig, any <code>\\usepackage</code>
+        inside <code>\\begin{latex}…\\end{latex}</code>, even a whole <code>\\documentclass</code> document.
+        Click a field for the LaTeX toolbar, <button type="button" class="editor-hint-link" onclick="window.AeroTeX && AeroTeX.openGuide(document.querySelector('.latex-source'))">open the guide</button>.
       </p>
 
       <div id="quizDraftList"></div>
@@ -10946,6 +13524,8 @@ function renderQuizDraft() {
           <strong>Question ${qi + 1}</strong>
           <span class="mat-type">${questionTypeLabel(q.type)}</span>
           <span class="quiz-question-marks-badge">+${q.marks} / ${q.negativeMarks}</span>
+          ${q.topic ? `<span class="qe-topic-chip"><i class="fas fa-tag"></i> ${escapeHtml(q.topic)}</span>` : ''}
+          ${q.difficulty ? `<span class="qe-diff-chip qe-diff-${escapeHtml(q.difficulty)}">${escapeHtml(q.difficulty)}</span>` : ''}
         </div>
         <div class="quiz-question-controls">
           <button type="button" class="quiz-icon-btn" onclick="moveQuizQuestion(${qi}, -1)" title="Move up" ${qi === 0 ? 'disabled' : ''}>
@@ -10956,6 +13536,9 @@ function renderQuizDraft() {
           </button>
           <button type="button" class="quiz-icon-btn" onclick="duplicateQuizQuestion(${qi})" title="Duplicate">
             <i class="fas fa-copy"></i>
+          </button>
+          <button type="button" class="quiz-icon-btn" onclick="saveQuestionToBank(${qi})" title="Save to Question Bank">
+            <i class="fas fa-box-archive"></i>
           </button>
           <button type="button" class="quiz-icon-btn danger" onclick="removeQuizQuestion(${qi})" title="Delete">
             <i class="fas fa-trash-alt"></i>
@@ -10987,6 +13570,24 @@ function renderQuizDraft() {
         </div>
       </div>
 
+      <!-- ⭐ topic + difficulty: power students' topic-wise analysis and practice -->
+      <div class="editor-grid-2 qe-tags" style="margin-bottom:12px;">
+        <div class="form-group">
+          <label>Topic <span class="hint" style="display:inline;">· e.g. Bernoulli, Drag, Stability</span></label>
+          <input type="text" list="qeTopicList" maxlength="80" value="${escapeHtml(q.topic || '')}" placeholder="Topic of this question"
+                 onchange="updateQuizField(${qi}, 'topic', this.value.trim()); renderQuizDraft();">
+        </div>
+        <div class="form-group">
+          <label>Difficulty</label>
+          <select onchange="updateQuizField(${qi}, 'difficulty', this.value); renderQuizDraft();">
+            <option value="" ${!q.difficulty ? 'selected' : ''}>— Not set —</option>
+            <option value="easy" ${q.difficulty === 'easy' ? 'selected' : ''}>Easy</option>
+            <option value="medium" ${q.difficulty === 'medium' ? 'selected' : ''}>Medium</option>
+            <option value="hard" ${q.difficulty === 'hard' ? 'selected' : ''}>Hard</option>
+          </select>
+        </div>
+      </div>
+
       <div class="form-group" style="margin-bottom:14px;">
         <label>Question Text <span class="hint" style="display:inline;">· LaTeX supported</span></label>
         <textarea rows="3" class="latex-source" data-preview-id="q${qi}-question"
@@ -11010,6 +13611,23 @@ function renderQuizDraft() {
   list.innerHTML = html;
   renderMathIn(list);
   updateQuizTotals();
+  _qeRefreshTopicList();
+}
+
+/* topic suggestions in the editor: this paper's topics + the bank's */
+let _qeBankTopics = null;
+function _qeRefreshTopicList() {
+  let dl = document.getElementById('qeTopicList');
+  if (!dl) { dl = document.createElement('datalist'); dl.id = 'qeTopicList'; document.body.appendChild(dl); }
+  const set = new Set(quizDraft.map(q => (q.topic || '').trim()).filter(Boolean));
+  (_qeBankTopics || []).forEach(t => t && set.add(t));
+  dl.innerHTML = [...set].sort().map(t => `<option value="${escapeHtml(t)}"></option>`).join('');
+  if (_qeBankTopics === null) {
+    _qeBankTopics = [];
+    fetchJSON(`${API_BASE}/qbank/topics?_t=${Date.now()}`, { cache: 'no-store' })
+      .then(d => { if (d && d.success) { _qeBankTopics = d.topics.map(t => t.topic).filter(Boolean); _qeRefreshTopicList(); } })
+      .catch(() => {});
+  }
 }
 
 function questionTypeLabel(t) {
@@ -11085,6 +13703,7 @@ function renderAnswerArea(q, qi) {
   }
 
   if (q.type === 'matrix') {
+    _syncMatrixRows(q);
     const leftItems  = q.matrixLeftItems  || [];
     const rightItems = q.matrixRightItems || [];
     const rows       = q.matrixRows       || [];
@@ -11145,28 +13764,19 @@ function renderAnswerArea(q, qi) {
             Correct Matching (for each List-I item, choose the List-II match)
           </label>
           ${rows.map((r, ri) => `
-            <div class="quiz-option-row" style="margin-bottom:8px;">
+            <div class="quiz-option-row matrix-key-row" style="margin-bottom:8px;">
               <span class="quiz-play-letter">${String.fromCharCode(65 + ri)}</span>
-              <input type="text" style="flex:1;" class="latex-source" data-preview-id="q${qi}-row${ri}"
-                     placeholder="Row ${String.fromCharCode(65 + ri)} text (LaTeX ok)"
-                     value="${escapeHtml(r.text)}"
-                     oninput="updateMatrixRow(${qi}, ${ri}, 'text', this.value)">
+              <span class="matrix-key-item">${escapeHtml(leftItems[ri] || '') || '<em>empty item</em>'}</span>
               <span style="font-size:12px;color:var(--text-tertiary);padding:0 8px;">→</span>
-              <select style="min-width:120px;" onchange="updateMatrixRow(${qi}, ${ri}, 'correctIndex', parseInt(this.value,10) || 0)">
-                ${(rightItems.length ? rightItems : ['P','Q','R','S']).map((_, x) => {
+              <select style="min-width:140px;" aria-label="Correct match for ${String.fromCharCode(65 + ri)}" onchange="updateMatrixRow(${qi}, ${ri}, 'correctIndex', parseInt(this.value,10) || 0)">
+                ${(rightItems.length ? rightItems : ['P','Q','R','S']).map((item, x) => {
                   const label = ['P','Q','R','S','T','U','V','W'][x] || (x + 1);
-                  return `<option value="${x}" ${Number(r.correctIndex) === x ? 'selected' : ''}>${label}</option>`;
+                  return `<option value="${x}" ${Number(r.correctIndex) === x ? 'selected' : ''}>${label}${item ? '. ' + escapeHtml(String(item)).slice(0, 40) : ''}</option>`;
                 }).join('')}
               </select>
-              <button type="button" class="quiz-remove" style="width:24px;height:24px;"
-                      onclick="removeMatrixRow(${qi}, ${ri})" title="Remove row">
-                <i class="fas fa-times" style="font-size:10px;"></i>
-              </button>
             </div>
           `).join('')}
-          <button type="button" class="btn btn-outline btn-sm" onclick="addMatrixRow(${qi})">
-            <i class="fas fa-plus"></i> Add Row
-          </button>
+          <p class="hint" style="margin:6px 0 0;font-size:12px;color:var(--text-tertiary);">One correct match per List-I item — add or remove items above.</p>
         </div>
       </div>`;
   }
@@ -11267,8 +13877,8 @@ function addQuizQuestion(type = 'single') {
   renderQuizDraft();
 }
 
-function removeQuizQuestion(qi) {
-  if (!confirm(`Delete Question ${qi + 1}?`)) return;
+async function removeQuizQuestion(qi) {
+  if (!(await quizConfirm({ title: `Delete question ${qi + 1}?`, text: 'It is removed from this paper when you save.', ok: 'Delete', danger: true, icon: 'fa-trash' }))) return;
   quizDraft.splice(qi, 1);
   renderQuizDraft();
 }
@@ -11387,6 +13997,44 @@ function updateMatrixItem(qi, side, idx, value) {
   const key = side === 'left' ? 'matrixLeftItems' : 'matrixRightItems';
   if (!Array.isArray(q[key])) q[key] = [];
   q[key][idx] = value;
+  _syncMatrixRows(q);
+}
+/* ⭐ 2026-10-10: the answer key has exactly one row per List-I item. (Rows
+   used to be added/removed separately — an extra row could never be
+   answered, so the question could never be scored correct.) */
+function _syncMatrixRows(q) {
+  const left = Array.isArray(q.matrixLeftItems) ? q.matrixLeftItems : [];
+  const nRight = Math.max(1, (q.matrixRightItems || []).length);
+  const old = Array.isArray(q.matrixRows) ? q.matrixRows : [];
+  q.matrixRows = left.map((txt, i) => {
+    const ci = old[i] ? Number(old[i].correctIndex) : i;
+    return { text: txt || '', correctIndex: Number.isFinite(ci) ? Math.min(Math.max(0, ci), nRight - 1) : 0 };
+  });
+}
+/* ⭐ blank options / list items are dropped on save (students used to see
+   empty choices); the answer key is re-pointed to the same items */
+function _cleanQuestionForSave(q) {
+  const c = JSON.parse(JSON.stringify(q));
+  if ((c.type === 'single' || c.type === 'multiple') && Array.isArray(c.options)) {
+    const keep = [], map = {};
+    c.options.forEach((o, i) => { if (String(o || '').trim()) { map[i] = keep.length; keep.push(o); } });
+    c.correctIndexes = (c.correctIndexes || []).filter(i => map[i] !== undefined).map(i => map[i]);
+    c.options = keep;
+  }
+  if (c.type === 'matrix') {
+    _syncMatrixRows(c);
+    const rmap = {}, right = [];
+    (c.matrixRightItems || []).forEach((o, i) => { if (String(o || '').trim()) { rmap[i] = right.length; right.push(o); } });
+    const left = [], rows = [];
+    (c.matrixLeftItems || []).forEach((o, i) => {
+      if (!String(o || '').trim()) return;
+      left.push(o);
+      const ci = c.matrixRows[i] ? c.matrixRows[i].correctIndex : 0;
+      rows.push({ text: o, correctIndex: rmap[ci] !== undefined ? rmap[ci] : -1 });
+    });
+    c.matrixLeftItems = left; c.matrixRightItems = right; c.matrixRows = rows;
+  }
+  return c;
 }
 
 function addMatrixItem(qi, side) {
@@ -11396,10 +14044,7 @@ function addMatrixItem(qi, side) {
   if (!Array.isArray(q[key])) q[key] = [];
   if (q[key].length >= 8) return showToast('Max 8 items per column.', 'info');
   q[key].push('');
-  if (side === 'left') {
-    if (!Array.isArray(q.matrixRows)) q.matrixRows = [];
-    q.matrixRows.push({ text: '', correctIndex: 0 });
-  }
+  _syncMatrixRows(q);
   renderQuizDraft();
 }
 
@@ -11471,6 +14116,7 @@ async function saveQuizPaper() {
     : 0;
 
   const resultMode = $('qpResultMode')?.value || 'immediate';
+  const _qpKind = (document.querySelector('input[name="qpKind"]:checked') || {}).value === 'assignment' ? 'assignment' : 'test';
 
   /* Absolute publish time — only meaningful in "scheduled" mode */
   let resultPublishAt = null;
@@ -11505,12 +14151,19 @@ async function saveQuizPaper() {
     maxAttempts,
     resultPublishMode:       resultMode,
     resultPublishAt,
-    resultPublishDelayHours
+    resultPublishDelayHours,
+
+    /* ⭐ 2026-10-11 — test / assignment, due date, leaderboard */
+    kind:            _qpKind,
+    dueAt:           _qpKind === 'assignment' && $('qpDueAt') && $('qpDueAt').value ? new Date($('qpDueAt').value).toISOString() : null,
+    allowLate:       $('qpAllowLate') ? $('qpAllowLate').checked : true,
+    showLeaderboard: $('qpShowLeaderboard') ? $('qpShowLeaderboard').checked : false
   };
 
-  /* ---------- Per-question validation (unchanged) ---------- */
-  for (let i = 0; i < quizDraft.length; i++) {
-    const q = quizDraft[i];
+  /* ---------- clean blanks, then validate exactly what will be saved ---------- */
+  const cleaned = quizDraft.map(_cleanQuestionForSave);
+  for (let i = 0; i < cleaned.length; i++) {
+    const q = cleaned[i];
     if (!q.question || !q.question.trim()) {
       return showToast(`Question ${i + 1} has no text.`, 'error');
     }
@@ -11554,7 +14207,7 @@ async function saveQuizPaper() {
       const right = (q.matrixRightItems || []).filter(x => x && x.trim());
       if (left.length  < 2) return showToast(`Question ${i + 1}: at least 2 List-I items required.`, 'error');
       if (right.length < 2) return showToast(`Question ${i + 1}: at least 2 List-II items required.`, 'error');
-      if ((q.matrixRows || []).length < 2) return showToast(`Question ${i + 1}: at least 2 rows required.`, 'error');
+      if ((q.matrixRows || []).some(r => r.correctIndex < 0)) return showToast(`Question ${i + 1}: a correct match points to an empty List-II item.`, 'error');
     }
   }
 
@@ -11562,7 +14215,7 @@ async function saveQuizPaper() {
   if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…'; }
 
   if (!quizPaperConfig.totalMarks) {
-    quizPaperConfig.totalMarks = quizDraft.reduce((s, q) => s + (Number(q.marks) || 0), 0);
+    quizPaperConfig.totalMarks = cleaned.reduce((s, q) => s + (Number(q.marks) || 0), 0);
   }
 
   try {
@@ -11571,12 +14224,15 @@ async function saveQuizPaper() {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quiz: quizDraft, examConfig: quizPaperConfig })
+        body: JSON.stringify({ quiz: cleaned, examConfig: quizPaperConfig })
       }
     );
     const data = await res.json();
     if (data.success) {
       showToast('✅ Paper saved!', 'success');
+      quizDraft = cleaned;                 // the editor now shows exactly what was saved
+      _quizDraftSavedJSON = JSON.stringify(quizDraft);
+      renderQuizDraft();
       await fetchCoursesFromDB();
     } else {
       showToast(data.message || 'Failed to save.', 'error');
@@ -11626,15 +14282,16 @@ function _detachAllProctorListeners() {
    OPEN — Shows pre-exam consent first
    ============================================================ */
 async function openQuizPlayer(courseId, materialId) {
+  if (!currentUser && isGuestBrowsing()) return aeroGuestGate(courseId, materialId);
   const course = findCourse(courseId); if (!course) return;
   const mat = (course.materials || []).find(m => m.id === materialId); if (!mat) return;
 
-  // Quiz data is not in the cached list — fetch it on demand
-  let quiz = mat.quiz;
-  if (!quiz || quiz.length === 0) {
+  /* ⭐ always the CURRENT paper (a cached copy kept students on an old
+     version after the instructor edited it) */
+  let quiz = null;
+  {
     try {
-      showToast('Loading quiz…', 'info');
-      const res = await fetch(`/api/courses/${courseId}/materials/${materialId}/full-quiz`);
+      const res = await fetch(`/api/courses/${courseId}/materials/${materialId}/full-quiz?_t=${Date.now()}`, { cache: 'no-store' });
       const data = await res.json();
       if (!data.success) return showToast(data.message || 'Could not load quiz.', 'error');
       quiz = data.quiz || [];
@@ -11652,7 +14309,8 @@ async function openQuizPlayer(courseId, materialId) {
      unreachable we fall back to a local shuffle so the exam still
      runs — the client is not the enforcer anyway. */
   let sessionInfo = null;
-  try {
+  const previewRole = isAdmin(currentUser) || String(currentUser.role || '').toLowerCase() === 'professor';
+  if (!previewRole) try {     // a preview records nothing, so it needs no server attempt
     const sres = await fetchJSON(
       `/api/user/quiz/${courseId}/${materialId}/start`,
       {
@@ -11666,6 +14324,18 @@ async function openQuizPlayer(courseId, materialId) {
       _examClockOffsetMs = (Number(sres.serverNow) || Date.now()) - Date.now();
     } else if (sres && sres.code === 'ALREADY_SUBMITTED') {
       return showToast('You have already submitted this test. Use Retake to start again.', 'info');
+    } else if (sres && sres.code === 'DEADLINE_PASSED') {
+      return showToast('The due date for this assignment has passed — it no longer takes submissions.', 'info');
+    } else if (sres && sres.code === 'EXPIRED_AUTO_SUBMITTED') {
+      /* ⭐ time ran out last time without a submit — the server graded the
+         answers saved before the deadline (the attempt was not lost) */
+      clearQuizAnswers(materialId);
+      try { await fetchCoursesFromDB(true); } catch (_) {}
+      try { renderCourseDetail(courseId); } catch (_) {}
+      return quizConfirm({
+        title: 'Your last attempt was submitted', icon: 'fa-clock', ok: 'OK', cancel: false,
+        text: 'Time ran out before it was submitted, so the answers saved before the deadline were submitted for you. Open the test again if you want to start a new attempt.'
+      });
     } else if (sres && sres.code === 'ATTEMPT_LIMIT_REACHED') {
       /* ⭐ Student has used every attempt the admin allowed.
          Show them their own result status instead of a wall. */
@@ -11694,16 +14364,28 @@ async function openQuizPlayer(courseId, materialId) {
       );
     }
   } catch (err) {
-    console.warn('[openQuizPlayer] session start failed, running offline:', err.message);
+    console.warn('[openQuizPlayer] session start failed:', err.message);
+  }
+  /* ⭐ The server runs the clock and records the attempt — an "offline"
+     attempt could never be submitted, so it is not started at all. */
+  if (!previewRole && !sessionInfo) {
+    return showToast('Could not start the test — check your internet connection and try again.', 'error');
   }
 
   const normalized = quiz.map(q => normalizeQuestion(q));
   const emptyAnswer = q => q.type === 'integer' || q.type === 'numerical' ? '' : [];
+  const fits = (a) => Array.isArray(a) && a.length === normalized.length;
 
+  if (sessionInfo && sessionInfo.resumed === false) clearQuizAnswers(materialId);   // a fresh attempt starts blank
   const saved = restoreQuizAnswers(materialId);
-  const initialAnswers = (saved && Array.isArray(saved) && saved.length === normalized.length)
-    ? saved
+  /* resuming: this device's copy, else the server's (refresh on another
+     device / cleared storage) — uploads still in flight are dropped */
+  const serverSaved = sessionInfo && sessionInfo.resumed && fits(sessionInfo.savedAnswers) ? sessionInfo.savedAnswers : null;
+  const pickedSaved = fits(saved) ? saved : serverSaved;
+  const initialAnswers = pickedSaved
+    ? pickedSaved.map((a, i) => normalized[i].type === 'subjective' && Array.isArray(a) ? a.filter(u => u && u.url && !u.uploading) : a)
     : normalized.map(emptyAnswer);
+  const resumedProctor = (sessionInfo && sessionInfo.resumed && sessionInfo.proctor) || null;
 
   /* Read the admin's proctoring config (defaults if fetch failed) */
   let cfg = { maxStrikes: 3, forwardOnly: true, shuffleQuestions: true, shuffleOptions: true };
@@ -11773,11 +14455,16 @@ async function openQuizPlayer(courseId, materialId) {
     paperConfig: mat.examConfig || {},
     previewMode: false,
     examStarted: false,
-    strikes: 0,
-    violations: [],
+    /* ⭐ strikes survive a reload (the server keeps the log) */
+    strikes: resumedProctor ? Number(resumedProctor.strikes) || 0 : 0,
+    violations: resumedProctor && Array.isArray(resumedProctor.events) ? resumedProctor.events.slice() : [],
     startTime: null,
     violationHandling: false,
     fullscreenArmed: false,
+    serverSession: !!sessionInfo,
+    /* ⭐ 2026-10-11 — homework: no timer, no full screen, no proctoring */
+    assignment: !!(sessionInfo && sessionInfo.kind === 'assignment'),
+    dueAt: sessionInfo && sessionInfo.dueAt ? new Date(sessionInfo.dueAt).getTime() : null,
 
     /* ⭐ NEW fields */
     forwardOnly: !allowBackNavigation,          // strict when back-nav is OFF
@@ -11831,7 +14518,7 @@ async function openQuizPlayer(courseId, materialId) {
      "Preview mode" note. Students proceed to the normal consent
      modal exactly as before.
      ============================================================ */
-  if (isAdmin(currentUser)) {
+  if (previewRole) {
     // Force preview semantics — this is the single source of truth
     // that renderQuizExamShell() and submitQuiz() already read.
     quizPlayerState.previewMode = true;
@@ -11863,7 +14550,44 @@ async function openQuizPlayer(courseId, materialId) {
     return;                         // short-circuit the student path
   }
 
+  if (quizPlayerState.assignment) return beginAssignmentSession();
   openModal('preExamWarningModal');
+}
+
+/* ⭐ Assignment: open straight away — answers autosave, nothing is proctored */
+function beginAssignmentSession() {
+  const st = quizPlayerState; if (!st) return;
+  const shell = document.getElementById('quizExamShell');
+  if (!shell) return;
+  shell.style.display = 'flex';
+  shell.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+  st.examStarted = true;
+  st.startTime = Date.now();
+  st.forwardOnly = false; st.allowBackNavigation = true;   // homework: move freely
+  _examQuestionEnteredAt = Date.now();
+  renderQuizExamShell();
+  _tickAssignmentDue();
+  clearInterval(window._assignDueTimer);
+  window._assignDueTimer = setInterval(_tickAssignmentDue, 30000);
+  showToast(st.dueAt ? `Assignment open — due ${new Date(st.dueAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}.` : 'Assignment open — your answers save automatically.', 'success');
+}
+function _assignDueText(dueAt) {
+  if (!dueAt) return 'No deadline';
+  const ms = dueAt - (Date.now() + _examClockOffsetMs);
+  if (ms <= 0) return 'Past due';
+  const m = Math.floor(ms / 60000), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  return d >= 1 ? `Due in ${d}d ${h % 24}h` : h >= 1 ? `Due in ${h}h ${m % 60}m` : `Due in ${m}m`;
+}
+function _tickAssignmentDue() {
+  const st = quizPlayerState;
+  if (!st || !st.assignment || st.submitted) { clearInterval(window._assignDueTimer); return; }
+  const el = document.getElementById('quizTimerDisplay');
+  if (el) {
+    el.textContent = _assignDueText(st.dueAt);
+    el.classList.add('assign-due');
+    el.classList.toggle('warning', !!st.dueAt && st.dueAt - Date.now() < 3600e3);
+  }
 }
 
 function togglePreExamConsent() {
@@ -12064,7 +14788,8 @@ function renderQuizExamShell() {
 
       <div class="quiz-exam-timer-wrap">
         <div class="quiz-exam-timer" id="quizTimerDisplay">--:--</div>
-        ${st.previewMode ? '' : '<div class="quiz-proctor-pill"><i class="fas fa-shield-halved"></i> Proctored</div>'}
+        ${st.previewMode ? '' : st.assignment ? '<div class="quiz-proctor-pill assign"><i class="fas fa-book-open-reader"></i> Assignment</div>' : '<div class="quiz-proctor-pill"><i class="fas fa-shield-halved"></i> Proctored</div>'}
+        ${st.previewMode || st.submitted ? '' : '<div class="quiz-save-state" id="quizSaveState"></div>'}
       </div>
 
       <div class="quiz-exam-progress">
@@ -12086,9 +14811,9 @@ function renderQuizExamShell() {
 
   if (!st.submitted) {
     /* ⭐ FORWARD-ONLY: render exactly ONE question at a time. */
-    const qHtml = st.forwardOnly
-      ? _renderSingleExamQuestion(st)
-      : _renderAllExamQuestions(st);
+    /* ⭐ both modes show one question at a time (free navigation used to put
+       every question on one page — unshuffled, with no Submit button) */
+    const qHtml = _renderSingleExamQuestion(st);
     bodyHtml = `<div class="quiz-exam-body-inner">${qHtml}</div>`;
   } else {
     /* ---------- SUBMITTED ---------- */
@@ -12192,7 +14917,7 @@ function renderQuizExamShell() {
       <footer class="quiz-exam-footer">
         <div class="quiz-exam-footer-left">
           <button type="button" class="btn btn-outline" onclick="requestQuitExam()">
-            <i class="fas fa-times"></i> Quit Exam
+            <i class="fas fa-times"></i> ${st.assignment ? 'Leave' : 'Quit Exam'}
           </button>
           ${st.forwardOnly
             ? `<span class="quiz-exam-warning-note" style="background:rgba(239,68,68,.1);color:var(--rose-600);border-color:rgba(239,68,68,.3);">
@@ -12208,9 +14933,14 @@ function renderQuizExamShell() {
                  <i class="fas fa-arrow-left"></i> Previous
                </button>`
             : ''}
-          ${st.forwardOnly && !isLast
+          ${!st.forwardOnly && !isLast
+            ? `<button type="button" class="btn btn-outline btn-lg" onclick="submitQuiz()">
+                 <i class="fas fa-paper-plane"></i> Submit
+               </button>`
+            : ''}
+          ${!isLast
             ? `<button type="button" class="btn btn-primary btn-lg" onclick="nextExamQuestion()">
-                 <i class="fas fa-arrow-right"></i> Next Question
+                 Next Question <i class="fas fa-arrow-right"></i>
                </button>`
             : ''}
           ${isLast
@@ -12245,6 +14975,8 @@ function renderQuizExamShell() {
 
   shell.innerHTML = headerHtml + `<div class="quiz-exam-body">${bodyHtml}</div>` + footerHtml;
   renderMathIn(shell.querySelector('.quiz-exam-body'));
+  if (!st.previewMode && !st.submitted) _setQuizSaveState(st._saveState || 'idle');
+  if (st.assignment && !st.submitted) _tickAssignmentDue();
 
   /* Re-arm the timer's countdown display after a fresh render */
   if (!st.submitted && st.durationSeconds) {
@@ -12275,7 +15007,7 @@ function _renderSingleExamQuestion(st) {
     <div class="quiz-play-qnum">
       Question ${displayIdx + 1} of ${st.questionOrder.length}
       <span class="quiz-qtype-tag">${questionTypeLabel(qType)}</span>
-      <span class="quiz-qmark-tag">+${q.marks || 4}${q.negativeMarks ? ' / ' + q.negativeMarks : ''}</span>
+      <span class="quiz-qmark-tag">${q.type === 'subjective' ? `+${q.subjectiveMaxMarks || q.marks || 10}` : `+${q.marks || 4}${q.negativeMarks ? ' / ' + q.negativeMarks : ''}`}</span>
       ${isAnswered ? '<span class="quiz-answered-tag"><i class="fas fa-check-circle"></i> Answered</span>' : ''}
       ${locked ? '<span class="quiz-answered-tag" style="color:var(--rose-500);"><i class="fas fa-lock"></i> Locked</span>' : ''}
     </div>
@@ -12296,7 +15028,7 @@ function _renderAllExamQuestions(st) {
       <div class="quiz-play-qnum">
         Question ${qi + 1} of ${st.quiz.length}
         <span class="quiz-qtype-tag">${questionTypeLabel(qType)}</span>
-        <span class="quiz-qmark-tag">+${q.marks || 4}${q.negativeMarks ? ' / ' + q.negativeMarks : ''}</span>
+        <span class="quiz-qmark-tag">${q.type === 'subjective' ? `+${q.subjectiveMaxMarks || q.marks || 10}` : `+${q.marks || 4}${q.negativeMarks ? ' / ' + q.negativeMarks : ''}`}</span>
         ${isAnswered ? '<span class="quiz-answered-tag"><i class="fas fa-check-circle"></i> Answered</span>' : ''}
       </div>
       <h4 class="quiz-play-question latex-content">${escapeHtml(q.question)}</h4>
@@ -12342,7 +15074,8 @@ function renderStudentAnswerAreaShuffled(q, qi, st) {
 /* ---- Advance to the next question (forward-only) ---- */
 function nextExamQuestion() {
   const st = quizPlayerState;
-  if (!st || !st.forwardOnly || st.submitted) return;
+  if (!st || st.submitted) return;
+  if (!st.forwardOnly) return jumpToExamQuestion(Math.min(st.displayIndex + 1, st.questionOrder.length - 1));
 
   const currentOriginalIdx = st.questionOrder[st.displayIndex];
 
@@ -12381,33 +15114,110 @@ function _recordQuestionTime(originalIdx) {
    ============================================================ */
 function _onExamVisibilityChange() {
   if (!quizPlayerState || !quizPlayerState.examStarted || quizPlayerState.submitted) return;
-  if (document.hidden) _handleExamViolation('You left the exam tab.');
+  if (_examPicker) {                                   // the phone's file picker / camera covers the page
+    if (!document.hidden) _examPickerReturned();
+    return;
+  }
+  if (document.hidden) { flushQuizServerSave(true); _handleExamViolation('You left the exam tab.'); }
 }
 
 function _onExamWindowBlur() {
   if (!quizPlayerState || !quizPlayerState.examStarted || quizPlayerState.submitted) return;
-  if (document.querySelector('.modal-overlay.active')) return;
-  if (window.__examAllowBlur) return;   // file picker grace period
+  if (_examPicker) return;                             // file picker open — not leaving the exam
+  if (document.querySelector('.modal-overlay.active, .aero-confirm-ov, .exam-fs-prompt')) return;
   _handleExamViolation('The exam window lost focus.');
 }
 
-/* Allow a brief window-blur without triggering a proctoring violation.
-   Used when the student opens the OS file picker for subjective uploads.
-   The flag auto-clears after 8 s — this is CRITICAL: if the student
-   cancels the file dialog, the input's onchange never fires, and
-   without this timer the proctoring would stay disabled for the rest
-   of the exam. */
-function allowExamBlurBriefly() {
-  window.__examAllowBlur = true;
-  clearTimeout(window.__examBlurTimer);
-  window.__examBlurTimer = setTimeout(() => {
-    window.__examAllowBlur = false;
-  }, 8000);
+/* ============================================================
+   ⭐ FILE-PICKER GUARD (2026-10-10)
+   ------------------------------------------------------------
+   Attaching a PDF / photo opens the system file picker or the
+   camera. To the browser that looks exactly like leaving the
+   exam: the window blurs, on phones the page is hidden, and full
+   screen ends. Before, students got a strike — or were auto-
+   submitted — just for attaching their answer sheet (the old
+   8-second blur grace was never even switched on: it listened on
+   the hidden <input>, which gets no mousedown/focus).
+
+   Now, while a picker the student opened from an upload button is
+   up, none of those count. It ends when the student is back
+   (focus / page visible / a file chosen / cancel / a tap on the
+   page). Full screen lost on the way is restored with a prompt,
+   not a strike. A picker kept open unusually long (> 3 min) is
+   recorded as time away.
+   ============================================================ */
+const EXAM_PICKER_MAX_MS = 3 * 60 * 1000;
+let _examPicker = null;          // { since, wasFullscreen, closing }
+
+function examPickerOpening() {
+  const st = quizPlayerState;
+  if (!st || !st.examStarted || st.submitted || st.previewMode) return;
+  if (_examPicker && !_examPicker.closing) return;
+  _examPicker = { since: Date.now(), wasFullscreen: !!(document.fullscreenElement || document.webkitFullscreenElement) };
+  /* the student is back on the page — however the picker closed */
+  const back = () => _examPickerReturned();
+  setTimeout(() => {                     // after the click that opened it
+    window.addEventListener('focus', back, { once: true });
+    document.addEventListener('pointerdown', back, { once: true, capture: true });
+    document.addEventListener('keydown', back, { once: true, capture: true });
+  }, 350);
+}
+/* kept for old markup / cached pages */
+function allowExamBlurBriefly() { examPickerOpening(); }
+
+function _examPickerReturned() {
+  const p = _examPicker;
+  if (!p || p.closing) return;
+  p.closing = true;
+  /* blur / fullscreen events can trail the picker closing by a moment */
+  setTimeout(() => {
+    if (_examPicker !== p) return;
+    _examPicker = null;
+    const st = quizPlayerState;
+    if (!st || !st.examStarted || st.submitted) return;
+    const away = Date.now() - p.since;
+    st.violations.push({ reason: `File picker (${Math.round(away / 1000)} s)`, at: p.since, strike: false });
+    if (away > EXAM_PICKER_MAX_MS) {
+      _handleExamViolation(`You were away from the exam for ${Math.round(away / 60000)} minutes while choosing a file.`);
+      return;
+    }
+    const fsNow = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    if (p.wasFullscreen && !fsNow) _showExamFullscreenPrompt();
+  }, 700);
+}
+
+/* Full screen can only be re-entered from a tap, so ask for one.
+   This is not a strike — the student did nothing wrong. */
+function _showExamFullscreenPrompt() {
+  if (document.querySelector('.exam-fs-prompt')) return;
+  const ov = document.createElement('div');
+  ov.className = 'exam-fs-prompt';
+  ov.setAttribute('role', 'dialog');
+  ov.innerHTML = `
+    <div class="exam-fs-prompt-card">
+      <div class="exam-fs-prompt-icon"><i class="fas fa-expand"></i></div>
+      <h3>File attached — back to the exam</h3>
+      <p>Choosing a file closed full screen. This is <strong>not</strong> counted as a warning.</p>
+      <button type="button" class="btn btn-primary btn-block"><i class="fas fa-expand"></i> Continue in full screen</button>
+    </div>`;
+  ov.querySelector('button').onclick = () => {
+    const st = quizPlayerState;
+    if (st) st.fullscreenArmed = false;               // the switch itself must not count
+    try {
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (req) { const pr = req.call(el); if (pr && pr.catch) pr.catch(() => {}); }
+    } catch (_) {}
+    ov.remove();
+    setTimeout(() => { if (quizPlayerState) quizPlayerState.fullscreenArmed = true; }, 900);
+  };
+  document.body.appendChild(ov);
 }
 
 function _onExamFullscreenChange() {
   if (!quizPlayerState || !quizPlayerState.examStarted || quizPlayerState.submitted) return;
   if (!quizPlayerState.fullscreenArmed) return;
+  if (_examPicker) return;                             // handled when the picker closes
   const stillFs = document.fullscreenElement || document.webkitFullscreenElement;
   if (!stillFs) _handleExamViolation('You exited full-screen mode.');
 }
@@ -12415,6 +15225,7 @@ function _onExamFullscreenChange() {
 function _onExamBeforeUnload(e) {
   if (!quizPlayerState || !quizPlayerState.examStarted || quizPlayerState.submitted) return;
   persistQuizAnswers();
+  flushQuizServerSave(true);
   e.preventDefault();
   e.returnValue = '';
   return '';
@@ -12426,7 +15237,8 @@ function _handleExamViolation(reason) {
 
   st.violationHandling = true;
   st.strikes = (st.strikes || 0) + 1;
-  st.violations.push({ reason, at: Date.now() });
+  st.violations.push({ reason, at: Date.now(), strike: true });
+  flushQuizServerSave(true);                          // the server keeps the record (a reload no longer clears it)
 
   if (st.strikes > QUIZ_PROCTOR_MAX_STRIKES) {
     _autoSubmitForViolation(reason);
@@ -12451,8 +15263,10 @@ function _showViolationWarning(reason, strikeNumber) {
   const box  = document.getElementById('quizViolationBox');
 
   if (text) {
-    text.textContent =
-      `${reason} This is your final warning — one more violation will instantly auto-submit your exam.`;
+    const left = QUIZ_PROCTOR_MAX_STRIKES - strikeNumber;
+    text.textContent = left <= 0
+      ? `${reason} This is your final warning — one more violation will instantly auto-submit your exam.`
+      : `${reason} ${left} more warning${left === 1 ? '' : 's'} allowed — after that your exam is submitted automatically.`;
   }
   if (box) {
     box.innerHTML = `
@@ -12487,23 +15301,28 @@ async function _autoSubmitForViolation(reason) {
   st.autoSubmitted = true;
   showToast('⚠️ Auto-submitting due to proctoring violation…', 'error');
   await new Promise(r => setTimeout(r, 400));
-  await submitQuiz({ auto: true });
+  await submitQuiz({ auto: true, reason: 'violation', detail: reason });
 }
 
-function requestQuitExam() {
+async function requestQuitExam() {
   const st = quizPlayerState;
   if (!st) return;
 
   st.examStarted = false;
-  const ok = confirm(
-    'Quit the exam?\n\n' +
-    'Your answers will be saved locally, but no score will be recorded.'
-  );
+  const ok = await quizConfirm({
+    title: st.assignment ? 'Leave the assignment?' : 'Leave the exam?', icon: 'fa-door-open', danger: !st.assignment,
+    ok: st.assignment ? 'Leave' : 'Leave exam', cancel: st.assignment ? 'Keep working' : 'Continue exam',
+    text: st.assignment
+      ? 'Your answers are saved. Come back any time before the due date and press Submit when you are done.'
+      : 'Your answers stay saved on this device and the timer keeps running. Come back before time is up and submit to get a score.'
+  });
   if (ok) {
     persistQuizAnswers();
+    flushQuizServerSave(true);          // the server copy is current too
     exitQuizSession();
     return;
   }
+  if (st.assignment) { st.examStarted = true; return; }
   try {
     if (!document.fullscreenElement && !document.webkitFullscreenElement) {
       const el = document.documentElement;
@@ -12575,55 +15394,50 @@ async function submitQuiz(opts = {}) {
      ALREADY_SUBMITTED. A 30 s timestamp guard blocks the duplicate
      without needing try/finally plumbing (30 s is far longer than
      any real submit round trip). */
-  const _now = Date.now();
-  if (st._submitGuardUntil && _now < st._submitGuardUntil) return;
-  st._submitGuardUntil = _now + 30000;
+  if (st._submitGuardUntil && Date.now() < st._submitGuardUntil) return;
 
   const auto = !!opts.auto;
+  /* the number the student sees for an original question (questions may be shuffled) */
+  const shown = (i) => (st.questionOrder ? st.questionOrder.indexOf(i) : i) + 1;
 
   if (!auto) {
-    /* Validate that every question has an answer */
+    /* uploads still in flight must finish first */
     for (let i = 0; i < st.quiz.length; i++) {
-      const q = st.quiz[i];
       const a = st.answers[i];
-      if (q.type === 'integer' || q.type === 'numerical') {
-        if (a === '' || a === null || a === undefined || isNaN(Number(a))) {
-          return showToast(`Please answer Q${i + 1}.`, 'error');
-        }
-      } else if (q.type === 'subjective') {
-        if (!Array.isArray(a) || a.length === 0) {
-          return showToast(`Please upload at least one photo for Q${i + 1}.`, 'error');
-        }
-        if (a.some(u => u && u.uploading)) {
-          return showToast(`Please wait for Q${i + 1} uploads to finish.`, 'error');
-        }
-        if (a.some(u => !u || !u.url)) {
-          return showToast(`Q${i + 1}: some photos failed to upload. Remove and retry.`, 'error');
-        }
-      } else if (q.type === 'matrix') {
-        const rows = q.matrixRows || [];
-        if (!Array.isArray(a) ||
-            a.filter(x => x !== undefined && x !== null && x !== '').length < rows.length) {
-          return showToast(`Please match all items in Q${i + 1}.`, 'error');
-        }
-      } else {
-        if (Array.isArray(a) ? a.length === 0 : (a === null || a === undefined || a === -1)) {
-          return showToast(`Please answer Q${i + 1}.`, 'error');
-        }
+      if (st.quiz[i].type === 'subjective' && Array.isArray(a)) {
+        if (a.some(u => u && u.uploading)) return showToast(`Please wait for the uploads in question ${shown(i)} to finish.`, 'error');
+        if (a.some(u => !u || !u.url)) return showToast(`Question ${shown(i)}: a photo failed to upload — remove it and try again.`, 'error');
       }
     }
+    /* ⭐ unanswered questions no longer block submitting (in forward-only mode a
+       skipped question could never be answered, so the test could never be
+       submitted) — the student confirms instead */
+    const blank = st.quiz.map((q, i) => _isQuestionAnswered(q, st.answers[i]) ? 0 : shown(i)).filter(Boolean).sort((x, y) => x - y);
+    const examWasOn = st.examStarted;
+    st.examStarted = false;                                    // the dialog must not count as leaving the exam
+    const answer = await quizConfirm({
+      title: blank.length ? `${blank.length} question${blank.length === 1 ? '' : 's'} not answered` : 'Submit your test?',
+      icon: blank.length ? 'fa-circle-exclamation' : 'fa-paper-plane',
+      html: blank.length
+        ? `<p class="modal-sub">Unanswered: <strong>${blank.slice(0, 15).join(', ')}${blank.length > 15 ? '…' : ''}</strong>. They will score zero (no negative marks).</p>`
+        : `<p class="modal-sub">You have answered every question. Once submitted, answers cannot be changed.</p>`,
+      ok: blank.length ? 'Submit anyway' : 'Submit',
+      cancel: 'Keep working',
+      extra: blank.length && !st.forwardOnly ? `Go to question ${blank[0]}` : ''
+    });
+    st.examStarted = examWasOn;
+    if (st.submitted || quizPlayerState !== st) return;         // time ran out while the dialog was open — already submitted
+    if (answer !== true) {
+      if (answer === 'extra') jumpToExamQuestion(blank[0] - 1);
+      return;
+    }
   }
+  /* in-flight guard (set only now: an open confirmation must never block the time-up submit) */
+  if (st._submitGuardUntil && Date.now() < st._submitGuardUntil) return;
+  st._submitGuardUntil = Date.now() + 30000;
 
-  /* ⭐ Record time on the final question before submitting */
-  if (st.forwardOnly && st.questionOrder && st.questionOrder.length > 0) {
-    const lastOrigIdx = st.questionOrder[st.displayIndex];
-    _recordQuestionTime(lastOrigIdx);
-  } else {
-    /* Non forward-only: credit remaining time to the question that was
-       being viewed when the user clicked submit. We approximate by
-       crediting _examQuestionEnteredAt to the currently-visible card. */
-    _recordQuestionTime(0);
-  }
+  /* ⭐ Record time on the question on screen */
+  if (st.questionOrder && st.questionOrder.length > 0) _recordQuestionTime(st.questionOrder[st.displayIndex]);
 
   st.examStarted = false;
 
@@ -12637,7 +15451,8 @@ async function submitQuiz(opts = {}) {
           userId: currentUser._id,
           answers: st.answers,
           timeSpentPerQuestion: st.timeSpentPerQuestion,
-          autoSubmitted: auto
+          autoSubmitted: auto,
+          proctor: _quizProctorLog(st)          // ⭐ the instructor sees warnings + how the attempt ended
         })
       }
     );
@@ -12646,6 +15461,9 @@ async function submitQuiz(opts = {}) {
     if (data.success) {
       st.submitted = true;
       st.response = data;
+      clearTimeout(_quizServerSaveTimer);
+      _examPicker = null;
+      document.querySelectorAll('.aero-confirm-ov, .exam-fs-prompt').forEach(o => o.remove());
 
       // ⭐ XP + level-up feedback
       if (data.xpResult && data.xpResult.gained > 0) {
@@ -12676,8 +15494,13 @@ async function submitQuiz(opts = {}) {
 
       renderQuizExamShell();
 
-      if (auto) {
-        showToast('⚠️ Exam auto-submitted (time up or proctoring violation).', 'error');
+      clearInterval(window._assignDueTimer);
+      if (data.kind === 'assignment' && !data.lateSubmission) {
+        showToast(data.late ? '📮 Assignment submitted — marked late (after the due date).' : '✅ Assignment submitted.', data.late ? 'info' : 'success');
+      } else if (data.lateSubmission) {
+        showToast('⏰ ' + (data.message || 'Time was up — the answers saved before the deadline were submitted.'), 'error');
+      } else if (auto) {
+        showToast(opts.reason === 'time' ? '⏰ Time is up — your answers were submitted.' : '⚠️ Exam auto-submitted after repeated proctoring violations.', 'error');
       } else if (data.pendingEvaluation) {
         showToast('✅ Submitted. Subjective answers are pending instructor review.', 'success');
       } else {
@@ -12688,6 +15511,17 @@ async function submitQuiz(opts = {}) {
       }
     } else {
       st.examStarted = true;
+      if (data.code === 'ALREADY_SUBMITTED' || data.code === 'NO_SESSION') {
+        /* finished elsewhere (another tab / device, or the server after time-up) */
+        stopQuizTimer();
+        _detachAllProctorListeners();
+        exitFullscreenNow();
+        clearQuizAnswers(st.materialId);
+        st.submitted = true;
+        showToast(data.code === 'NO_SESSION' ? data.message : 'This attempt was already submitted — open the course to see your result.', 'info');
+        exitQuizSession();
+        return;
+      }
       if (data.code === 'TIME_EXPIRED') {
         stopQuizTimer();
         _detachAllProctorListeners();
@@ -12705,9 +15539,16 @@ async function submitQuiz(opts = {}) {
   } catch (err) {
     console.error('[submitQuiz]', err);
     st.examStarted = true;
-    showToast('Server error.', 'error');
     /* ⭐ FIX: release the in-flight guard so the student can retry. */
     st._submitGuardUntil = 0;
+    if (auto) {
+      /* time-up / violation submit hit a network error: keep trying — the
+         server also grades the autosaved answers if this never gets through */
+      showToast('No connection — retrying the submission…', 'error');
+      setTimeout(() => { if (quizPlayerState === st && !st.submitted) submitQuiz(opts); }, 5000);
+    } else {
+      showToast('Could not reach the server — your answers are saved. Try Submit again.', 'error');
+    }
   }
 }
 
@@ -12917,37 +15758,42 @@ function renderStudentAnswerArea(q, qi) {
           <span class="subjective-max-badge"><i class="fas fa-star"></i> ${maxM} marks · Admin evaluated</span>
         </div>
 
-        <!-- ⭐ Two buttons so mobile users can either shoot a photo or attach a PDF -->
+        <!-- ⭐ Camera · Gallery · PDF. The camera button opens the camera
+             directly; Gallery lets a phone pick photos already taken (with
+             capture= set, Android only ever offered the camera). Opening any
+             of them is NOT counted as leaving the exam (examPickerOpening). -->
         <div class="subjective-upload-row">
           <label class="subjective-upload-btn">
-            <input type="file"
-                   accept="image/*,.heic,.heif"
-                   capture="environment"
-                   multiple
-                   style="display:none;"
-                   onmousedown="allowExamBlurBriefly();"
-                   onfocus="allowExamBlurBriefly();"
-                   onchange="handleSubjectiveUpload(${qi}, this, 'image');">
+            <input type="file" accept="image/*" capture="environment" style="display:none;"
+                   onclick="examPickerOpening();"
+                   onchange="handleSubjectiveUpload(${qi}, this, 'image');"
+                   oncancel="_examPickerReturned();">
             <i class="fas fa-camera"></i>
-            <span>Take / Choose Photo</span>
+            <span>Camera</span>
+          </label>
+
+          <label class="subjective-upload-btn">
+            <input type="file" accept="image/*,.heic,.heif" multiple style="display:none;"
+                   onclick="examPickerOpening();"
+                   onchange="handleSubjectiveUpload(${qi}, this, 'image');"
+                   oncancel="_examPickerReturned();">
+            <i class="fas fa-images"></i>
+            <span>Photos</span>
           </label>
 
           <label class="subjective-upload-btn subjective-upload-btn--pdf">
-            <input type="file"
-                   accept="application/pdf,.pdf"
-                   multiple
-                   style="display:none;"
-                   onmousedown="allowExamBlurBriefly();"
-                   onfocus="allowExamBlurBriefly();"
-                   onchange="handleSubjectiveUpload(${qi}, this, 'pdf');">
+            <input type="file" accept="application/pdf,.pdf" multiple style="display:none;"
+                   onclick="examPickerOpening();"
+                   onchange="handleSubjectiveUpload(${qi}, this, 'pdf');"
+                   oncancel="_examPickerReturned();">
             <i class="fas fa-file-pdf"></i>
-            <span>Attach PDF Scan</span>
+            <span>PDF</span>
           </label>
         </div>
 
         <p class="subjective-upload-hint">
           <i class="fas fa-info-circle"></i>
-          Images (<strong>JPG · PNG · HEIC</strong>) or <strong>PDF</strong> · max <strong>25 MB</strong> per file · up to <strong>10 files</strong>
+          <span>Images (<strong>JPG · PNG · HEIC</strong>) or <strong>PDF</strong> · max <strong>25 MB</strong> per file · up to <strong>10 files</strong></span>
         </p>
 
         <div class="subjective-uploads" id="subjectiveUploads-${qi}">
@@ -13039,9 +15885,17 @@ function renderResultDetail(q, r) {
       </div>
       ${uploads.length > 0 ? `
         <div class="subjective-result-thumbs">
-          ${uploads.map(u => `<a href="${escapeHtml(u.url)}" target="_blank" rel="noopener">
-            <img src="${escapeHtml(u.url)}" alt="answer" loading="lazy" decoding="async">
-          </a>`).join('')}
+          ${uploads.map(u => {
+            const _pdf = u.isPdf === true || /\.pdf(\b|$|\?|#)/i.test(u.url || '') || /\.pdf(\b|$|\?|#)/i.test(u.fileName || '');
+            return _pdf
+              ? `<a href="${escapeHtml(u.url)}" target="_blank" rel="noopener" class="subjective-result-pdf"
+                    onclick="return aeroOpenPdfUrl(event, ${jsStr(u.url || '')}, ${jsStr(u.fileName || 'Your answer')})">
+                   <i class="fas fa-file-pdf"></i><span>${escapeHtml(u.fileName || 'PDF')}</span>
+                 </a>`
+              : `<a href="${escapeHtml(u.url)}" target="_blank" rel="noopener">
+                   <img src="${escapeHtml(u.url)}" alt="answer" loading="lazy" decoding="async">
+                 </a>`;
+          }).join('')}
         </div>` : '<div class="quiz-answer-row"><em>No photos uploaded.</em></div>'}
       <div class="quiz-answer-row subjective-pending-note">
         <i class="fas fa-hourglass-half"></i>
@@ -13060,7 +15914,7 @@ function renderResultDetail(q, r) {
           ${rows.map((row, ri) => {
             const ok = Number(chosen[ri]) === Number(row.correctIndex);
             return `<tr class="${ok ? 'ok-row' : 'bad-row'}">
-              <td class="latex-content">${String.fromCharCode(65 + ri)}. ${escapeHtml(row.text)}</td>
+              <td class="latex-content">${String.fromCharCode(65 + ri)}. ${escapeHtml(((q.matrixLeftItems || [])[ri]) || row.text || '')}</td>
               <td>${chosen[ri] != null && chosen[ri] !== '' ? (rightLabels[chosen[ri]] || '—') : '—'}</td>
               <td>${rightLabels[row.correctIndex] || '—'}</td>
             </tr>`;
@@ -13118,7 +15972,7 @@ function previewQuizPaper() {
   const course = findCourse(quizEditingCourseId);
   const mat = (course.materials || []).find(m => m.id === quizEditingMaterialId);
 
-  const emptyAnswer = q => q.type === 'integer' ? '' : [];
+  const emptyAnswer = q => (q.type === 'integer' || q.type === 'numerical') ? '' : [];
   const _previewOrder = Array.from({ length: quizDraft.length }, (_, i) => i);
 
   quizPlayerState = {
@@ -13167,7 +16021,8 @@ function previewQuizPaper() {
 function assertMaterialUnlocked(courseId, materialId, opts) {
   opts = opts || {};
   if (!currentUser) {
-    if (!opts.silent) showToast('Please log in to open this material.', 'error');
+    if (!opts.silent && isGuestBrowsing()) aeroGuestGate(courseId, materialId);
+    else if (!opts.silent) showToast('Please log in to open this material.', 'error');
     return false;
   }
   if (isAdmin(currentUser)) return true;
@@ -13258,6 +16113,7 @@ function _detectDocumentKind(fileName, url) {
 let _renderOverlayEl = null;
 let _renderSession = 0;          // bumped on every open / cancel — a stale poll loop stops itself
 function _showRenderOverlay(title, kind) {
+  try { AeroOpening.stop(); } catch (_) {}
   _hideRenderOverlay();
   const el = document.createElement('div');
   el.className = 'render-overlay';
@@ -13352,7 +16208,176 @@ async function openRenderedOfficeFile(course, mat, meta, pdfJsPromise) {
   });
 }
 
-async function viewFileOnline(courseId, materialId) {
+
+/* ============================================================
+   ⭐ INSTANT OPEN FEEDBACK + WHOLE-CARD CLICK (2026-10-07)
+   ------------------------------------------------------------
+   • The moment a material is clicked, its card shows an
+     "Opening…" veil with a spinner and a thin progress bar runs
+     along the top of the screen — before any network request
+     finishes. The state clears as soon as the viewer / player /
+     render overlay is on screen (or an error toast appears).
+   • A second click on the same material while it is opening is
+     ignored (no double requests, no double access-log entries).
+   • Safety net: the state never stays longer than 30 s.
+   ============================================================ */
+const AeroOpening = (function () {
+  let activeId = null;
+  let safety = null;
+  let bar = null;
+
+  function cardFor(mid) {
+    if (!mid) return null;
+    try { return document.querySelector('.material-item[data-mid="' + CSS.escape(String(mid)) + '"]'); }
+    catch (_) { return null; }
+  }
+  function getBar() {
+    if (bar && document.body.contains(bar)) return bar;
+    bar = document.createElement('div');
+    bar.className = 'aero-open-bar';
+    bar.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(bar);
+    return bar;
+  }
+  function paint(mid) {
+    const card = cardFor(mid);
+    if (!card || card.classList.contains('is-opening')) return;
+    card.classList.add('is-opening');
+    card.setAttribute('aria-busy', 'true');
+    if (!card.querySelector('.mat-opening-veil')) {
+      const v = document.createElement('div');
+      v.className = 'mat-opening-veil';
+      v.setAttribute('role', 'status');
+      v.innerHTML = '<span class="mat-opening-spinner" aria-hidden="true"></span><span class="mat-opening-text">Opening…</span>';
+      card.appendChild(v);
+    }
+  }
+  function unpaint() {
+    document.querySelectorAll('.material-item.is-opening').forEach(card => {
+      card.classList.remove('is-opening');
+      card.removeAttribute('aria-busy');
+      const v = card.querySelector('.mat-opening-veil');
+      if (v) v.remove();
+    });
+  }
+  function start(mid) {
+    activeId = mid || '__any__';
+    paint(mid);
+    const b = getBar();
+    b.classList.remove('done');
+    void b.offsetWidth;                         // restart the animation
+    b.classList.add('active');
+    clearTimeout(safety);
+    safety = setTimeout(stop, 30000);
+  }
+  function stop() {
+    clearTimeout(safety);
+    activeId = null;
+    unpaint();
+    if (bar && bar.classList.contains('active')) {
+      bar.classList.add('done');
+      setTimeout(() => { if (!activeId && bar) bar.classList.remove('active', 'done'); }, 320);
+    }
+  }
+  function isBusy(mid) { return !!activeId && activeId === (mid || '__any__'); }
+  function reapply() { if (activeId && activeId !== '__any__') paint(activeId); }
+
+  async function run(mid, fn) {
+    if (isBusy(mid)) return;                    // already opening this one
+    start(mid);
+    /* Let the browser paint the feedback before any heavy work */
+    await new Promise(r => requestAnimationFrame(() => r()));
+    try { return await fn(); }
+    finally { if (activeId === (mid || '__any__')) stop(); }
+  }
+  return { run, start, stop, isBusy, reapply };
+})();
+window.AeroOpening = AeroOpening;
+
+/* Card click → the same action as the card's main button */
+function aeroMaterialCardClick(event, courseId, materialId, action) {
+  const t = event && event.target;
+  /* Inner controls keep their own behaviour */
+  if (t && t.closest && t.closest('button, a[href], input, textarea, select, label, video, iframe, .vprog')) return;
+  /* Don't hijack a text selection */
+  try { const sel = window.getSelection && window.getSelection(); if (sel && String(sel).trim()) return; } catch (_) {}
+  if (AeroOpening.isBusy(materialId)) return;
+
+  switch (action) {
+    case 'guest':        return aeroGuestGate(courseId, materialId);
+    case 'video':        return openMaterialVideo(courseId, materialId);
+    case 'buy-course':   return showPaymentModal(courseId, null);
+    case 'buy-material': return showPaymentModal(courseId, materialId);
+    case 'preview':
+    case 'read':
+    default:             return viewFileOnline(courseId, materialId);
+  }
+}
+window.aeroMaterialCardClick = aeroMaterialCardClick;
+
+/* ⚡ Any other PDF on the site (e.g. a student's uploaded answer) opens
+   in the same fast in-app reader — first pages at once, the rest in the
+   background — instead of the browser's own viewer in a new tab.
+   Files from other sites keep opening in a new tab. Returns false to
+   cancel the link's default action when the reader takes over. */
+function aeroOpenPdfUrl(event, url, title) {
+  url = String(url || '');
+  if (!/^\/uploads\/[^?#]+\.pdf(\?|#|$)/i.test(url)) return true;
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  const fallback = () => {
+    /* in a proctored exam a new tab counts as leaving it — don't open one */
+    if (typeof _inExam === 'function' && _inExam()) return showToast('The PDF is attached. It cannot be previewed during the exam on this device.', 'info');
+    try { window.open(withAuthToken(url), '_blank', 'noopener'); } catch (_) {}
+  };
+  AeroOpening.run('pdf:' + url, async () => {
+    try { await window.loadPDFJS(); } catch (_) { return fallback(); }
+    if (!window.PDFViewer || typeof window.PDFViewer.open !== 'function') return fallback();
+    window.PDFViewer.open({
+      url:            withAuthToken(url),
+      materialId:     'file-' + url.split('?')[0].split('/').pop(),
+      title:          title || 'Document',
+      username:       currentUser ? (currentUser.fullName || currentUser.username || 'Student') : 'Guest',
+      hasFullAccess:  true,
+      previewPercent: 0
+    });
+  });
+  return false;
+}
+window.aeroOpenPdfUrl = aeroOpenPdfUrl;
+
+/* ⚡ Idle warm-up of the PDF engine on course pages.
+   Before, PDF.js (~300 KB) only started loading when the mouse
+   hovered a card — on phones that is a split second before the tap,
+   so the first open always waited for it. Now it loads in idle time
+   once a signed-in student is looking at a list that has documents.
+   Skipped on Data Saver. Loaded once per page (browser-cached after). */
+let _aeroPdfWarmScheduled = false;
+function aeroIdleWarmPdfEngine(materials) {
+  if (_aeroPdfWarmScheduled || window.pdfjsLib || !currentUser) return;
+  try { if (navigator.connection && navigator.connection.saveData) return; } catch (_) {}
+  const hasDocs = (materials || []).some(m => !(m.type === 'video' && (m.url || m.cloudUrl) && !(m.fileName || m.diskName)));
+  if (!hasDocs) return;
+  _aeroPdfWarmScheduled = true;
+  const go = () => {
+    try {
+      window.loadPDFJS().then(() => {
+        try { if (window.PDFViewer && window.PDFViewer.prewarmWorker) window.PDFViewer.prewarmWorker(); } catch (_) {}
+      }).catch(() => { _aeroPdfWarmScheduled = false; });
+    } catch (_) { _aeroPdfWarmScheduled = false; }
+  };
+  if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(go, { timeout: 2500 });
+  else setTimeout(go, 1200);
+}
+
+/* ⭐ Public entry point — shows instant "Opening…" feedback on the card
+   (and a thin top progress bar) while the real work happens. */
+function viewFileOnline(courseId, materialId) {
+  if (!currentUser && isGuestBrowsing()) return aeroGuestGate(courseId, materialId);
+  return AeroOpening.run(materialId, () => _viewFileOnlineImpl(courseId, materialId));
+}
+
+async function _viewFileOnlineImpl(courseId, materialId) {
+  if (!currentUser && isGuestBrowsing()) return aeroGuestGate(courseId, materialId);
   const course = findCourse(courseId);
   if (!course) return showToast('Course not found.', 'error');
 
@@ -13362,30 +16387,65 @@ async function viewFileOnline(courseId, materialId) {
   /* Client-side access is only used as a FALLBACK if meta fails. */
   const access = getMaterialAccessInfo(course, mat);
 
-  /* ① Kick off PDF.js load + meta fetch in PARALLEL.
-     We ALSO warm the /uploads/ connection with a tiny HEAD so the
-     campus proxy has already negotiated the TCP + TLS handshake
-     by the time the real GET fires. Fire-and-forget — never blocks. */
-  const pdfJsPromise = window.loadPDFJS().catch(err => {
+  /* ⚡ INSTANT OPEN (2026-10-07): a PDF the student owns opens on screen
+     immediately — pages already on this device (or the server's instant
+     posters) appear at once — while the server is still answering. The
+     real document is attached to this same reader below; any other
+     outcome (locked, PowerPoint, error…) simply closes it again. */
+  let shellToken = null;
+  const dropShell = () => {
+    try {
+      const V = window.PDFViewer;
+      if (shellToken && V && V._shell && V._shellToken === shellToken) V.close();
+    } catch (_) {}
+    shellToken = null;
+  };
+  try {
+    if (currentUser && access && access.hasFullAccess === true && _aeroLooksLikePdf(mat) &&
+        window.PDFViewer && typeof window.PDFViewer.openShell === 'function' && !window.PDFViewer.active) {
+      shellToken = window.PDFViewer.openShell({
+        materialId: mat.id,
+        courseId:   course.id,
+        title:      mat.title,
+        username:   currentUser.fullName || currentUser.username || 'Student',
+        cacheKey:   aeroPdfCacheKey(mat),
+        posterBase: `${API_BASE}/courses/${course.id}/materials/${mat.id}/poster/`
+      });
+      if (shellToken) AeroOpening.stop();      // the reader itself is the feedback now
+    }
+  } catch (_) { shellToken = null; }
+  try {
+    return await _viewFileOnlineAttach(course, mat, access, shellToken, dropShell);
+  } finally {
+    dropShell();                               // never leave an empty reader behind
+  }
+}
+
+function _aeroLooksLikePdf(m) {
+  const clean = String(m.url || '').toLowerCase().split('?')[0].split('#')[0];
+  return String(m.fileName || '').toLowerCase().endsWith('.pdf') || clean.endsWith('.pdf');
+}
+/* Per student + per file version: a replaced file never shows old pages */
+function aeroPdfCacheKey(m) {
+  const src = String(m.url || '') + '|' + String(m.fileName || '') + '|' + String(m.diskName || '');
+  let h = 5381;
+  for (let i = 0; i < src.length; i++) h = ((h << 5) + h + src.charCodeAt(i)) >>> 0;
+  return String(currentUser && currentUser._id || 'anon') + '-' + m.id + '-' + h.toString(36);
+}
+
+async function _viewFileOnlineAttach(course, mat, access, shellToken, dropShell) {
+  const courseId = course.id, materialId = mat.id;
+
+  /* ① Kick off PDF.js load (+ its worker) and the meta fetch in PARALLEL.
+     (The old unsigned HEAD "warm-up" of /uploads/ was removed: it ran a
+     full access check on the server for every open while the meta call
+     already opens the same connection.) */
+  const pdfJsPromise = window.loadPDFJS().then(() => {
+    try { if (window.PDFViewer && window.PDFViewer.prewarmWorker) window.PDFViewer.prewarmWorker(); } catch (_) {}
+  }).catch(err => {
     console.warn('[viewFileOnline] PDF.js load failed:', err);
     throw err;
   });
-
-  /* ⭐ Non-blocking warm-up of the uploads route. */
-  try {
-    const warmUrl = (mat.url && String(mat.url).startsWith('/uploads/'))
-      ? String(mat.url)
-      : null;
-    if (warmUrl) {
-      fetch(warmUrl, {
-        method: 'HEAD',
-        credentials: 'same-origin',
-        cache: 'default',
-        priority: 'low',
-        keepalive: true
-      }).catch(() => {});
-    }
-  } catch (_) { /* purely an optimisation — never break the flow */ }
 
   let meta = null;
   let metaFailed = false;
@@ -13470,6 +16530,7 @@ async function viewFileOnline(courseId, materialId) {
     const url = (meta && meta.signedUrl)
       ? effectiveUrl
       : (isDiskUrl ? withAuthToken(effectiveUrl) : effectiveUrl);
+    if (!hasFullAccess) dropShell();
 
     window.PDFViewer.open({
       url,
@@ -13481,7 +16542,15 @@ async function viewFileOnline(courseId, materialId) {
                         : 'Guest · ' + new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
       hasFullAccess,
       previewPercent,
-      lockReason
+      lockReason,
+      /* ⚡ the server sent its re-packed fast-view copy → load on demand */
+      fastView:       !!(meta && meta.fastView === true && effectiveUrl === serverFileUrl),
+      /* ⚡ server accepts the signature as a header → stable URL, so the
+         browser re-uses its cached copy instead of downloading again */
+      sigInHeader:    !!(meta && meta.sigHeader === true && meta.signedUrl && effectiveUrl === serverFileUrl),
+      fileSize:       (meta && effectiveUrl === serverFileUrl && Number(meta.fileSize)) || 0,
+      cacheKey:       hasFullAccess ? aeroPdfCacheKey(mat) : null,
+      shellToken:     (hasFullAccess && shellToken) ? shellToken : undefined
     });
     return;
   }
@@ -13508,6 +16577,7 @@ async function viewFileOnline(courseId, materialId) {
     /* ⭐ PowerPoint / Word / Excel → rendered on the server to a protected
        PDF and shown in the in-app viewer (slideshow for presentations).
        The original file is never downloaded. */
+    if (!isPdf) dropShell();
     if (!isPdf && meta && meta.renderable) {
       return openRenderedOfficeFile(course, mat, meta, pdfJsPromise);
     }
@@ -13577,6 +16647,7 @@ if (_viewUrl.startsWith('/')) {
     }
 
   /* ⑤c LEGACY BASE64 FALLBACK — only when streaming isn't possible */
+  dropShell();
   try { await pdfJsPromise; }
   catch { return showToast('Could not load PDF viewer.', 'error'); }
 
@@ -13803,7 +16874,11 @@ function openMaterialSmart(courseId, materialId) {
 /* ============================================================
    openMaterialVideo — PREMIUM GATED
    ============================================================ */
-async function openMaterialVideo(courseId, materialId) {
+function openMaterialVideo(courseId, materialId) {
+  return AeroOpening.run(materialId, () => _openMaterialVideoImpl(courseId, materialId));
+}
+
+async function _openMaterialVideoImpl(courseId, materialId) {
   if (!assertMaterialUnlocked(courseId, materialId)) return;
 
   const course = findCourse(courseId);
@@ -13860,6 +16935,7 @@ async function openMaterialVideo(courseId, materialId) {
 
 async function toggleBookmark(e, courseId) {
   if (e) e.stopPropagation();
+  if (!currentUser && isGuestBrowsing()) return aeroGuestGate(courseId, null);
   if (!currentUser?._id) return;
   try {
     const res = await fetch(`/api/user/bookmarks/${courseId}`, {
@@ -13877,6 +16953,7 @@ async function toggleBookmark(e, courseId) {
 }
 
 async function toggleMaterialViewed(e, courseId, materialId) {
+  if (!currentUser && isGuestBrowsing()) { if (e) e.stopPropagation(); return aeroGuestGate(courseId, materialId); }
   if (e) e.stopPropagation();
   const currently = isMaterialViewed(courseId, materialId);
   try {
@@ -14190,14 +17267,12 @@ async function askDoubt(courseId) {
     const response = await fetch(`/api/courses/${courseId}/doubts`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        studentName: currentUser.fullName || currentUser.username,
-        studentUsername: currentUser.username,
-        studentEmail: currentUser.email || '',
-        question
+        question,
+        materialId: ($('newDoubtMaterial') && $('newDoubtMaterial').value) || ''
       })
     });
     const data = await response.json();
-    if (data.success) { showToast('❓ Submitted!', 'success'); textarea.value = ''; fetchCoursesFromDB(); }
+    if (data.success) { showToast('❓ Submitted!', 'success'); textarea.value = ''; window._qaAskMaterial = null; window._qaSort = Object.assign({}, window._qaSort, { [courseId]: 'new' }); refreshCourseDoubts(courseId); }
     else showToast(data.message || 'Error.', 'error');
   } catch { showToast('Server error.', 'error'); }
 }
@@ -14217,7 +17292,7 @@ async function postReply(courseId, doubtId) {
       })
     });
     const data = await res.json();
-    if (data.success) { showToast('💬 Posted!', 'success'); ta.value = ''; fetchCoursesFromDB(); }
+    if (data.success) { showToast('💬 Posted!', 'success'); ta.value = ''; refreshCourseDoubts(courseId); }
     else showToast(data.message || 'Failed.', 'error');
   } catch { showToast('Server error.', 'error'); }
 }
@@ -14229,7 +17304,7 @@ async function acceptReply(courseId, doubtId, replyId) {
       body: JSON.stringify({ acceptedBy: currentUser.username })
     });
     const data = await res.json();
-    if (data.success) { showToast('✅ Accepted!', 'success'); fetchCoursesFromDB(); }
+    if (data.success) { showToast('✅ Accepted!', 'success'); refreshCourseDoubts(courseId); }
     else showToast(data.message || 'Failed.', 'error');
   } catch { showToast('Server error.', 'error'); }
 }
@@ -14241,7 +17316,9 @@ async function acceptReply(courseId, doubtId, replyId) {
    PAYMENT MODAL — SECURE + ROBUST
    ============================================================ */
 async function showPaymentModal(courseId, materialId = null) {
+  if (aeroPlayBlocksPurchase()) return;
   if (!currentUser) {
+    if (isGuestBrowsing()) return aeroGuestGate(courseId, materialId);
     return showToast('Please log in first.', 'error');
   }
   if (String(currentUser.role || '').toLowerCase() === 'admin') {
@@ -14421,11 +17498,356 @@ function showToast(message, type = 'info') {
 /* ============================================================
    INIT
    ============================================================ */
+/* ============================================================
+   ⭐ GUEST COURSE CATALOG + SIGN-UP GATE (2026-10-06)
+   ------------------------------------------------------------
+   Landing page → "Explore Courses" (/app?intent=explore) lets a
+   visitor browse the full catalog and every course's curriculum
+   (types, lesson titles, playlists) exactly as students see it —
+   without an account.
+
+   • All lessons stay locked: any click on a lesson, PDF, video,
+     quiz, playlist, bookmark or purchase opens the "Create your
+     free account" pop-up instead (aeroGuestGate). The server also
+     refuses lesson files / videos / quizzes to visitors.
+   • Register (email + phone OTP) or Sign in inside the pop-up.
+     After it succeeds the pop-up closes, the visitor is signed
+     in on the same page, and the lesson they clicked opens.
+   • Signed-in users never see any of this. A logged-out visitor
+     who did not choose to browse still gets the normal login page.
+   ============================================================ */
+var AERO_GUEST_KEY = 'aero_guest_browse';
+var _aeroGuest = false;
+var _aeroGuestPending = null;          // { courseId, materialId } clicked before signing up
+try { _aeroGuest = sessionStorage.getItem(AERO_GUEST_KEY) === '1'; } catch (e) {}
+
+function isGuestBrowsing() { return !currentUser && _aeroGuest; }
+
+function _aeroSetGuest(on) {
+  _aeroGuest = !!on;
+  try {
+    if (on) sessionStorage.setItem(AERO_GUEST_KEY, '1');
+    else sessionStorage.removeItem(AERO_GUEST_KEY);
+  } catch (e) {}
+  if (!on) document.body.classList.remove('aero-guest');
+}
+
+/* Start browsing as a visitor (landing "Explore Courses", login page link) */
+function aeroStartGuestBrowse(courseId) {
+  if (currentUser) { navigateStudent('courses'); return; }
+  _aeroSetGuest(true);
+  editingCourseId = null;
+  currentMaterialFilter = 'all';
+  if (courseId) {
+    currentCourseId = courseId;
+    window.currentSelectedCourseId = courseId;
+    try { history.replaceState(null, '', '#/course/' + courseId); } catch (e) {}
+  } else {
+    currentCourseId = null;
+    window.currentSelectedCourseId = null;
+    studentNav = 'courses';
+    try { history.replaceState(null, '', '#/courses'); } catch (e) {}
+  }
+  renderApp();
+}
+
+/* Called once from initApp() before the first paint (no saved session) */
+function aeroConsumeLandingIntent() {
+  if (currentUser) { _aeroSetGuest(false); return; }
+  let intent = '';
+  try { intent = sessionStorage.getItem('aero_landing_intent') || ''; } catch (e) {}
+  if (intent === 'explore') {
+    try { sessionStorage.removeItem('aero_landing_intent'); } catch (e) {}
+    _aeroSetGuest(true);
+  }
+  if (!_aeroGuest) return;
+  /* only the catalog and course pages exist for visitors */
+  if (!currentCourseId) {
+    studentNav = 'courses';
+    try { history.replaceState(null, '', '#/courses'); } catch (e) {}
+  }
+}
+
+/* Header buttons for visitors: Sign in · Register free */
+function aeroEnsureGuestBar() {
+  if (document.getElementById('guestHeaderActions')) return;
+  const info = document.querySelector('#appHeader .user-info');
+  if (!info) return;
+  const bar = document.createElement('div');
+  bar.id = 'guestHeaderActions';
+  bar.className = 'guest-header-actions';
+  bar.innerHTML = `
+    <button type="button" class="btn btn-outline btn-sm" onclick="aeroGuestGate(null, null, 'signin')">
+      <i class="fas fa-right-to-bracket"></i> <span>Sign in</span>
+    </button>
+    <button type="button" class="btn btn-primary btn-sm" onclick="aeroGuestRegister()">
+      <i class="fas fa-user-plus"></i> <span>Register free</span>
+    </button>`;
+  info.insertBefore(bar, info.firstChild);
+}
+
+/* Small banner on the catalog / course page for visitors */
+function aeroGuestBannerHTML(where) {
+  if (currentUser) return '';
+  return `
+    <div class="guest-banner">
+      <div class="guest-banner-icon"><i class="fas fa-eye"></i></div>
+      <div class="guest-banner-text">
+        <strong>You're previewing RankerNode as a guest.</strong>
+        <span>${where === 'course'
+          ? 'Every lecture, note and PYQ of this course is listed below — register free to open them.'
+          : 'Browse every course and its full curriculum. Register free to open the lectures, notes and PYQs.'}</span>
+      </div>
+      <div class="guest-banner-actions">
+        <button type="button" class="btn btn-primary btn-sm" onclick="aeroGuestRegister()"><i class="fas fa-rocket"></i> Register free</button>
+        <button type="button" class="btn btn-outline btn-sm" onclick="aeroGuestGate(null, null, 'signin')">Sign in</button>
+      </div>
+    </div>`;
+}
+
+/* The visitor's version of the app: catalog + course pages only */
+function renderGuestApp() {
+  document.body.classList.add('aero-logged-out', 'aero-guest');
+  $('appHeader').style.display = 'flex';
+  $('appFooter').style.display = 'block';
+  aeroEnsureGuestBar();
+  const brand = document.querySelector('#appHeader .brand');
+  if (brand) brand.style.cursor = 'pointer';
+
+  if (!liveCourses.length && !_coursesLoading) {
+    fetchCoursesFromDB(true).catch(err => console.warn('[guest] course fetch failed:', err));
+  }
+
+  if (currentCourseId) {
+    $('courseDetailView').classList.add('active');
+    if (!findCourse(currentCourseId) && (!liveCourses.length || _coursesLoading)) {
+      const el = $('courseDetailContent');
+      if (el) el.innerHTML = renderCoursesLoadingSkeleton('Loading course…');
+      return;
+    }
+    renderCourseDetail(currentCourseId);
+    return;
+  }
+  if (studentNav !== 'courses') {
+    studentNav = 'courses';
+    try { history.replaceState(null, '', '#/courses'); } catch (e) {}
+  }
+  $('studentCoursesView').classList.add('active');
+  renderStudentCourses();
+}
+
+/* ---------- The "create your free account" pop-up ---------- */
+function _aeroGateModal() {
+  let el = document.getElementById('guestGateModal');
+  if (el) return el;
+  el = document.createElement('div');
+  el.className = 'modal-overlay';
+  el.id = 'guestGateModal';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-labelledby', 'guestGateTitle');
+  el.innerHTML = `
+    <div class="modal-box guest-gate">
+      <button type="button" class="guest-gate-close" aria-label="Close" onclick="aeroCloseGuestGate()"><i class="fas fa-xmark"></i></button>
+      <div class="guest-gate-icon"><i class="fas fa-lock-open"></i></div>
+      <h3 id="guestGateTitle">Create your free account to continue</h3>
+      <p class="modal-sub" id="guestGateSub"></p>
+      <ul class="guest-gate-perks">
+        <li><i class="fas fa-check"></i> Every lecture, note, PYQ and tutorial</li>
+        <li><i class="fas fa-check"></i> Track your progress and resume anywhere</li>
+        <li><i class="fas fa-check"></i> Free — takes about 30 seconds</li>
+      </ul>
+      <button type="button" class="btn btn-primary btn-block guest-gate-register" onclick="aeroGuestRegister()">
+        <i class="fas fa-user-plus"></i> Register free
+      </button>
+      <div class="guest-gate-or"><span>Already have an account?</span></div>
+      <form class="guest-gate-signin" onsubmit="aeroGuestSignInSubmit(event)" autocomplete="on">
+        <div class="form-group"><label for="guestGateUser">Username</label>
+          <input type="text" id="guestGateUser" autocomplete="username" required></div>
+        <div class="form-group"><label for="guestGatePass">Password</label>
+          <input type="password" id="guestGatePass" autocomplete="current-password" required></div>
+        <button type="submit" class="btn btn-outline btn-block" id="guestGateSignInBtn"><i class="fas fa-right-to-bracket"></i> Sign in</button>
+        <a href="#" class="link-inline guest-gate-forgot" onclick="event.preventDefault();aeroCloseGuestGate(true);showForgotPasswordModal();">Forgot password?</a>
+      </form>
+    </div>`;
+  el.addEventListener('click', (e) => { if (e.target === el) aeroCloseGuestGate(); });
+  document.body.appendChild(el);
+  return el;
+}
+
+function aeroGuestGate(courseId, materialId, mode) {
+  if (currentUser) return;                       // already signed in → nothing to gate
+  if (courseId || materialId) _aeroGuestPending = { courseId: courseId || currentCourseId || null, materialId: materialId || null };
+  const el = _aeroGateModal();
+  const sub = el.querySelector('#guestGateSub');
+  const course = courseId ? findCourse(courseId) : (currentCourseId ? findCourse(currentCourseId) : null);
+  const mat = course && materialId ? (course.materials || []).find(m => m.id === materialId) : null;
+  if (sub) {
+    sub.innerHTML = mat
+      ? `<strong>“${escapeHtml(mat.title)}”</strong>${course ? ` in ${escapeHtml(course.name)}` : ''} is available to registered students.`
+      : (mode === 'signin'
+          ? 'Sign in to open lectures, notes and PYQs — or register free if you are new.'
+          : 'Course lessons are available to registered students.');
+  }
+  el.classList.add('active');
+  document.addEventListener('keydown', _aeroGateEsc, true);
+  setTimeout(() => {
+    const f = mode === 'signin' ? el.querySelector('#guestGateUser') : el.querySelector('.guest-gate-register');
+    if (f) try { f.focus(); } catch (e) {}
+  }, 60);
+}
+
+function _aeroGateEsc(e) {
+  if (e.key === 'Escape') { e.preventDefault(); aeroCloseGuestGate(); }
+}
+
+/* keepPending: the visitor moved on to register / reset password */
+function aeroCloseGuestGate(keepPending) {
+  const el = document.getElementById('guestGateModal');
+  if (el) el.classList.remove('active');
+  document.removeEventListener('keydown', _aeroGateEsc, true);
+  if (!keepPending) _aeroGuestPending = null;
+}
+
+function aeroGuestRegister() {
+  if (currentUser) return;
+  aeroCloseGuestGate(true);
+  showRegisterModal();
+}
+
+async function aeroGuestSignInSubmit(e) {
+  e.preventDefault();
+  const u = (document.getElementById('guestGateUser') || {}).value || '';
+  const p = (document.getElementById('guestGatePass') || {}).value || '';
+  if (!u.trim() || !p) return showToast('Please enter your username and password.', 'error');
+  const btn = document.getElementById('guestGateSignInBtn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Signing in…'; }
+  try {
+    await aeroGuestSignIn(u.trim(), p);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-right-to-bracket"></i> Sign in'; }
+  }
+}
+
+/* Sign in without leaving the page. Returns true on success. */
+async function aeroGuestSignIn(username, password) {
+  let data = null;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, role: 'student' })
+    });
+    const raw = await res.text();
+    try { data = raw ? JSON.parse(raw) : {}; } catch (e) { data = { success: false, message: 'Server returned HTTP ' + res.status + '.' }; }
+  } catch (err) {
+    showToast('Could not reach the server. Please check your connection.', 'error');
+    return false;
+  }
+  if (data && (data.requires2FA || data.code === 'WRONG_LOGIN_TAB')) {
+    /* Admin / professor accounts use the full sign-in page (their own tab + email code) */
+    aeroCloseGuestGate();
+    _aeroSetGuest(false);
+    currentCourseId = null; window.currentSelectedCourseId = null;
+    try { history.replaceState(null, '', '#/home'); } catch (e) {}
+    renderApp();
+    showToast('Professor and admin accounts sign in here — pick the Professor or Admin tab.', 'info');
+    return false;
+  }
+  if (!data || !data.success || !data.user) {
+    showToast((data && data.message) || 'Sign-in failed. Please try again.', 'error');
+    return false;
+  }
+  aeroFinishGuestAuth(data);
+  return true;
+}
+
+/* Signed in (after Sign in, or right after registering) — stay on the
+   same page and open the lesson the visitor had clicked. */
+function aeroFinishGuestAuth(data) {
+  const pending = _aeroGuestPending;
+  _aeroGuestPending = null;
+  currentUser = data.user;
+  saveSession(data.user, data.token);
+  _aeroSetGuest(false);
+  aeroCloseGuestGate();
+  closeModal('registerModal');
+  closeModal('otpVerificationModal');
+  _sessionKilled = false;
+  startSessionHeartbeat();
+
+  const isAdminRole = String(data.user.role || '').trim().toLowerCase() === 'admin';
+  if (isAdminRole) {
+    currentCourseId = null; window.currentSelectedCourseId = null;
+    adminTab = 'overview';
+    try { history.replaceState(null, '', '#/admin/overview'); } catch (e) {}
+  } else {
+    try { ensureStudentAIHomeView(); } catch (e) {}
+  }
+  showToast(`Welcome${data.user.fullName ? ', ' + data.user.fullName.split(' ')[0] : ''}! You now have full access.`, 'success');
+  renderApp();
+
+  Promise.allSettled([
+    fetchCoursesFromDB(true),
+    fetchProfessorsFromDB(true),
+    fetchSubscriptionSettings(),
+    fetchOwnerProfile(true)
+  ]).then(() => {
+    try { renderApp(); } catch (e) {}
+    if (!isAdminRole && pending && pending.courseId && pending.materialId) {
+      const c = findCourse(pending.courseId);
+      if (c && (c.materials || []).some(m => m.id === pending.materialId)) {
+        setTimeout(() => { try { openMaterialSmart(pending.courseId, pending.materialId); } catch (e) {} }, 150);
+      }
+    }
+  });
+  setTimeout(() => {
+    refreshUserData().catch(() => {});
+    loadNotifications().catch(() => {});
+  }, 800);
+}
+
+/* Visitors: any click on a lesson / button inside the catalog or a course
+   page (other than browsing controls) opens the sign-up pop-up instead.
+   Runs in the capture phase, before the element's own onclick. */
+document.addEventListener('click', function (e) {
+  if (!isGuestBrowsing()) return;
+  const t = e.target;
+  if (!t || !t.closest) return;
+  const area = t.closest('#courseDetailContent, #studentCourseList');
+  if (!area) return;
+  /* browsing controls that stay available to visitors */
+  if (t.closest('.material-tabs button, .playlist-banner button, .guest-banner, [data-guest-ok]')) return;
+
+  let gated = false;
+  if (area.id === 'studentCourseList') {
+    /* the course card itself opens the course page; its buttons need an account */
+    gated = !!t.closest('.bookmark-btn, button');
+  } else {
+    gated = !!t.closest('button, a[href], [onclick], .material-item, .material-thumb, input, textarea, select, summary, label, video, iframe');
+  }
+  if (!gated) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+
+  const item = t.closest('[data-gmid]');
+  const card = t.closest('.course-card');
+  let courseId = currentCourseId || null;
+  if (!courseId && card) {
+    const m = String(card.getAttribute('onclick') || '').match(/viewCourseDetail\('([^']+)'/);
+    if (m) courseId = m[1];
+  }
+  aeroGuestGate(courseId, item ? item.getAttribute('data-gmid') : null);
+}, true);
+
 function initApp() {
   const savedUser = loadSessionUser();
   if (savedUser) {
     currentUser = savedUser;
     if (currentUser.role === 'admin') adminTab = 'overview';
+    // ⚡ Start the student count now so the Overview tile is ready on first paint
+    try { aeroPrefetchAdminStats(); } catch (_) {}
     // Restart heartbeat immediately if we already have a live session
     _sessionKilled = false;
     startSessionHeartbeat();
@@ -14434,6 +17856,8 @@ function initApp() {
   _applyCustomLogoIfAny().catch(() => {});
   updateThemeIcon();
   syncHashToState();
+  /* ⭐ Landing "Explore Courses" → browse the catalog as a visitor */
+  try { aeroConsumeLandingIntent(); } catch (e) {}
 
   // Make sure the AI home section exists (idempotent — returns early if already injected)
   if (currentUser && String(currentUser.role || '').toLowerCase() === 'student') {
@@ -14945,12 +18369,9 @@ window.addEventListener('popstate', () => { syncHashToState(); renderApp(); });
 // Only AUTO-UPGRADE to Admin (e.g. when the username contains "admin").
 // Never auto-downgrade — the user may have deliberately clicked the Admin
 // tab, and many admin usernames aren't literally the word "admin".
-document.getElementById('loginUsername')?.addEventListener('input', (e) => {
-  const val = e.target.value.trim().toLowerCase();
-  if (/admin/i.test(val) && loginRole !== 'admin') {
-    setLoginRole('admin');
-  }
-});
+/* ⭐ 2026-10-09: no automatic tab switching any more — the tab the user
+   picks is the only one their account can sign in from (server-enforced). */
+document.getElementById('loginUsername')?.addEventListener('input', () => _loginClearTabError());
 /* ============================================================
 /* ---------- Student: Alumni section (cached) ---------- */
 async function renderAlumniSection() {
@@ -15416,6 +18837,7 @@ async function askAIDoubt(courseId, postPublicly = false) {
       body: JSON.stringify({
         question,
         courseId,
+        model: (typeof _aiSelectedModel === 'string' && _aiSelectedModel) || 'auto',
         userId: currentUser ? currentUser._id : null
       })
     });
@@ -15434,7 +18856,7 @@ async function askAIDoubt(courseId, postPublicly = false) {
     answerBox.innerHTML = `
       <div class="ai-answer-header">
         <i class="fas fa-robot"></i> <strong>AI Assistant</strong>
-        <span class="ai-badge">Beta</span>
+        <span class="ai-badge">${escapeHtml(data.model || 'Beta')}</span>
       </div>
       <div class="ai-answer-body" id="aiAnswerBody-${courseId}">${renderMarkdown(data.answer)}</div>
       <div class="ai-answer-footer">
@@ -15501,11 +18923,19 @@ function renderMarkdown(text) {
 
   // ---- Step 1: Stash fenced code blocks ----
   const codeBlocks = [];
-  let html = String(text).replace(/```([\s\S]*?)```/g, (_, body) => {
+  /* ⭐ 2026-10-08: the language tag after ``` (```python) is no longer shown
+     as the first line of the code; an unfinished block (still streaming
+     or cut off) is shown as code too instead of leaking raw backticks. */
+  const stashCode = (body) => {
     const idx = codeBlocks.length;
-    codeBlocks.push('<pre><code>' + escapeHtml(body.replace(/^\n+/, '')) + '</code></pre>');
-    return '\u0001CB' + idx + '\u0001';
-  });
+    let lang = '';
+    const m = /^([A-Za-z][\w+#.-]{0,20})[ \t]*\n/.exec(body);
+    if (m) { lang = m[1]; body = body.slice(m[0].length); }
+    codeBlocks.push('<pre' + (lang ? ' data-lang="' + escapeHtml(lang.toLowerCase()) + '"' : '') + '><code>' + escapeHtml(body.replace(/^\n+/, '').replace(/\s+$/, '')) + '</code></pre>');
+    return '\n\n\u0001CB' + idx + '\u0001\n\n';
+  };
+  let html = String(text).replace(/```([\s\S]*?)```/g, (_, body) => stashCode(body));
+  html = html.replace(/```([\s\S]*)$/, (_, body) => stashCode(body));
 
   // ---- Step 2: Stash math (BEFORE escaping, so TeX survives) ----
   const mathBlocks = [];
@@ -15567,21 +18997,27 @@ function renderMarkdown(text) {
   html = html.replace(/^## (.+)$/gm,   '<h3>$1</h3>');
   html = html.replace(/^# (.+)$/gm,    '<h3>$1</h3>');
 
-  // ---- Step 6: Blockquotes ----
+  // ---- Step 6: Blockquotes + horizontal rules ----
   html = html.replace(/^&gt;[ \t]?(.+)$/gm, '<blockquote>$1</blockquote>');
+  html = html.replace(/^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/gm, '<hr>');
 
   // ---- Step 7: Lists ----
   // Unordered
-  html = html.replace(/(?:^[ \t]*[-*+] .+(?:\n|$))+/gm, (block) => {
-    const items = block.trimEnd().split('\n')
-      .map(l => `<li>${l.replace(/^[ \t]*[-*+]\s*/, '')}</li>`).join('');
-    return `<ul>${items}</ul>`;
+  html = html.replace(/(?:^[ \t]*[-*+•] .+(?:\n|$))+/gm, (block) => {
+    const lines = block.trimEnd().split('\n');
+    const indent = (lines[0].match(/^[ \t]*/) || [''])[0].replace(/\t/g, '  ').length;
+    const items = lines.map(l => {
+      const ind = (l.match(/^[ \t]*/) || [''])[0].replace(/\t/g, '  ').length;
+      return `<li${ind >= 2 && ind > indent ? ' class="md-sub-li"' : ''}>${l.replace(/^[ \t]*[-*+•]\s*/, '')}</li>`;
+    }).join('');
+    return `<ul${indent >= 2 ? ' class="md-sub"' : ''}>${items}</ul>\n`;
   });
-  // Ordered
-  html = html.replace(/(?:^[ \t]*\d+\. .+(?:\n|$))+/gm, (block) => {
-    const items = block.trimEnd().split('\n')
-      .map(l => `<li>${l.replace(/^[ \t]*\d+\.\s*/, '')}</li>`).join('');
-    return `<ol>${items}</ol>`;
+  // Ordered — keeps the real number, so "1. … (blank line) 2. …" no longer restarts at 1
+  html = html.replace(/(?:^[ \t]*\d+[.)] .+(?:\n|$))+/gm, (block) => {
+    const lines = block.trimEnd().split('\n');
+    const start = parseInt((lines[0].match(/\d+/) || ['1'])[0], 10) || 1;
+    const items = lines.map(l => `<li>${l.replace(/^[ \t]*\d+[.)]\s*/, '')}</li>`).join('');
+    return `<ol${start !== 1 ? ` start="${start}"` : ''}>${items}</ol>\n`;
   });
 
   // ---- Step 8: Inline formatting ----
@@ -15595,7 +19031,7 @@ function renderMarkdown(text) {
     const t = p.trim();
     if (!t) return '';
     // Block-level HTML must not be wrapped in <p>
-    if (/^<(h[1-6]|table|ul|ol|blockquote|div|pre|hr)\b/i.test(t)) return t;
+    if (/^<(h[1-6]|table|ul|ol|blockquote|div|pre|hr)\b/i.test(t) || /^\u0001CB\d+\u0001$/.test(t)) return t;
     return '<p>' + t.replace(/\n/g, '<br>') + '</p>';
   }).filter(Boolean).join('\n');
 
@@ -15673,17 +19109,68 @@ async function submitStudentFeedback(e) {
   }
 }
 
+/* ============================================================
+   ⚡ FAST LISTS (2026-10-09) — stale-while-revalidate
+   ------------------------------------------------------------
+   Reviews and "My contributions" used to show a spinner and hit
+   the server on EVERY visit to Home. Now the last copy is painted
+   instantly (from memory, or from this device on a fresh visit),
+   and the server is asked again only when that copy is older than
+   a minute; the list is re-painted only if something changed.
+   ============================================================ */
+const _fastLists = {};
+function fastList(key, store, maxAgeMs) {
+  let c = _fastLists[key];
+  if (!c && store) {
+    try { const raw = store.getItem('aero_fl_' + key); const o = raw && JSON.parse(raw); if (o && Array.isArray(o.v)) c = _fastLists[key] = { at: o.at || 0, v: o.v, sig: JSON.stringify(o.v) }; } catch (_) {}
+  }
+  return {
+    cached: c ? c.v : null,
+    fresh: !!(c && Date.now() - c.at < maxAgeMs),
+    put(v) {
+      const sig = JSON.stringify(v), changed = !c || c.sig !== sig;
+      c = _fastLists[key] = { at: Date.now(), v, sig };
+      if (store) { try { store.setItem('aero_fl_' + key, JSON.stringify({ at: c.at, v })); } catch (_) {} }
+      return changed;
+    }
+  };
+}
+
+/* mark a cached list stale (it still paints instantly, then refreshes) */
+function staleFastList(prefix) {
+  Object.keys(_fastLists).forEach(k => { if (k.indexOf(prefix) === 0) _fastLists[k].at = 0; });
+  [window.localStorage, window.sessionStorage].forEach(st => {
+    try { for (let i = 0; i < st.length; i++) { const k = st.key(i); if (k && k.indexOf('aero_fl_' + prefix) === 0) { const o = JSON.parse(st.getItem(k)); o.at = 0; st.setItem(k, JSON.stringify(o)); } } } catch (_) {}
+  });
+}
+
 async function loadApprovedFeedback() {
   const host = document.getElementById('studentFeedbackList');
   if (!host) return;
-
-  host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
+  let ls = null; try { ls = window.localStorage; } catch (_) {}
+  const fl = fastList('reviews', ls, 60 * 1000);
+  if (fl.cached) _paintApprovedFeedback(host, fl.cached);
+  else host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
     <i class="fas fa-spinner fa-spin"></i><p>Loading reviews…</p></div>`;
-
+  if (fl.fresh) return;
+  if (loadApprovedFeedback._busy) return;
+  loadApprovedFeedback._busy = true;
   try {
-    const data = await fetchJSON(`${API_BASE}/feedback?_t=${Date.now()}`);
-    const list = (data && data.success && Array.isArray(data.feedback)) ? data.feedback : [];
-
+    const data = await fetchJSON(`${API_BASE}/feedback`);
+    if (!data || !data.success || !Array.isArray(data.feedback)) throw new Error('bad response');
+    if (fl.put(data.feedback) || !fl.cached) {
+      const h = document.getElementById('studentFeedbackList');
+      if (h) _paintApprovedFeedback(h, data.feedback);
+    }
+  } catch (err) {
+    console.error('[loadApprovedFeedback]', err);
+    if (!fl.cached) host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
+      <p style="color:var(--rose-500);">Could not load reviews.</p>
+    </div>`;
+  } finally { loadApprovedFeedback._busy = false; }
+}
+function _paintApprovedFeedback(host, list) {
+  {
     if (list.length === 0) {
       host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
         <i class="fas fa-star-half-alt"></i>
@@ -15724,11 +19211,6 @@ async function loadApprovedFeedback() {
     html += '</div>';
     host.innerHTML = html;
     _initFeedbackReadMore(host);
-  } catch (err) {
-    console.error('[loadApprovedFeedback]', err);
-    host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
-      <p style="color:var(--rose-500);">Could not load reviews.</p>
-    </div>`;
   }
 }
 
@@ -15873,6 +19355,7 @@ async function submitContribution(e) {
     if (data.success) {
       closeModal('contributionModal');
       showToast('✅ ' + (data.message || 'Contribution submitted!'), 'success');
+      staleFastList('contrib_');
       loadMyContributions();
     } else {
       showToast(data.message || 'Upload failed.', 'error');
@@ -15894,13 +19377,31 @@ async function loadMyContributions() {
     return;
   }
 
-  host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
+  let ss = null; try { ss = window.sessionStorage; } catch (_) {}
+  const uname = currentUser.username;
+  const fl = fastList('contrib_' + String(uname).toLowerCase(), ss, 60 * 1000);
+  if (fl.cached) _paintMyContributions(host, fl.cached);
+  else host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
     <i class="fas fa-spinner fa-spin"></i><p>Loading your contributions…</p></div>`;
-
+  if (fl.fresh) return;
+  if (loadMyContributions._busy) return;
+  loadMyContributions._busy = true;
   try {
-    const data = await fetchJSON(`${API_BASE}/contributions/mine/${encodeURIComponent(currentUser.username)}?_t=${Date.now()}`);
-    const list = (data && data.success && Array.isArray(data.contributions)) ? data.contributions : [];
-
+    const data = await fetchJSON(`${API_BASE}/contributions/mine/${encodeURIComponent(uname)}`, { cache: 'no-store' });
+    if (!data || !data.success || !Array.isArray(data.contributions)) throw new Error('bad response');
+    if (fl.put(data.contributions) || !fl.cached) {
+      const h = document.getElementById('myContributionsList');
+      if (h && currentUser && currentUser.username === uname) _paintMyContributions(h, data.contributions);
+    }
+  } catch (err) {
+    console.error('[loadMyContributions]', err);
+    if (!fl.cached) host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
+      <p style="color:var(--rose-500);">Could not load your contributions.</p>
+    </div>`;
+  } finally { loadMyContributions._busy = false; }
+}
+function _paintMyContributions(host, list) {
+  {
     if (list.length === 0) {
       host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
         <i class="fas fa-inbox"></i>
@@ -15938,11 +19439,6 @@ async function loadMyContributions() {
     });
     html += '</div>';
     host.innerHTML = html;
-  } catch (err) {
-    console.error('[loadMyContributions]', err);
-    host.innerHTML = `<div class="empty-state" style="padding:30px 20px;">
-      <p style="color:var(--rose-500);">Could not load your contributions.</p>
-    </div>`;
   }
 }
 
@@ -16028,7 +19524,7 @@ async function approveFeedback(id) {
   if (!confirm('Approve this feedback? It will become public.')) return;
   try {
     const data = await fetchJSON(`${API_BASE}/admin/feedback/${id}/approve`, { method: 'PUT' });
-    if (data.success) { showToast('✅ Approved.', 'success'); renderAdminFeedback(); }
+    if (data.success) { showToast('✅ Approved.', 'success'); staleFastList('reviews'); renderAdminFeedback(); }
     else showToast(data.message || 'Failed.', 'error');
   } catch (e) { showToast(e.message, 'error'); }
 }
@@ -16036,7 +19532,7 @@ async function rejectFeedback(id) {
   if (!confirm('Reject / Unpublish this feedback?')) return;
   try {
     const data = await fetchJSON(`${API_BASE}/admin/feedback/${id}/reject`, { method: 'PUT' });
-    if (data.success) { showToast('Rejected.', 'info'); renderAdminFeedback(); }
+    if (data.success) { showToast('Rejected.', 'info'); staleFastList('reviews'); renderAdminFeedback(); }
     else showToast(data.message || 'Failed.', 'error');
   } catch (e) { showToast(e.message, 'error'); }
 }
@@ -16044,7 +19540,7 @@ async function deleteFeedback(id, who) {
   if (!confirm(`Delete feedback from "${who}"?`)) return;
   try {
     const data = await fetchJSON(`${API_BASE}/admin/feedback/${id}`, { method: 'DELETE' });
-    if (data.success) { showToast('Deleted.', 'info'); renderAdminFeedback(); }
+    if (data.success) { showToast('Deleted.', 'info'); staleFastList('reviews'); renderAdminFeedback(); }
     else showToast(data.message || 'Failed.', 'error');
   } catch (e) { showToast(e.message, 'error'); }
 }
@@ -16366,6 +19862,85 @@ function _aiLoad() {
 }
 
 /* ============================================================
+   ⭐ MY NOTES (2026-10-09) — GoodNotes-style notebooks
+   ------------------------------------------------------------
+   notes.js / notes.css are fetched the first time a student opens
+   Notes, so nobody else pays for them. Their versioned URLs come
+   from <template id="aeroLazyAssets"> in index.html (the server
+   stamps the ?v= hashes there).
+   ============================================================ */
+var _notesMounted = false;   // var: read by _renderAppNow, which is defined earlier in the file
+var _notesLoading = null;
+function ensureStudentNotesView() {
+  let el = document.getElementById('studentNotesView');
+  if (el) return el;
+  const main = document.querySelector('.main-content');
+  if (!main) return null;
+  el = document.createElement('section');
+  el.id = 'studentNotesView';
+  el.className = 'view';
+  const ai = document.getElementById('studentAIHomeView');
+  if (ai && ai.parentNode === main) ai.insertAdjacentElement('afterend', el);
+  else main.appendChild(el);
+  return el;
+}
+function _lazyAssetUrl(name, fallback) {
+  try {
+    const tpl = document.getElementById('aeroLazyAssets');
+    const node = tpl && tpl.content && tpl.content.querySelector(`[data-asset="${name}"]`);
+    const url = node && (node.getAttribute('src') || node.getAttribute('href'));
+    if (url) return url;
+  } catch (_) {}
+  return fallback;
+}
+function loadNotesModule() {
+  if (window.AeroNotes) return Promise.resolve();
+  if (_notesLoading) return _notesLoading;
+  _notesLoading = new Promise((resolve, reject) => {
+    if (!document.querySelector('link[data-aero-notes]')) {
+      const l = document.createElement('link');
+      l.rel = 'stylesheet'; l.href = _lazyAssetUrl('notes-css', 'notes.css'); l.setAttribute('data-aero-notes', '1');
+      document.head.appendChild(l);
+    }
+    const s = document.createElement('script');
+    s.src = _lazyAssetUrl('notes-js', 'notes.js');
+    s.async = true;
+    s.onload = () => window.AeroNotes ? resolve() : reject(new Error('Notes failed to start.'));
+    s.onerror = () => { try { s.remove(); } catch (_) {} reject(new Error('Could not load Notes. Check your connection.')); };
+    document.head.appendChild(s);
+  }).catch((e) => { _notesLoading = null; throw e; });
+  return _notesLoading;
+}
+function _notesIdFromHash() {
+  const m = /^#\/notes\/([A-Za-z0-9_-]{6,40})/.exec(location.hash || '');
+  return m ? m[1] : null;
+}
+/* ⚡ fetch the Notes files quietly once the student is idle, so opening
+   "My Notes" later is instant (prefetch = download only, nothing runs) */
+var _notesPrefetched = false;
+function prefetchNotesModule() {
+  if (_notesPrefetched || window.AeroNotes) return;
+  _notesPrefetched = true;
+  try { const c = navigator.connection; if (c && (c.saveData || /2g/.test(c.effectiveType || ''))) return; } catch (_) {}
+  const go = () => [['notes-js', 'notes.js', 'script'], ['notes-css', 'notes.css', 'style']].forEach(([name, file, as]) => {
+    const l = document.createElement('link'); l.rel = 'prefetch'; l.as = as; l.href = _lazyAssetUrl(name, file); document.head.appendChild(l);
+  });
+  if ('requestIdleCallback' in window) requestIdleCallback(go, { timeout: 6000 }); else setTimeout(go, 3000);
+}
+function renderStudentNotes(view) {
+  if (window.AeroNotes) { window.AeroNotes.show(view, _notesIdFromHash()); return; }
+  if (!view.firstElementChild) {
+    view.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:64px 16px;color:var(--text-secondary)"><i class="fas fa-spinner fa-spin" style="font-size:26px;color:var(--brand-600,#4f46e5)"></i><p style="margin:0">Opening your notes…</p></div>';
+  }
+  loadNotesModule().then(() => {
+    if (studentNav === 'notes' && view.classList.contains('active')) window.AeroNotes.show(view, _notesIdFromHash());
+  }).catch((e) => {
+    if (studentNav !== 'notes') return;
+    view.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:64px 16px;text-align:center;color:var(--text-secondary)"><i class="fas fa-wifi" style="font-size:26px"></i><p style="margin:0">${escapeHtml(e.message || 'Could not load Notes.')}</p><button type="button" class="btn btn-primary" onclick="renderApp()"><i class="fas fa-rotate-right"></i> Try again</button></div>`;
+  });
+}
+
+/* ============================================================
    ENSURE AI HOME SECTION EXISTS (stale index.html self-heal)
    ============================================================ */
 function ensureStudentAIHomeView() {
@@ -16405,6 +19980,218 @@ function ensureStudentAIHomeView() {
 
 /* The composer is built here (one source of truth). Any older
    markup from a cached index.html is replaced on first render. */
+/* ============================================================
+   ⭐ AI MODEL PICKER (2026-10-08)
+   ------------------------------------------------------------
+   The server lists the models it can use (Gemini + Groq). "Auto"
+   lets the server pick the best one that is free right now; a
+   picked model that is busy or can't read the attachment is
+   swapped automatically and the answer says which model replied.
+   The choice is remembered on this device.
+   ============================================================ */
+const AI_MODEL_KEY = 'aero_ai_model';
+let _aiModels = null;            // { models:[…], providers:{…} }
+let _aiModelsAt = 0;
+let _aiModelsLoading = null;
+let _aiSelectedModel = (function () { try { return localStorage.getItem(AI_MODEL_KEY) || 'auto'; } catch (_) { return 'auto'; } })();
+
+function _aiModelById(id) { return ((_aiModels && _aiModels.models) || []).find(m => m.id === id) || null; }
+function _aiModelShortLabel(full) {
+  if (!_aiSelectedModel || _aiSelectedModel === 'auto') return full ? '' : 'Auto';
+  const m = _aiModelById(_aiSelectedModel);
+  if (m) return m.label;
+  /* list not loaded yet — derive a readable name from the id */
+  const raw = String(_aiSelectedModel).split(':').slice(1).join(':').split('/').pop() || 'Model';
+  return raw.replace(/^gemini-/, 'Gemini ').replace(/-/g, ' ').replace(/\b(\w)/g, c => c.toUpperCase());
+}
+function _aiUpdateModelBtn() {
+  const l = document.getElementById('aiModelBtnLabel');
+  if (l) l.textContent = _aiModelShortLabel();
+  const b = document.getElementById('aiModelBtn');
+  if (b) {
+    b.classList.toggle('is-custom', !!_aiSelectedModel && _aiSelectedModel !== 'auto');
+    b.title = 'AI model: ' + (_aiSelectedModel === 'auto' ? 'Auto (best available)' : _aiModelShortLabel());
+  }
+}
+async function loadAIModels(force) {
+  if (!force && _aiModels && Date.now() - _aiModelsAt < 60000) return _aiModels;
+  if (_aiModelsLoading) return _aiModelsLoading;
+  _aiModelsLoading = (async () => {
+    try {
+      const d = await fetchJSON(`${API_BASE}/ai/models?_t=${Date.now()}`, { cache: 'no-store' });
+      if (d && d.success) {
+        _aiModels = { models: d.models || [], providers: d.providers || {} };
+        _aiModelsAt = Date.now();
+        /* a remembered model that the server no longer offers → back to Auto */
+        if (_aiSelectedModel !== 'auto' && !_aiModelById(_aiSelectedModel)) aiSelectModel('auto', true);
+      }
+    } catch (e) { console.warn('[ai/models]', e && e.message); }
+    finally { _aiModelsLoading = null; _aiUpdateModelBtn(); }
+    return _aiModels;
+  })();
+  return _aiModelsLoading;
+}
+function aiSelectModel(id, silent) {
+  _aiSelectedModel = id || 'auto';
+  try { localStorage.setItem(AI_MODEL_KEY, _aiSelectedModel); } catch (_) {}
+  _aiUpdateModelBtn();
+  if (!silent) {
+    const m = _aiModelById(_aiSelectedModel);
+    showToast(_aiSelectedModel === 'auto' ? 'Auto: the best available model answers.' : `${m ? m.label : 'Model'} will answer your questions.`, 'success');
+  }
+  const pop = document.getElementById('aiModelMenu');
+  if (pop) _aiRenderModelMenu(pop);
+}
+function _aiBusyText(sec) {
+  if (!sec) return '';
+  return sec >= 90 ? `busy · ~${Math.ceil(sec / 60)} min` : `busy · ${sec}s`;
+}
+function _aiTagHTML(t) {
+  const map = { fast: ['fa-bolt', 'Fast'], reasoning: ['fa-brain', 'Deep reasoning'], files: ['fa-file-image', 'Images & PDFs'], images: ['fa-image', 'Images'] };
+  const x = map[t]; if (!x) return '';
+  return `<span class="ai-mm-tag ai-mm-tag-${t}"><i class="fas ${x[0]}"></i>${x[1]}</span>`;
+}
+function _aiRenderModelMenu(pop) {
+  const list = (_aiModels && _aiModels.models) || [];
+  const sel = _aiSelectedModel || 'auto';
+  const groups = [];
+  list.forEach(m => { let g = groups.find(x => x.name === m.group); if (!g) groups.push(g = { name: m.group, items: [] }); g.items.push(m); });
+  const item = (m) => `
+    <button type="button" class="ai-mm-item ${m.id === sel ? 'is-on' : ''} ${m.busy ? 'is-busy' : ''}" role="option" aria-selected="${m.id === sel}" data-ai-model="${escapeHtml(m.id)}">
+      <span class="ai-mm-radio" aria-hidden="true"></span>
+      <span class="ai-mm-text">
+        <span class="ai-mm-name">${escapeHtml(m.label)}${m.busy ? `<span class="ai-mm-busy"><i class="fas fa-hourglass-half"></i> ${_aiBusyText(m.busy)}</span>` : ''}</span>
+        <span class="ai-mm-desc">${escapeHtml(m.desc || '')}</span>
+        <span class="ai-mm-tags">${(m.tags || []).map(_aiTagHTML).join('')}</span>
+      </span>
+    </button>`;
+  const anyBusy = list.filter(m => m.busy).length;
+  pop.innerHTML = `
+    <div class="ai-mm-head">
+      <div><strong>Choose AI model</strong><span>${list.length ? `${list.length} models available${anyBusy ? ` · ${anyBusy} busy` : ''}` : (_aiModels ? 'No AI models are configured on the server.' : 'Loading models…')}</span></div>
+      <button type="button" class="ai-mm-close" data-ai-mm-close aria-label="Close"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="ai-mm-body" role="listbox" aria-label="AI model">
+      <button type="button" class="ai-mm-item ai-mm-auto ${sel === 'auto' ? 'is-on' : ''}" role="option" aria-selected="${sel === 'auto'}" data-ai-model="auto">
+        <span class="ai-mm-radio" aria-hidden="true"></span>
+        <span class="ai-mm-text">
+          <span class="ai-mm-name"><i class="fas fa-wand-magic-sparkles"></i> Auto <span class="ai-mm-rec">Recommended</span></span>
+          <span class="ai-mm-desc">Uses the best model that is free right now and switches instantly if one is busy.</span>
+        </span>
+      </button>
+      ${groups.map(g => `<div class="ai-mm-group">${escapeHtml(g.name)}</div>${g.items.map(item).join('')}`).join('')}
+      ${!list.length && !_aiModels ? '<div class="ai-mm-loading"><i class="fas fa-spinner fa-spin"></i> Loading…</div>' : ''}
+    </div>
+    <div class="ai-mm-foot">
+      <span><i class="fas fa-circle-info"></i> If your pick is busy or can't read your file, another model answers and we tell you which.</span>
+      ${typeof isAdmin === 'function' && isAdmin(currentUser) ? '<button type="button" class="ai-mm-test" data-ai-mm-test><i class="fas fa-stethoscope"></i> Test all models</button>' : ''}
+    </div>`;
+}
+function _aiPlaceModelMenu(pop) {
+  const btn = document.getElementById('aiModelBtn');
+  if (!btn) return;
+  const r = btn.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const ov = document.getElementById('aiModelMenuOv');
+  if (ov) ov.classList.toggle('is-dim', vw <= 600);
+  if (vw <= 600) { pop.classList.add('is-sheet'); pop.style.left = pop.style.top = pop.style.bottom = ''; return; }
+  pop.classList.remove('is-sheet');
+  const w = Math.min(420, vw - 24);
+  pop.style.width = w + 'px';
+  pop.style.left = Math.max(12, Math.min(r.left, vw - w - 12)) + 'px';
+  const spaceAbove = r.top - 12, spaceBelow = vh - r.bottom - 12;
+  if (spaceAbove >= 320 || spaceAbove > spaceBelow) {
+    pop.style.top = ''; pop.style.bottom = (vh - r.top + 8) + 'px';
+    pop.style.maxHeight = Math.max(240, spaceAbove - 8) + 'px';
+  } else {
+    pop.style.bottom = ''; pop.style.top = (r.bottom + 8) + 'px';
+    pop.style.maxHeight = Math.max(240, spaceBelow - 8) + 'px';
+  }
+}
+function aiCloseModelMenu() {
+  const pop = document.getElementById('aiModelMenu');
+  const ov = document.getElementById('aiModelMenuOv');
+  if (pop) pop.remove();
+  if (ov) ov.remove();
+  const b = document.getElementById('aiModelBtn');
+  if (b) b.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('keydown', _aiModelMenuKeys, true);
+  window.removeEventListener('resize', _aiModelMenuReplace);
+}
+function _aiModelMenuReplace() { const pop = document.getElementById('aiModelMenu'); if (pop) _aiPlaceModelMenu(pop); }
+function _aiModelMenuKeys(e) {
+  if (e.key === 'Escape') { e.preventDefault(); aiCloseModelMenu(); const b = document.getElementById('aiModelBtn'); if (b) b.focus(); return; }
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const items = Array.from(document.querySelectorAll('#aiModelMenu .ai-mm-item'));
+  if (!items.length) return;
+  e.preventDefault();
+  let i = items.indexOf(document.activeElement);
+  i = e.key === 'ArrowDown' ? (i + 1) % items.length : (i <= 0 ? items.length - 1 : i - 1);
+  items[i].focus();
+}
+function aiOpenModelMenu() {
+  if (document.getElementById('aiModelMenu')) return;
+  const ov = document.createElement('div');
+  ov.id = 'aiModelMenuOv'; ov.className = 'ai-mm-ov';
+  ov.addEventListener('click', aiCloseModelMenu);
+  const pop = document.createElement('div');
+  pop.id = 'aiModelMenu'; pop.className = 'ai-mm'; pop.setAttribute('role', 'dialog'); pop.setAttribute('aria-label', 'Choose AI model');
+  pop.addEventListener('click', (e) => {
+    if (e.target.closest('[data-ai-mm-close]')) return aiCloseModelMenu();
+    if (e.target.closest('[data-ai-mm-test]')) return aiTestAllModels();
+    const it = e.target.closest('[data-ai-model]');
+    if (it) { aiSelectModel(it.dataset.aiModel); setTimeout(aiCloseModelMenu, 120); }
+  });
+  _aiRenderModelMenu(pop);
+  document.body.appendChild(ov);
+  document.body.appendChild(pop);
+  _aiPlaceModelMenu(pop);
+  const b = document.getElementById('aiModelBtn');
+  if (b) b.setAttribute('aria-expanded', 'true');
+  document.addEventListener('keydown', _aiModelMenuKeys, true);
+  window.addEventListener('resize', _aiModelMenuReplace);
+  setTimeout(() => { const on = pop.querySelector('.ai-mm-item.is-on') || pop.querySelector('.ai-mm-item'); if (on) on.focus({ preventScroll: true }); }, 30);
+  loadAIModels(true).then(() => {
+    const p = document.getElementById('aiModelMenu');
+    if (p) { _aiRenderModelMenu(p); _aiPlaceModelMenu(p); }
+  });
+}
+function aiToggleModelMenu() {
+  if (document.getElementById('aiModelMenu')) aiCloseModelMenu(); else aiOpenModelMenu();
+}
+function aiRetryWithAuto() {
+  aiSelectModel('auto', true);
+  retryAILastMessage();
+}
+async function aiTestAllModels() {
+  const btn = document.querySelector('[data-ai-mm-test]');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Testing… (up to 30 s)'; }
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/ai/test`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!d || !d.success) throw new Error((d && d.message) || 'Test failed.');
+    aiCloseModelMenu();
+    const rows = (d.results || []).map(r => `<div class="ai-test-row ${r.ok ? 'ok' : 'bad'}"><i class="fas ${r.ok ? 'fa-circle-check' : 'fa-circle-xmark'}"></i>
+        <div><strong>${escapeHtml(r.label)}</strong><span>${r.ok ? `answered in ${(r.ms / 1000).toFixed(1)} s` : escapeHtml(r.error || 'failed')}</span></div></div>`).join('');
+    const prov = d.providers || {};
+    const ok = (d.results || []).filter(r => r.ok).length;
+    aeroInfoDialog(`AI models: ${ok} of ${(d.results || []).length} working`,
+      `<span class="ai-test-keys">Gemini key: <strong>${prov.gemini ? 'set' : 'missing'}</strong> · Groq key: <strong>${prov.groq ? 'set' : 'missing'}</strong></span>` +
+      (rows ? `<span class="ai-test-list">${rows}</span>` : '<br>No models are configured. Add GEMINI_API_KEY and/or GROQ_API_KEY to the server .env and restart.') +
+      (d.listErrors && Object.keys(d.listErrors).length ? `<span class="ai-test-note">Model list problem: ${escapeHtml(Object.entries(d.listErrors).map(([k, v]) => k + ' — ' + v).join('; '))}</span>` : ''),
+      ok ? 'fa-stethoscope' : 'fa-triangle-exclamation');
+    _aiModelsAt = 0;
+  } catch (e) {
+    showToast(e.message || 'Test failed.', 'error');
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-stethoscope"></i> Test all models'; }
+  }
+}
+/* Repaint only the "Thinking · model" line while waiting for the first words */
+function _aiRepaintTyping(msg) {
+  const el = document.getElementById('aiTypingLabel');
+  if (!el) return;
+  el.textContent = msg.trying || (('Thinking') + (msg.modelLabel ? ' · ' + msg.modelLabel : '') + '…');
+}
+
 function _aiComposerHTML() {
   const mathKeys = AI_MATH_KEYS.map(([label, tex]) =>
     `<button type="button" class="ai-math-key" data-tex="${escapeHtml(tex)}" title="${escapeHtml(tex)}">${escapeHtml(label)}</button>`).join('');
@@ -16423,6 +20210,9 @@ function _aiComposerHTML() {
     <div class="ai-math-preview" id="aiMathPreview" hidden aria-live="polite"></div>
     <div class="ai-composer-row">
       <div class="ai-tools">
+        <button type="button" class="ai-tool-btn ai-model-btn" id="aiModelBtn" data-ai-act="model" aria-haspopup="dialog" aria-expanded="false" title="Choose the AI model">
+          <i class="fas fa-wand-magic-sparkles"></i><span class="ai-model-btn-label" id="aiModelBtnLabel">${escapeHtml(_aiModelShortLabel())}</span><i class="fas fa-chevron-up ai-model-chev"></i>
+        </button>
         <button type="button" class="ai-tool-btn" data-ai-act="attach" title="Attach images, PDFs or documents">
           <i class="fas fa-paperclip"></i><span>Attach</span>
         </button>
@@ -16493,6 +20283,7 @@ function _aiWireComposer(comp) {
       else if (act === 'math') _aiToggleMath();
       else if (act === 'voice') _aiToggleVoice();
       else if (act === 'clear') resetAIHomeChat();
+      else if (act === 'model') aiToggleModelMenu();
       else if (act === 'send') { if (_aiHomeBusy) stopAIAnswer(); else askAIDoubtHome(); }
       return;
     }
@@ -16836,6 +20627,7 @@ function renderStudentAIHome() {
   const messagesEl = document.getElementById('aiChatMessages');
   if (!messagesEl) return;
   _aiEnsureComposer();
+  loadAIModels(false).catch(() => {});
   _aiLoad();
   if (!_aiHomeRendered) {
     _aiHomeRendered = true;
@@ -16857,6 +20649,9 @@ function _aiFilesHTML(files) {
 function renderAIHomeChat() {
   const messagesEl = document.getElementById('aiChatMessages');
   if (!messagesEl) return;
+  /* ⭐ slim header while a conversation is open → more room for answers */
+  const _aiView = document.getElementById('studentAIHomeView');
+  if (_aiView) _aiView.classList.toggle('ai-has-chat', _aiHomeChat.length > 0);
 
   if (_aiHomeChat.length === 0) {
     messagesEl.innerHTML = renderAIWelcomeState();
@@ -16884,16 +20679,18 @@ function renderAIHomeChat() {
           <div class="ai-msg-bubble">
             <div class="ai-msg-error-title">Couldn't get an answer</div>
             <div class="ai-msg-error-body">${escapeHtml(m.text)}</div>
-            ${i === _aiHomeChat.length - 1 ? `<button class="ai-retry-btn" onclick="retryAILastMessage()"><i class="fas fa-rotate-right"></i> Try again</button>` : ''}
+            ${i === _aiHomeChat.length - 1 ? `<div class="ai-error-actions"><button class="ai-retry-btn" onclick="retryAILastMessage()"><i class="fas fa-rotate-right"></i> Try again</button>${_aiSelectedModel && _aiSelectedModel !== 'auto' ? `<button class="ai-retry-btn ai-retry-auto" onclick="aiRetryWithAuto()"><i class="fas fa-wand-magic-sparkles"></i> Try with Auto</button>` : ''}<button class="ai-retry-btn ai-retry-pick" onclick="aiOpenModelMenu()"><i class="fas fa-sliders"></i> Pick another model</button></div>` : ''}
           </div>
         </div>`;
     } else if (m.streaming) {
-      const reading = (_aiHomeChat[i - 1] && _aiHomeChat[i - 1].files && _aiHomeChat[i - 1].files.length) ? 'Reading your files…' : 'Thinking…';
+      const reading = m.trying ? m.trying
+        : ((_aiHomeChat[i - 1] && _aiHomeChat[i - 1].files && _aiHomeChat[i - 1].files.length) ? 'Reading your files' : 'Thinking')
+          + (m.modelLabel ? ' · ' + m.modelLabel : '') + '…';
       html += `
         <div class="ai-msg ai-msg-assistant">
           <div class="ai-msg-avatar"><i class="fas fa-robot"></i></div>
           <div class="ai-msg-bubble allow-select">
-            <div class="ai-stream-body" id="aiStreamBody">${m.text ? renderMarkdown(m.text) : `<span class="ai-typing-inline"><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-label">${reading}</span></span>`}</div>
+            <div class="ai-stream-body" id="aiStreamBody">${m.text ? renderMarkdown(m.text) : `<span class="ai-typing-inline"><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-label" id="aiTypingLabel">${escapeHtml(reading)}</span></span>`}</div>
           </div>
         </div>`;
     } else {
@@ -16905,6 +20702,7 @@ function renderAIHomeChat() {
             <div class="ai-answer-body" id="aiHomeMsg-${i}">${renderMarkdown(m.text)}</div>
             ${m.stopped ? '<div class="ai-msg-note"><i class="fas fa-circle-stop"></i> You stopped this answer.</div>' : ''}
             ${m.partial && !m.stopped ? '<div class="ai-msg-note"><i class="fas fa-scissors"></i> The answer was cut short.</div>' : ''}
+            ${m.note ? `<div class="ai-msg-note ai-msg-note-model"><i class="fas fa-shuffle"></i> ${escapeHtml(m.note)}</div>` : ''}
             <div class="ai-msg-actions">
               <button type="button" class="ai-msg-action" data-ai-copy="${i}" title="Copy"><i class="fas fa-copy"></i> Copy</button>
               ${isLast && !_aiHomeBusy ? `<button type="button" class="ai-msg-action" data-ai-regen="${i}" title="Get a new answer"><i class="fas fa-rotate"></i> Regenerate</button>` : ''}
@@ -17051,7 +20849,7 @@ async function askAIDoubtHome(opts) {
     files: files.map(f => ({ name: f.name, kind: f.kind, size: f.size, thumb: f.thumb || '', url: f.url || '' }))
   };
   _aiHomeChat.push(userMsg);
-  const msg = { role: 'assistant', text: '', streaming: true, ts: Date.now() };
+  const msg = { role: 'assistant', text: '', streaming: true, ts: Date.now(), modelLabel: _aiModelShortLabel(true) };
   _aiHomeChat.push(msg);
   _aiLastSent = { text, files: files.slice() };
 
@@ -17068,6 +20866,7 @@ async function askAIDoubtHome(opts) {
   fd.append('question', text);
   fd.append('history', JSON.stringify(history));
   fd.append('convId', _aiConvId);
+  fd.append('model', _aiSelectedModel || 'auto');
   if (_aiHadFiles && !files.length) fd.append('hadFiles', '1');
   files.forEach(f => fd.append('files', f.blob, f.name));
   if (files.length) _aiHadFiles = true;
@@ -17147,15 +20946,29 @@ function _aiHandleEvent(ev, msg) {
   if (ev.t === 'delta' && typeof ev.text === 'string') {
     msg.text += ev.text;
     _aiPaintStream(msg);
+  } else if (ev.t === 'model') {
+    /* ⭐ which model is answering (a busy one is skipped automatically) */
+    const prev = msg.modelLabel;
+    msg.modelLabel = ev.label || '';
+    if (ev.attempt > 1 && !msg.text) msg.trying = `${prev || 'The first model'} is busy — trying ${ev.label}…`;
+    if (!msg.text) _aiRepaintTyping(msg);
   } else if (ev.t === 'done') {
     msg._ended = true;
     msg.model = ev.model || '';
+    msg.modelId = ev.modelId || '';
     msg.partial = !!ev.partial;
+    if (ev.switched === 'pdf' || ev.switched === 'images') {
+      msg.note = `${ev.requested || 'The chosen model'} can't read ${ev.switched === 'pdf' ? 'PDFs / documents' : 'images'}, so ${ev.model} answered.`;
+    } else if (ev.fallback) {
+      msg.note = `${ev.requested || 'The chosen model'} was busy, so ${ev.model} answered.`;
+    }
     if (ev.filesExpired) showToast('Files from earlier in this chat have expired — attach them again if the AI needs them.', 'info');
+    _aiModelsAt = 0;                       // refresh busy markers next time the menu opens
   } else if (ev.t === 'error') {
     msg._ended = true;
     if (msg.text) { msg.partial = true; showToast(ev.message || 'The answer stopped early.', 'error'); }
     else { msg.error = true; msg.text = ev.message || 'The AI could not answer.'; }
+    _aiModelsAt = 0;
   } else if (ev.t === 'meta' && Array.isArray(ev.files)) {
     const conv = ev.files.filter(f => f.converted).length;
     const cut = ev.files.filter(f => f.truncated).map(f => f.name);
@@ -17351,10 +21164,7 @@ function renderSubscriptionPlansGrid(containerId) {
         ${savings}
         <p class="plan-desc">${escapeHtml(p.description || '')}</p>
         <ul class="plan-features">
-          <li><i class="fas fa-check"></i> Every course unlocked</li>
-          <li><i class="fas fa-check"></i> All premium materials</li>
-          <li><i class="fas fa-check"></i> AI Doubt Solver (unlimited)</li>
-          <li><i class="fas fa-check"></i> Full quiz & analytics</li>
+          ${PREMIUM_PERKS.map(k => `<li><i class="fas fa-check"></i> ${escapeHtml(k.short)}</li>`).join('')}
         </ul>
         <button class="btn btn-primary btn-block plan-select-btn"
                 onclick="startCheckoutForPlan(${jsStr(p.id)})">
@@ -17370,11 +21180,13 @@ function renderSubscriptionPlansGrid(containerId) {
    CHECKOUT MODAL — plan + coupon + proceed
    ============================================================ */
 function startCheckoutForPlan(planId) {
+  if (aeroPlayBlocksPurchase()) return;
   if (!currentUser || currentUser.role !== 'student') {
     return showToast('Please log in as a student first.', 'error');
   }
-  if (currentUser.isSubscribed) {
-    return showToast('You already have an active subscription.', 'info');
+  const curSub = currentUser.subscription || {};
+  if (currentUser.isSubscribed && curSub.autoRenew) {
+    return showToast('Your premium renews automatically — there is nothing to pay now.', 'info');
   }
 
   const plan = (_livePlans || []).find(p => p.id === planId);
@@ -17382,6 +21194,7 @@ function startCheckoutForPlan(planId) {
 
   _activeCheckoutPlan = plan;
   _activeCheckoutCoupon = null;
+  _activeCheckoutExtend = !!currentUser.isSubscribed;   // ⭐ extend: the days are added to the current end date
 
   // Build modal (inject once)
   let modal = document.getElementById('checkoutPlanModal');
@@ -17451,6 +21264,12 @@ function renderCheckoutSummary() {
       <div class="checkout-plan-price">₹${plan.amount}</div>
     </div>
     <p class="checkout-plan-desc">${escapeHtml(plan.description || '')}</p>
+    ${_activeCheckoutExtend ? (() => {
+      const sub = (currentUser && currentUser.subscription) || {};
+      const from = sub.expiresAt && new Date(sub.expiresAt) > new Date() ? new Date(sub.expiresAt) : new Date();
+      const until = new Date(from.getTime() + plan.durationDays * 86400000);
+      return `<div class="checkout-extend-note"><i class="fas fa-calendar-plus"></i> Adds <strong>${plan.durationDays} days</strong> to your current premium — active until <strong>${until.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })}</strong>. One-time payment, no auto-pay.</div>`;
+    })() : ''}
   `;
 
   const final = _activeCheckoutCoupon ? _activeCheckoutCoupon.finalAmount : plan.amount;
@@ -17498,6 +21317,7 @@ async function applyCheckoutCoupon() {
 }
 
 async function proceedCheckout() {
+  if (aeroPlayBlocksPurchase()) return;
   if (!_activeCheckoutPlan) return;
   if (!currentUser || currentUser.role !== 'student') return;
 
@@ -17531,20 +21351,17 @@ async function proceedCheckout() {
       key: createRes.key_id,
       name: 'RankerNode',
       description: `${createRes.planTitle} — ${createRes.durationDays} days${createRes.couponCode ? ' · ' + createRes.couponCode : ''}`,
-      prefill: {
-        name: currentUser.fullName || currentUser.username,
-        email: currentUser.email || 'student@rankernode.example',
-        contact: '9999999999'
-      },
+      prefill: premiumPrefill(),   // ⭐ only real details — a made-up email/phone sent the receipt nowhere
       theme: { color: '#4f46e5' },
       modal: { ondismiss: function () { showToast('Checkout cancelled.', 'info'); } }
     };
 
     if (createRes.mode === 'one-time') {
+      const extend = !!createRes.extend;
       rzpOptions.amount = Math.round(createRes.amount * 100);
       rzpOptions.order_id = createRes.orderId;
       rzpOptions.handler = async function (response) {
-        await _finalizeOneTimeSubscription(response);
+        await _finalizeOneTimeSubscription(response, extend);
       };
     } else {
       rzpOptions.subscription_id = createRes.subscriptionId;
@@ -17579,17 +21396,17 @@ async function _finalizeSubscription(response) {
     if (vres.success) {
       currentUser = vres.user;
       saveSessionUser(currentUser);
-      showToast('🎉 Subscription activated! All courses unlocked.', 'success');
       renderApp();
+      showPremiumWelcome(false);
     } else {
       showToast(vres.message || 'Verification failed.', 'error');
     }
   } catch (err) {
-    showToast('Verification error — contact support.', 'error');
+    showToast('We could not confirm the payment yet. If money was deducted, premium switches on by itself within a few minutes.', 'error');
   }
 }
 
-async function _finalizeOneTimeSubscription(response) {
+async function _finalizeOneTimeSubscription(response, extend) {
   showToast('Verifying payment…', 'info');
   try {
     const vres = await fetchJSON(`${API_BASE}/subscribe/verify-order`, {
@@ -17605,13 +21422,13 @@ async function _finalizeOneTimeSubscription(response) {
     if (vres.success) {
       currentUser = vres.user;
       saveSessionUser(currentUser);
-      showToast('🎉 Subscription activated! All courses unlocked.', 'success');
       renderApp();
+      showPremiumWelcome(!!extend);
     } else {
       showToast(vres.message || 'Verification failed.', 'error');
     }
   } catch (err) {
-    showToast('Verification error — contact support.', 'error');
+    showToast('We could not confirm the payment yet. If money was deducted, premium switches on by itself within a few minutes.', 'error');
   }
 }
 
@@ -17620,10 +21437,11 @@ async function _finalizeOneTimeSubscription(response) {
    (keeps backward compatibility with existing buttons)
    ============================================================ */
 window.startSubscriptionCheckout = function () {
+  if (aeroPlayBlocksPurchase()) return;
   if (!currentUser || currentUser.role !== 'student') {
     return showToast('Please log in as a student first.', 'error');
   }
-  if (currentUser.isSubscribed) return showToast('You already have an active subscription.', 'info');
+  if (currentUser.isSubscribed) return showMyPlanModal();
   if (!_livePlans.length) {
     showToast('No plans available right now.', 'error');
     return;
@@ -17858,16 +21676,25 @@ async function renderStudentSubscriptionBanner() {
     const exp = sub.expiresAt
       ? new Date(sub.expiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
       : '—';
+    const left = premiumDaysLeft(sub);
+    const ending = !sub.autoRenew && left !== null && left <= 7;
+    const unread = helpUnreadCount();
     wrap.innerHTML = `
-      <div class="subscribe-active-banner">
+      <div class="subscribe-active-banner ${ending ? 'is-ending' : ''}">
         <div class="subscribe-active-icon"><i class="fas fa-crown"></i></div>
         <div class="subscribe-active-info">
           <h4>${escapeHtml(sub.planTitle || 'Premium')} active</h4>
-          <p>Renews on <strong>${exp}</strong> · ₹${sub.amount || 0}${sub.autoRenew ? ' · auto-renew on' : ''}</p>
+          <p>${sub.autoRenew ? 'Renews on' : 'Ends on'} <strong>${exp}</strong>${left !== null ? ` · ${left === 0 ? 'last day' : left + ' day' + (left === 1 ? '' : 's') + ' left'}` : ''}${sub.autoRenew ? ' · auto-pay on' : ''}</p>
         </div>
-        <button class="btn btn-outline btn-sm" onclick="showMyPlanModal()">
-          <i class="fas fa-info-circle"></i> Manage
-        </button>
+        <div class="subscribe-active-actions">
+          ${ending ? `<button class="btn btn-primary btn-sm" onclick="openPlansShowcaseModal()"><i class="fas fa-calendar-plus"></i> Extend</button>` : ''}
+          <button class="btn btn-outline btn-sm premium-help-btn" onclick="openHelpDesk()">
+            <i class="fas fa-headset"></i> Help Desk${unread ? `<span class="premium-dot">${unread}</span>` : ''}
+          </button>
+          <button class="btn btn-outline btn-sm" onclick="showMyPlanModal()">
+            <i class="fas fa-crown"></i> My Premium
+          </button>
+        </div>
       </div>`;
   } else if (liveSubscriptionSettings.enabled && _livePlans.length > 0) {
     const cheapest = _livePlans.reduce((min, p) => (p.amount < min.amount ? p : min), _livePlans[0]);
@@ -17890,6 +21717,7 @@ async function renderStudentSubscriptionBanner() {
 }
 
 function openPlansShowcaseModal() {
+  if (aeroPlayBlocksPurchase()) return;
   let modal = document.getElementById('plansShowcaseModal');
   if (!modal) {
     modal = document.createElement('div');
@@ -17967,6 +21795,11 @@ window.updateAdminTabUI = function () {
 
 const _origRenderAdminDashboard = window.renderAdminDashboard;
 window.renderAdminDashboard = function () {
+  /* ⭐ 2026-10-08: these three used to skip updateAdminTabUI(), so the previous
+     section stayed on screen and the new one was stacked under it. */
+  if (adminTab === 'plans' || adminTab === 'coupons' || adminTab === 'referrals') {
+    try { updateAdminTabUI(); } catch (e) {}
+  }
   if (adminTab === 'plans')      return renderAdminPlans();
   if (adminTab === 'coupons')    return renderAdminCoupons();
   if (adminTab === 'referrals')  return renderAdminReferrals();
@@ -18658,64 +22491,442 @@ window.registerStudent = function (e) {
     if (typeof _origRegisterStudent === 'function') _origRegisterStudent.call(this, e);
   }
 };
+/* ============================================================
+   ⭐ PREMIUM (2026-10-10) — what a subscription gives, the Premium
+   hub (plan, days left, receipts, auto-pay), the welcome screen after
+   paying, and the Premium Help Desk (student + admin).
+   ============================================================ */
+const PREMIUM_PERKS = [
+  { icon: 'fa-unlock-keyhole', short: 'Every premium course & material', title: 'Everything unlocked', desc: 'All premium courses, lectures, notes, papers and videos — nothing stays locked.' },
+  { icon: 'fa-headset', short: 'Premium Help Desk — ask the team directly', title: 'Premium Help Desk', desc: 'Stuck on a course, an exam, your account or a payment? Ask the team — premium questions are answered first.' },
+  { icon: 'fa-robot', short: '3× higher AI Doubt Solver limit', title: '3× AI Doubt Solver', desc: '30 AI questions a minute instead of 10 — for long study sessions.' },
+  { icon: 'fa-receipt', short: 'Receipt for every payment', title: 'Payment receipts', desc: 'A receipt for every payment, ready to save or print from My Premium.' },
+  { icon: 'fa-shield-heart', short: 'Stop auto-pay any time, keep your days', title: 'Fair cancellation', desc: 'Turn auto-pay off any time — premium stays on until the end of what you paid for.' }
+];
+let _activeCheckoutExtend = false;
+const _premiumDate = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : '—';
+
+function premiumPrefill() {
+  const u = currentUser || {}, phone = String(u.phone || '').replace(/[\s-]/g, '');
+  return Object.assign({ name: u.fullName || u.username || '' },
+    u.email ? { email: u.email } : {},
+    /^\+?\d{10,13}$/.test(phone) ? { contact: phone } : {});
+}
+function premiumDaysLeft(sub) {
+  if (!sub || !sub.expiresAt) return null;
+  return Math.max(0, Math.ceil((new Date(sub.expiresAt).getTime() - Date.now()) / 86400000));
+}
+function helpUnreadCount() {
+  return ((currentUser && currentUser.notifications) || []).filter(n => !n.read && n.type === 'help-reply').length;
+}
+
+/* ---------- welcome screen right after a payment ---------- */
+function showPremiumWelcome(extended) {
+  const sub = (currentUser && currentUser.subscription) || {};
+  const name = (currentUser && (currentUser.fullName || currentUser.username) || '').split(' ')[0];
+  const old = document.getElementById('premiumWelcomeModal'); if (old) old.remove();
+  const modal = document.createElement('div');
+  modal.id = 'premiumWelcomeModal';
+  modal.className = 'modal-overlay active';
+  modal.innerHTML = `
+    <div class="modal-box premium-welcome" role="dialog" aria-modal="true" aria-labelledby="premiumWelcomeTitle">
+      <div class="premium-welcome-crown" aria-hidden="true"><i class="fas fa-crown"></i></div>
+      <h3 id="premiumWelcomeTitle">${extended ? 'Premium extended' : `Welcome to Premium${name ? ', ' + escapeHtml(name) : ''}!`}</h3>
+      <p class="premium-welcome-sub">${extended ? 'Your new end date is' : 'Everything is unlocked until'} <strong>${_premiumDate(sub.expiresAt)}</strong>${sub.autoRenew ? ' · renews automatically' : ''}.</p>
+      <ul class="premium-perks">
+        ${PREMIUM_PERKS.map(k => `<li><span class="premium-perk-ic"><i class="fas ${k.icon}"></i></span><div><b>${escapeHtml(k.title)}</b><small>${escapeHtml(k.desc)}</small></div></li>`).join('')}
+      </ul>
+      <div class="modal-actions">
+        <button class="btn btn-outline" onclick="document.getElementById('premiumWelcomeModal').remove(); openHelpDesk();"><i class="fas fa-headset"></i> Meet the Help Desk</button>
+        <button class="btn btn-primary" onclick="document.getElementById('premiumWelcomeModal').remove(); navigateStudent('courses');"><i class="fas fa-rocket"></i> Start learning</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+}
+
+/* ---------- My Premium hub ---------- */
 function showMyPlanModal() {
-  if (!currentUser || !currentUser.subscription) return;
+  if (!currentUser || !currentUser.subscription) return openPlansShowcaseModal();
   const sub = currentUser.subscription;
-  const exp = sub.expiresAt
-    ? new Date(sub.expiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
-    : '—';
-  const started = sub.startedAt
-    ? new Date(sub.startedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
-    : '—';
+  const active = !!currentUser.isSubscribed;
+  const left = premiumDaysLeft(sub);
+  const total = Math.max(1, sub.planDurationDays || 30);
+  const pct = left === null ? 100 : Math.max(0, Math.min(100, Math.round(left / total * 100)));
+  const pays = (sub.history || []).map((h, i) => ({ h, i })).filter(x => x.h && x.h.status === 'charged').reverse();
+  const unread = helpUnreadCount();
 
-  const old = document.getElementById('myPlanModal');
-  if (old) old.remove();
-
+  const old = document.getElementById('myPlanModal'); if (old) old.remove();
   const modal = document.createElement('div');
   modal.id = 'myPlanModal';
   modal.className = 'modal-overlay active';
   modal.innerHTML = `
-    <div class="modal-box" style="max-width:480px;">
-      <div class="modal-icon-header">
-        <div class="modal-icon-tile tone-emerald" style="background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#422006;">
-          <i class="fas fa-crown"></i>
+    <div class="modal-box premium-hub" role="dialog" aria-modal="true" aria-labelledby="premiumHubTitle">
+      <div class="premium-hub-head">
+        <div class="premium-hub-crown"><i class="fas fa-crown"></i></div>
+        <div class="premium-hub-title">
+          <h3 id="premiumHubTitle">${escapeHtml(sub.planTitle || 'Premium')}</h3>
+          <span class="premium-chip ${active ? (sub.autoRenew ? 'on' : 'ending') : 'off'}">
+            ${active ? (sub.autoRenew ? '<i class="fas fa-rotate"></i> Active · auto-pay on' : '<i class="fas fa-hourglass-half"></i> Active · auto-pay off') : '<i class="fas fa-circle-pause"></i> Not active'}
+          </span>
         </div>
-        <div>
-          <h3>Your Premium Plan</h3>
-          <p class="modal-sub" style="margin:2px 0 0;">Active subscription details</p>
-        </div>
+        <button class="premium-hub-x" aria-label="Close" onclick="document.getElementById('myPlanModal').remove()"><i class="fas fa-xmark"></i></button>
       </div>
 
-      <div class="checkout-plan-summary">
-        <div class="checkout-plan-row">
-          <div>
-            <strong>${escapeHtml(sub.planTitle || 'Premium')}</strong>
-            <div class="checkout-plan-meta">
-              <i class="fas fa-clock"></i> ${sub.planDurationDays || 30} days · ${sub.paymentMode === 'one-time' ? 'One-time' : 'Auto-renew'}
-            </div>
-          </div>
-          <div class="checkout-plan-price">₹${sub.amount || 0}</div>
+      ${active ? `
+      <div class="premium-days">
+        <div class="premium-days-row">
+          <span><b>${left === null ? '∞' : left}</b> day${left === 1 ? '' : 's'} left</span>
+          <span>${sub.autoRenew ? 'Renews' : 'Ends'} on <b>${_premiumDate(sub.expiresAt)}</b></span>
         </div>
-        <p class="checkout-plan-desc">
-          Started: <strong>${started}</strong><br>
-          ${sub.paymentMode === 'subscription' ? 'Renews' : 'Expires'}: <strong>${exp}</strong>
-        </p>
+        <div class="premium-days-bar"><span style="width:${pct}%"></span></div>
+        ${!sub.autoRenew && left !== null && left <= 7 ? `<p class="premium-days-warn"><i class="fas fa-bell"></i> Ending soon — extend now and the new days are added after ${_premiumDate(sub.expiresAt)}, so you lose nothing.</p>` : ''}
+      </div>` : `<p class="premium-days-warn"><i class="fas fa-circle-info"></i> Your premium ended on ${_premiumDate(sub.expiresAt)}. Pick a plan to switch everything back on.</p>`}
+
+      <div class="premium-section-title">What you get</div>
+      <div class="premium-perk-grid">
+        ${PREMIUM_PERKS.map(k => `<div class="premium-perk-card"><i class="fas ${k.icon}"></i><b>${escapeHtml(k.title)}</b><small>${escapeHtml(k.desc)}</small></div>`).join('')}
       </div>
 
-      <div class="modal-actions">
-        <button class="btn btn-outline" onclick="document.getElementById('myPlanModal').remove()">
-          <i class="fas fa-times"></i> Close
-        </button>
-        ${sub.autoRenew
-          ? `<button class="btn btn-danger" onclick="document.getElementById('myPlanModal').remove(); cancelSubscription();">
-               <i class="fas fa-times-circle"></i> Cancel Auto-Pay
-             </button>`
-          : ''}
+      <button class="premium-help-cta" onclick="document.getElementById('myPlanModal').remove(); openHelpDesk();">
+        <span class="premium-help-cta-ic"><i class="fas fa-headset"></i></span>
+        <span><b>Need help? Ask the team</b><small>Courses, exams, account or payments — premium questions are answered first.</small></span>
+        ${unread ? `<span class="premium-dot">${unread}</span>` : '<i class="fas fa-chevron-right"></i>'}
+      </button>
+
+      <div class="premium-section-title">Payments & receipts</div>
+      ${pays.length ? `<div class="premium-pay-list">${pays.slice(0, 12).map(({ h, i }) => `
+        <div class="premium-pay">
+          <div><b>₹${Number(h.amount || 0).toLocaleString('en-IN')}</b><small>${_premiumDate(h.date)} · ${escapeHtml(h.note && /webhook|subscription\.(charged|authenticated)/.test(h.note) ? 'Auto-pay' : (h.note || 'Payment'))}</small></div>
+          <button class="btn btn-outline btn-sm" onclick="showPremiumReceipt(${i})"><i class="fas fa-receipt"></i> Receipt</button>
+        </div>`).join('')}</div>` : `<p class="premium-muted">No payments yet${sub.history && sub.history.some(h => h && h.status === 'granted') ? ' — your premium was granted by the team' : ''}.</p>`}
+
+      <div class="modal-actions premium-hub-actions">
+        ${active && sub.autoRenew ? `<button class="btn btn-outline btn-danger-text" id="premiumCancelBtn" onclick="premiumAskCancel()"><i class="fas fa-circle-stop"></i> Stop auto-pay</button>` : ''}
+        ${!active || !sub.autoRenew ? `<button class="btn btn-primary" onclick="document.getElementById('myPlanModal').remove(); openPlansShowcaseModal();"><i class="fas ${active ? 'fa-calendar-plus' : 'fa-crown'}"></i> ${active ? 'Extend premium' : 'Renew premium'}</button>` : ''}
       </div>
-    </div>
-  `;
+      <div id="premiumCancelConfirm"></div>
+    </div>`;
   document.body.appendChild(modal);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+}
+function premiumAskCancel() {
+  const box = document.getElementById('premiumCancelConfirm'); if (!box) return;
+  const sub = (currentUser && currentUser.subscription) || {};
+  box.innerHTML = `
+    <div class="premium-cancel-confirm">
+      <p><b>Stop auto-pay?</b> You will not be charged again. Premium stays on until <b>${_premiumDate(sub.expiresAt)}</b> — every day you paid for is kept. We'll email you a code to confirm.</p>
+      <div class="modal-actions">
+        <button class="btn btn-outline" onclick="document.getElementById('premiumCancelConfirm').innerHTML=''">Keep auto-pay</button>
+        <button class="btn btn-danger" onclick="document.getElementById('myPlanModal').remove(); cancelSubscription(true);"><i class="fas fa-envelope"></i> Send code</button>
+      </div>
+    </div>`;
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/* ---------- receipt (on screen, printable / save as PDF) ---------- */
+function showPremiumReceipt(idx) {
+  const sub = (currentUser && currentUser.subscription) || {};
+  const h = (sub.history || [])[idx]; if (!h) return;
+  const no = 'RN-' + new Date(h.date).toISOString().slice(0, 10).replace(/-/g, '') + '-' + String(h.paymentId || idx).slice(-6).toUpperCase();
+  const old = document.getElementById('premiumReceiptModal'); if (old) old.remove();
+  const modal = document.createElement('div');
+  modal.id = 'premiumReceiptModal';
+  modal.className = 'modal-overlay active';
+  modal.innerHTML = `
+    <div class="modal-box premium-receipt-box">
+      <div class="premium-receipt" id="premiumReceipt">
+        <div class="premium-receipt-head">
+          <div><b>RankerNode</b><small>Learn. Practice. Rank.</small></div>
+          <div class="premium-receipt-tag">PAYMENT RECEIPT</div>
+        </div>
+        <table>
+          <tr><td>Receipt no.</td><td>${escapeHtml(no)}</td></tr>
+          <tr><td>Date</td><td>${_premiumDate(h.date)}</td></tr>
+          <tr><td>Billed to</td><td>${escapeHtml(currentUser.fullName || currentUser.username || '')}${currentUser.email ? `<br><small>${escapeHtml(currentUser.email)}</small>` : ''}</td></tr>
+          <tr><td>Item</td><td>${escapeHtml(sub.planTitle || 'Premium subscription')}${sub.planDurationDays ? ` · ${sub.planDurationDays} days` : ''}</td></tr>
+          ${sub.couponApplied && /coupon/i.test(h.note || '') ? `<tr><td>Coupon</td><td>${escapeHtml(sub.couponApplied)}</td></tr>` : ''}
+          <tr><td>Payment ref.</td><td><code>${escapeHtml(h.paymentId || '—')}</code></td></tr>
+          <tr class="premium-receipt-total"><td>Amount paid</td><td>₹${Number(h.amount || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>
+        </table>
+        <p class="premium-receipt-foot">Paid online via Razorpay. Keep this receipt for your records. Questions about a payment? Use the Premium Help Desk.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-outline" onclick="document.getElementById('premiumReceiptModal').remove()">Close</button>
+        <button class="btn btn-primary" onclick="printPremiumReceipt()"><i class="fas fa-print"></i> Print / Save as PDF</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+}
+function printPremiumReceipt() {
+  document.documentElement.classList.add('aero-print-receipt');
+  const done = () => { document.documentElement.classList.remove('aero-print-receipt'); window.removeEventListener('afterprint', done); };
+  window.addEventListener('afterprint', done);
+  try { window.print(); } catch (e) { showToast('Printing is not available here — take a screenshot of the receipt instead.', 'info'); }
+  setTimeout(done, 60000);
+}
+
+/* ============================================================
+   PREMIUM HELP DESK — student side
+   ============================================================ */
+const HD = { tickets: [], categories: {}, premium: false, view: 'list', open: null, loading: false };
+async function openHelpDesk(ticketId) {
+  if (!currentUser || currentUser.role !== 'student') return showToast('Please log in as a student.', 'error');
+  let modal = document.getElementById('helpDeskModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'helpDeskModal';
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `<div class="modal-box help-desk" role="dialog" aria-modal="true" aria-label="Premium Help Desk"><div id="helpDeskBody"></div></div>`;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) closeModal('helpDeskModal'); });
+  }
+  openModal('helpDeskModal');
+  HD.view = 'list'; HD.open = null;
+  helpDeskRender();
+  await helpDeskLoad();
+  if (ticketId && HD.tickets.some(t => t.id === ticketId)) helpDeskOpen(ticketId);
+  else if (!HD.tickets.length && HD.premium) { HD.view = 'new'; helpDeskRender(); }
+}
+async function helpDeskLoad() {
+  HD.loading = true;
+  try {
+    const d = await fetchJSON(`${API_BASE}/help/tickets?_t=${Date.now()}`, { cache: 'no-store' });
+    if (d.success) { HD.tickets = d.tickets || []; HD.categories = d.categories || {}; HD.premium = !!d.premium; }
+    else showToast(d.message || 'Could not load the help desk.', 'error');
+  } catch (e) { showToast(e.message, 'error'); }
+  HD.loading = false;
+  helpDeskRender();
+}
+function helpDeskStatus(t) {
+  return t.status === 'open' ? '<span class="hd-status open"><i class="fas fa-clock"></i> Waiting for the team</span>'
+    : t.status === 'answered' ? '<span class="hd-status answered"><i class="fas fa-reply"></i> Answered</span>'
+    : '<span class="hd-status closed"><i class="fas fa-check"></i> Solved</span>';
+}
+function helpDeskRender() {
+  const body = document.getElementById('helpDeskBody'); if (!body) return;
+  const head = (title, sub, back) => `
+    <div class="hd-head">
+      ${back ? `<button class="hd-icon-btn" onclick="HD.view='list';helpDeskRender()" aria-label="Back"><i class="fas fa-arrow-left"></i></button>` : `<div class="hd-head-ic"><i class="fas fa-headset"></i></div>`}
+      <div class="hd-head-t"><h3>${title}</h3>${sub ? `<p>${sub}</p>` : ''}</div>
+      <button class="hd-icon-btn" onclick="closeModal('helpDeskModal')" aria-label="Close"><i class="fas fa-xmark"></i></button>
+    </div>`;
+
+  if (HD.view === 'new') {
+    body.innerHTML = head('Ask the team', 'Premium questions are answered first. You will get a notification and an email when we reply.', true) + `
+      <form class="hd-form" onsubmit="helpDeskSubmit(event)">
+        <label>Topic<select id="hdCategory">${Object.entries(HD.categories).map(([k, v]) => `<option value="${k}">${escapeHtml(v)}</option>`).join('')}</select></label>
+        <label>Subject<input id="hdSubject" maxlength="140" required placeholder="e.g. Can't open Lecture 4 PDF"></label>
+        <label>Your question<textarea id="hdMessage" rows="6" maxlength="4000" required placeholder="Tell us what you need — which course or exam, what you tried, any error you saw."></textarea></label>
+        <div class="modal-actions"><button type="button" class="btn btn-outline" onclick="HD.view='list';helpDeskRender()">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="hdSendBtn"><i class="fas fa-paper-plane"></i> Send question</button></div>
+      </form>`;
+    setTimeout(() => { const s = document.getElementById('hdSubject'); if (s) s.focus(); }, 50);
+    return;
+  }
+
+  if (HD.view === 'thread') {
+    const t = HD.tickets.find(x => x.id === HD.open); if (!t) { HD.view = 'list'; return helpDeskRender(); }
+    body.innerHTML = head(escapeHtml(t.subject), `${escapeHtml(t.categoryLabel)} · ${helpDeskStatus(t)}`, true) + `
+      <div class="hd-thread" id="hdThread">
+        ${t.messages.map(m => `
+          <div class="hd-msg ${m.from}">
+            <div class="hd-msg-meta">${m.from === 'admin' ? '<i class="fas fa-shield-halved"></i> ' + escapeHtml(m.name || 'RankerNode Team') : 'You'} · ${timeAgo(m.at)}</div>
+            <div class="hd-msg-text">${escapeHtml(m.text)}</div>
+          </div>`).join('')}
+        ${t.status === 'open' ? '<div class="hd-waiting"><i class="fas fa-hourglass-half"></i> The team has your message and will reply here.</div>' : ''}
+      </div>
+      <form class="hd-reply" onsubmit="helpDeskReply(event)">
+        <textarea id="hdReply" rows="2" maxlength="4000" placeholder="${t.status === 'closed' ? 'Write to reopen this question…' : 'Write a reply…'}" required></textarea>
+        <div class="hd-reply-actions">
+          ${t.status !== 'closed' ? `<button type="button" class="btn btn-outline btn-sm" onclick="helpDeskClose()"><i class="fas fa-check"></i> Mark as solved</button>` : '<span></span>'}
+          <button type="submit" class="btn btn-primary btn-sm" id="hdReplyBtn"><i class="fas fa-paper-plane"></i> Send</button>
+        </div>
+      </form>`;
+    const th = document.getElementById('hdThread'); if (th) th.scrollTop = th.scrollHeight;
+    return;
+  }
+
+  /* list */
+  const locked = !HD.premium;
+  body.innerHTML = head('Premium Help Desk', 'Ask the team about courses, exams, your account or payments.') + `
+    ${locked ? `
+      <div class="hd-locked">
+        <i class="fas fa-lock"></i>
+        <b>The Help Desk is part of Premium</b>
+        <p>Premium students can ask the team directly and get answers first.${HD.tickets.length ? ' You can still read and reply to your earlier questions below.' : ''}</p>
+        <button class="btn btn-primary" onclick="closeModal('helpDeskModal'); openPlansShowcaseModal();"><i class="fas fa-crown"></i> See premium plans</button>
+      </div>` : `
+      <button class="hd-new" onclick="HD.view='new';helpDeskRender()"><i class="fas fa-plus"></i> Ask a new question</button>`}
+    ${HD.loading && !HD.tickets.length ? '<div class="hd-empty"><i class="fas fa-spinner fa-spin"></i></div>' : ''}
+    ${HD.tickets.length ? `<div class="hd-list">${HD.tickets.map(t => `
+      <button class="hd-item ${t.unread ? 'unread' : ''}" onclick="helpDeskOpen('${t.id}')">
+        <div class="hd-item-top"><b>${escapeHtml(t.subject)}</b>${t.unread ? '<span class="premium-dot">new</span>' : ''}</div>
+        <div class="hd-item-meta">${helpDeskStatus(t)} · ${escapeHtml(t.categoryLabel)} · ${timeAgo(t.lastActivityAt)}</div>
+      </button>`).join('')}</div>` : (!HD.loading && !locked ? '<div class="hd-empty"><i class="fas fa-comments"></i><p>No questions yet. Whatever you are stuck on, we are here to help.</p></div>' : '')}`;
+}
+async function helpDeskOpen(id) {
+  HD.view = 'thread'; HD.open = id;
+  const t = HD.tickets.find(x => x.id === id);
+  helpDeskRender();
+  if (t && t.unread) {
+    t.unread = false;
+    try { await fetchJSON(`${API_BASE}/help/tickets/${id}/seen`, { method: 'POST' }); } catch (e) {}
+    /* the matching bell notifications are read now too */
+    const ns = ((currentUser && currentUser.notifications) || []).filter(n => !n.read && n.link === 'help:' + id);
+    for (const n of ns) { try { await fetch(`/api/user/notifications/${currentUser._id}/mark-read`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifId: n.id }) }); n.read = true; } catch (e) {} }
+    if (ns.length) { saveSessionUser(currentUser); try { renderNotificationBadge(); } catch (e) {} try { renderStudentSubscriptionBanner(); } catch (e) {} }
+  }
+}
+function _hdPut(ticket) {
+  const i = HD.tickets.findIndex(x => x.id === ticket.id);
+  if (i >= 0) HD.tickets.splice(i, 1);
+  HD.tickets.unshift(ticket);
+}
+async function helpDeskSubmit(e) {
+  e.preventDefault();
+  const btn = document.getElementById('hdSendBtn'); if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending…'; }
+  try {
+    const d = await fetchJSON(`${API_BASE}/help/tickets`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category: document.getElementById('hdCategory').value, subject: document.getElementById('hdSubject').value, message: document.getElementById('hdMessage').value })
+    });
+    if (!d.success) { showToast(d.message || 'Could not send.', 'error'); if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send question'; } return; }
+    _hdPut(d.ticket);
+    showToast('Question sent — the team will reply here.', 'success');
+    helpDeskOpen(d.ticket.id);
+  } catch (err) { showToast(err.message, 'error'); if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send question'; } }
+}
+async function helpDeskReply(e) {
+  e.preventDefault();
+  const ta = document.getElementById('hdReply'), btn = document.getElementById('hdReplyBtn');
+  if (!ta || !ta.value.trim()) return;
+  if (btn) btn.disabled = true;
+  try {
+    const d = await fetchJSON(`${API_BASE}/help/tickets/${HD.open}/reply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: ta.value }) });
+    if (!d.success) { showToast(d.message || 'Could not send.', 'error'); if (btn) btn.disabled = false; return; }
+    _hdPut(d.ticket); helpDeskRender();
+  } catch (err) { showToast(err.message, 'error'); if (btn) btn.disabled = false; }
+}
+async function helpDeskClose() {
+  try {
+    const d = await fetchJSON(`${API_BASE}/help/tickets/${HD.open}/close`, { method: 'POST' });
+    if (d.success) { _hdPut(d.ticket); showToast('Marked as solved. Glad we could help!', 'success'); helpDeskRender(); }
+    else showToast(d.message || 'Could not update.', 'error');
+  } catch (err) { showToast(err.message, 'error'); }
+}
+
+/* ============================================================
+   PREMIUM HELP DESK — admin tab
+   ============================================================ */
+const AHD = { status: 'open', tickets: [], counts: {}, open: null, summaryAt: 0 };
+(function ensureHelpDeskAdminTab() {
+  const tabsEl = document.querySelector('.admin-tabs');
+  if (!tabsEl || tabsEl.querySelector('[data-tab="helpdesk"]')) return;
+  const btn = document.createElement('button');
+  btn.className = 'admin-tab'; btn.dataset.tab = 'helpdesk';
+  btn.setAttribute('onclick', "switchAdminTab('helpdesk')");
+  btn.innerHTML = '<i class="fas fa-headset"></i> Help Desk <span class="ahd-badge" id="ahdBadge" hidden></span>';
+  const anchor = tabsEl.querySelector('[data-tab="replies"]');
+  if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(btn, anchor); else tabsEl.appendChild(btn);
+  if (!document.getElementById('adminTabHelpdesk')) {
+    const c = document.createElement('div');
+    c.className = 'admin-tab-content'; c.id = 'adminTabHelpdesk';
+    c.innerHTML = '<div id="adminHelpDeskContent"></div>';
+    const view = document.getElementById('adminView'); if (view) view.appendChild(c);
+  }
+})();
+const _hdOrigUpdateAdminTabUI = window.updateAdminTabUI;
+window.updateAdminTabUI = function () {
+  if (typeof _hdOrigUpdateAdminTabUI === 'function') _hdOrigUpdateAdminTabUI.apply(this, arguments);
+  if (adminTab === 'helpdesk') {
+    const t = document.getElementById('adminPageTitle'); if (t) t.innerHTML = '<i class="fas fa-headset"></i> Premium Help Desk';
+    const a = document.getElementById('adminHeaderActions');
+    if (a) a.innerHTML = `<button class="btn btn-outline" onclick="switchAdminTab('overview')"><i class="fas fa-chart-pie"></i> <span class="btn-text">Overview</span></button>
+      <button class="btn btn-primary" onclick="renderAdminHelpDesk()"><i class="fas fa-rotate"></i> <span class="btn-text">Refresh</span></button>`;
+  }
+};
+const _hdOrigRenderAdminDashboard = window.renderAdminDashboard;
+window.renderAdminDashboard = function () {
+  if (Date.now() - AHD.summaryAt > 60000) refreshHelpDeskBadge();
+  if (adminTab === 'helpdesk') { try { updateAdminTabUI(); } catch (e) {} return renderAdminHelpDesk(); }
+  if (typeof _hdOrigRenderAdminDashboard === 'function') return _hdOrigRenderAdminDashboard.apply(this, arguments);
+};
+async function refreshHelpDeskBadge() {
+  AHD.summaryAt = Date.now();
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/help/summary?_t=${Date.now()}`, { cache: 'no-store' });
+    const b = document.getElementById('ahdBadge');
+    if (b && d.success) { b.textContent = d.waiting; b.hidden = !d.waiting; }
+  } catch (e) {}
+}
+async function renderAdminHelpDesk() {
+  const host = document.getElementById('adminHelpDeskContent'); if (!host) return;
+  if (!AHD.tickets.length) host.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>Loading questions…</p></div>';
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/help/tickets?status=${AHD.status}&_t=${Date.now()}`, { cache: 'no-store' });
+    if (!d.success) throw new Error(d.message || 'Could not load.');
+    AHD.tickets = d.tickets || []; AHD.counts = d.counts || {};
+    const b = document.getElementById('ahdBadge'); if (b) { b.textContent = AHD.counts.open || 0; b.hidden = !AHD.counts.open; }
+  } catch (e) { host.innerHTML = `<div class="empty-state"><i class="fas fa-triangle-exclamation"></i><p>${escapeHtml(e.message)}</p></div>`; return; }
+  if (AHD.open && !AHD.tickets.some(t => t.id === AHD.open)) AHD.open = null;
+  adminHelpDeskPaint();
+}
+function adminHelpDeskPaint() {
+  const host = document.getElementById('adminHelpDeskContent'); if (!host) return;
+  const c = AHD.counts, tab = (id, label, n) => `<button class="${AHD.status === id ? 'on' : ''}" onclick="AHD.status='${id}';AHD.open=null;renderAdminHelpDesk()">${label}${n != null ? ` <b>${n}</b>` : ''}</button>`;
+  const t = AHD.tickets.find(x => x.id === AHD.open);
+  host.innerHTML = `
+    <div class="ahd-filters">${tab('open', 'Waiting', c.open || 0)}${tab('answered', 'Answered', c.answered || 0)}${tab('closed', 'Solved', c.closed || 0)}${tab('all', 'All')}</div>
+    <div class="ahd-wrap ${t ? 'has-open' : ''}">
+      <div class="ahd-list">
+        ${AHD.tickets.length ? AHD.tickets.map(x => `
+          <button class="ahd-item ${x.id === AHD.open ? 'on' : ''}" onclick="AHD.open='${x.id}';adminHelpDeskPaint()">
+            <div class="ahd-item-top">${x.premium ? '<i class="fas fa-crown" title="Premium"></i>' : ''}<b>${escapeHtml(x.subject)}</b></div>
+            <div class="ahd-item-meta">${escapeHtml(x.fullName || x.username)} · ${escapeHtml(x.categoryLabel)} · ${x.status === 'open' ? 'waiting ' + timeAgo(x.waitingSince) : timeAgo(x.lastActivityAt)}</div>
+          </button>`).join('') : `<div class="empty-state"><i class="fas fa-mug-hot"></i><p>${AHD.status === 'open' ? 'No one is waiting. All caught up!' : 'Nothing here.'}</p></div>`}
+      </div>
+      <div class="ahd-thread">
+        ${t ? `
+          <div class="ahd-thread-head">
+            <button class="hd-icon-btn ahd-back" onclick="AHD.open=null;adminHelpDeskPaint()" aria-label="Back"><i class="fas fa-arrow-left"></i></button>
+            <div><h4>${escapeHtml(t.subject)}</h4>
+              <small>${t.premium ? '<i class="fas fa-crown"></i> Premium · ' : ''}${escapeHtml(t.fullName || '')} (@${escapeHtml(t.username)})${t.email ? ' · ' + escapeHtml(t.email) : ''} · ${escapeHtml(t.categoryLabel)}</small></div>
+          </div>
+          <div class="hd-thread ahd-msgs">${t.messages.map(m => `
+            <div class="hd-msg ${m.from === 'admin' ? 'student' : 'admin'}">
+              <div class="hd-msg-meta">${m.from === 'admin' ? 'You (' + escapeHtml(m.name || 'Team') + ')' : escapeHtml(m.name || t.username)} · ${timeAgo(m.at)}</div>
+              <div class="hd-msg-text">${escapeHtml(m.text)}</div>
+            </div>`).join('')}</div>
+          <form class="hd-reply" onsubmit="adminHelpDeskReply(event, false)">
+            <textarea id="ahdReply" rows="4" maxlength="4000" placeholder="Write your reply — the student gets a notification and an email." required></textarea>
+            <div class="hd-reply-actions">
+              <span>${t.status !== 'closed' ? `<button type="button" class="btn btn-outline btn-sm" onclick="adminHelpDeskStatus('closed')"><i class="fas fa-check"></i> Mark solved</button>` : `<button type="button" class="btn btn-outline btn-sm" onclick="adminHelpDeskStatus('open')"><i class="fas fa-rotate-left"></i> Reopen</button>`}</span>
+              <span><button type="button" class="btn btn-outline btn-sm" onclick="adminHelpDeskReply(event, true)">Send & mark solved</button>
+              <button type="submit" class="btn btn-primary btn-sm"><i class="fas fa-paper-plane"></i> Send reply</button></span>
+            </div>
+          </form>` : '<div class="empty-state ahd-pick"><i class="fas fa-comments"></i><p>Pick a question to read and reply.</p></div>'}
+      </div>
+    </div>`;
+  const m = host.querySelector('.ahd-msgs'); if (m) m.scrollTop = m.scrollHeight;
+}
+async function adminHelpDeskReply(e, close) {
+  e.preventDefault();
+  const ta = document.getElementById('ahdReply'); if (!ta || !ta.value.trim()) return showToast('Write a reply first.', 'error');
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/help/tickets/${AHD.open}/reply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: ta.value, close: !!close }) });
+    if (!d.success) return showToast(d.message || 'Could not send.', 'error');
+    showToast('Reply sent — the student has been notified.', 'success');
+    renderAdminHelpDesk();
+  } catch (err) { showToast(err.message, 'error'); }
+}
+async function adminHelpDeskStatus(status) {
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/help/tickets/${AHD.open}/status`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) });
+    if (!d.success) return showToast(d.message || 'Could not update.', 'error');
+    renderAdminHelpDesk();
+  } catch (err) { showToast(err.message, 'error'); }
 }
 /* ============================================================
    SUBJECTIVE ANSWER UPLOAD HELPERS
@@ -18779,12 +22990,8 @@ async function handleSubjectiveUpload(qi, input, kind) {
 
   const files = Array.from(input.files || []);
 
-  if (files.length === 0) {
-    /* User cancelled the picker — release the blur grace immediately. */
-    clearTimeout(window.__examBlurTimer);
-    window.__examAllowBlur = false;
-    return;
-  }
+  _examPickerReturned();                     // a file was chosen (or the picker was cancelled) — the student is back
+  if (files.length === 0) return;
 
   if (!Array.isArray(st.answers[qi])) st.answers[qi] = [];
 
@@ -18885,12 +23092,6 @@ async function handleSubjectiveUpload(qi, input, kind) {
 
   /* Reset the input so the same file can be re-picked if needed */
   input.value = '';
-
-  /* Release the blur grace so a cancelled dialog can't disable proctoring */
-  clearTimeout(window.__examBlurTimer);
-  window.__examBlurTimer = setTimeout(() => {
-    window.__examAllowBlur = false;
-  }, 1500);
 }
 
 function renderSubjectiveUpload(u, qi, idx) {
@@ -18915,7 +23116,8 @@ function renderSubjectiveUpload(u, qi, idx) {
     return `
       <div class="subjective-upload-tile pdf" data-upload-idx="${idx}">
         <a href="${escapeHtml(u.url)}" target="_blank" rel="noopener noreferrer"
-           class="subjective-pdf-link" title="Open in new tab">
+           class="subjective-pdf-link" title="Open"
+           onclick="return aeroOpenPdfUrl(event, ${jsStr(u.url || '')}, ${jsStr(u.fileName || 'Uploaded PDF')})">
           <i class="fas fa-file-pdf"></i>
           <span>PDF</span>
         </a>
@@ -18968,12 +23170,18 @@ function updateSubjectiveUploadProgress(qi, placeholder) {
   if (bar) bar.style.width = (placeholder.progress || 0) + '%';
 }
 
-function removeSubjectiveUpload(qi, idx) {
+async function removeSubjectiveUpload(qi, idx) {
   const st = quizPlayerState;
   if (!st || st.submitted) return;
   if (!Array.isArray(st.answers[qi])) return;
-  if (!confirm('Remove this uploaded photo?')) return;
-  st.answers[qi].splice(idx, 1);
+  const u = st.answers[qi][idx];
+  if (!u) return;
+  /* in-page dialog: the browser's confirm() fails in the Android app and drops full screen */
+  if (!(await quizConfirm({ title: 'Remove this file?', text: u.fileName || 'Uploaded answer', ok: 'Remove', danger: true, icon: 'fa-trash' }))) return;
+  if (quizPlayerState !== st || st.submitted) return;
+  const at = st.answers[qi].indexOf(u);
+  if (at < 0) return;
+  st.answers[qi].splice(at, 1);
   persistQuizAnswers();
   renderSubjectiveUploads(qi);
   updateQuizQuestionCard(qi);
@@ -21733,10 +25941,11 @@ function acChapterMenu(e, courseId, chId) {
     { label: 'Rename', icon: 'fa-pen', onClick: () => acEditChapter(chId) },
     { divider: true },
     { label: 'Move up', icon: 'fa-arrow-up', disabled: i === 0, onClick: () => acMoveChapter(courseId, chId, -1) },
-    { label: 'Move down', icon: 'fa-arrow-down', disabled: i === chapters.length - 1, onClick: () => acMoveChapter(courseId, chId, 1) },
+    { label: 'Move down', icon: 'fa-arrow-down', disabled: i === chapters.length - 1, onClick: () => acMoveChapter(courseId, chId, 1) }
+  ].concat(isProfessor(currentUser) ? [] : [          // ⭐ professors never delete (the server refuses it too)
     { divider: true },
     { label: 'Delete chapter', icon: 'fa-trash', danger: true, onClick: () => acDeleteChapter(courseId, chId, ch.title, count) }
-  ]);
+  ]));
 }
 function acMaterialMenu(e, courseId, matId) {
   if (e) e.stopPropagation();
@@ -22114,7 +26323,7 @@ function acOpenUploader(courseId, chapterId) {
           </div>
         </div>
 
-        <div class="acu-access">
+        <div class="acu-access admin-only">
           <span>Access</span>
           <div class="acu-toggle" role="radiogroup" aria-label="Access">
             <button type="button" role="radio" class="active" data-pro="0" aria-checked="true"><i class="fas fa-unlock"></i> Free</button>
@@ -22937,7 +27146,7 @@ function aiHomeUsePrompt(btn) {
         const max = doc.scrollHeight - window.innerHeight;
         const y = window.scrollY || doc.scrollTop || 0;
         const pct = max > 40 ? Math.min(100, Math.max(0, (y / max) * 100)) : 0;
-        bar.style.width = pct.toFixed(2) + '%';
+        bar.style.transform = 'scaleX(' + (pct / 100).toFixed(4) + ')';
         /* The bar only earns its place once the page actually scrolls. */
         bar.style.opacity = pct > 0.5 ? '1' : '0';
         btn.classList.toggle('is-visible', y > 420);
@@ -23869,6 +28078,10 @@ window.addEventListener('beforeunload', () => {
     e.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
     e.btn.setAttribute('aria-label', open ? 'Close navigation menu' : 'Open navigation menu');
     document.body.classList.toggle('aero-nav-open', open);
+    /* ⭐ dim the page behind the open menu */
+    var scrim = document.getElementById('aeroNavScrim');
+    if (!scrim) { scrim = document.createElement('div'); scrim.id = 'aeroNavScrim'; scrim.setAttribute('aria-hidden', 'true'); document.body.appendChild(scrim); }
+    scrim.classList.toggle('show', open);
   }
 
   function boot() {
@@ -24661,9 +28874,11 @@ async function renderAdminMobileApp() {
   if (!el) return;
   el.innerHTML = '<div class="empty-state" style="padding:40px"><i class="fas fa-spinner fa-spin"></i><p>Loading…</p></div>';
   let a = { available: false };
+  let win = { available: false };
+  let winJob = null;
   try {
     const res = await fetchJSON(`${API_BASE}/admin/app-release?_t=${Date.now()}`);
-    if (res && res.success) a = res.android || a;
+    if (res && res.success) { a = res.android || a; win = res.windows || win; winJob = res.windowsJob || null; }
   } catch (e) {
     el.innerHTML = `<div class="empty-state" style="padding:40px"><p>${escapeHtml(e.message)}</p></div>`;
     return;
@@ -24720,7 +28935,14 @@ async function renderAdminMobileApp() {
         </ol>
         <p class="ma-muted">The app opens your website full-screen with its own icon — no browser bar or badge — and Android blocks screenshots and screen recording inside it. Installed apps offer the new version automatically within a few hours.</p>
       </div>
-    </div>`;
+    </div>
+    ${_mwHtml(win)}`;
+  if (winJob && winJob.state === 'running') { _mwShowJob(winJob); _mwPoll(); }
+  const wfile = document.getElementById('mwFile');
+  if (wfile) wfile.addEventListener('change', () => {
+    const f = wfile.files && wfile.files[0];
+    document.getElementById('mwFileLabel').innerHTML = f ? `<b>${escapeHtml(f.name)}</b> · ${mb(f.size)}` : 'Choose the .exe file';
+  });
 
   const file = document.getElementById('maFile');
   file.addEventListener('change', () => {
@@ -24767,6 +28989,156 @@ function maUpload(e, force) {
   xhr.send(fd);
 }
 
+/* ---------- Windows app (2026-10-10) ---------- */
+function _mwHtml(w) {
+  const mb = (n) => (Number(n || 0) / 1048576).toFixed(1) + ' MB';
+  const when = (d) => d ? new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
+  const link = location.origin + '/download/windows';
+  const t = w && w.test;
+  const testHtml = !t ? '' : (t.fails === 0
+    ? `<div class="ma-test ma-test-ok"><i class="fas fa-circle-check"></i> Tested on a real Windows PC by GitHub — all ${Number(t.passes)} checks passed. <a href="${escapeHtml(t.url)}" target="_blank" rel="noopener">Report</a></div>`
+    : `<div class="ma-test ma-test-warn"><i class="fas fa-triangle-exclamation"></i> ${Number(t.fails)} of ${Number(t.passes) + Number(t.fails)} checks failed in GitHub's Windows test. <a href="${escapeHtml(t.url)}" target="_blank" rel="noopener">Report</a>
+         <ul>${(t.failed || []).map((x) => `<li>${escapeHtml(String(x).replace(/^FAIL\s+/, ''))}</li>`).join('')}</ul></div>`);
+  return `
+    <div class="ma-grid ma-grid-win">
+      <div class="section-card ma-current ma-win">
+        <h2><i class="fab fa-windows"></i> Windows app</h2>
+        ${w && w.available ? `
+          <div class="ma-status ma-live"><span class="lp-dot lp-dot-live"></span> Live — Windows visitors get it from <b>Get App</b>; installed apps update themselves</div>
+          <div class="ma-facts">
+            <div><span>Version</span><strong>${escapeHtml(w.version)}</strong></div>
+            <div><span>Size</span><strong>${mb(w.size)}</strong></div>
+            <div><span>Published</span><strong>${escapeHtml(when(w.updatedAt))}</strong></div>
+            <div><span>New installs</span><strong>${Number(w.downloads || 0).toLocaleString('en-IN')}</strong></div>
+            <div><span>Auto-updates</span><strong>${Number(w.updates || 0).toLocaleString('en-IN')}</strong></div>
+          </div>
+          ${testHtml}
+          <div class="ma-link"><code>${escapeHtml(link)}</code>
+            <button class="btn btn-outline btn-sm" type="button" onclick="copyToClipboard(${jsStr(link)}).then(ok=>showToast(ok?'Link copied.':'Copy failed.', ok?'success':'error'))"><i class="fas fa-copy"></i> Copy link</button>
+          </div>
+          ${w.previous ? `<p class="ma-muted">Previous version kept for rollback: ${escapeHtml(w.previous.version)}</p>` : ''}
+          <button class="btn btn-outline btn-sm ma-remove" type="button" onclick="mwRemoveRelease()"><i class="fas fa-eye-slash"></i> Stop offering the Windows app</button>
+        ` : `
+          <div class="ma-status"><span class="lp-dot"></span> Not published yet — Windows visitors still get the browser install.</div>
+        `}
+      </div>
+
+      <div class="section-card ma-upload">
+        <h3><i class="fab fa-github"></i> Publish a new version</h3>
+        <p class="ma-muted" style="margin:0 0 12px">Takes the newest <b>windows-v1.0.N</b> build from GitHub — built and tested there, nothing to download on your computer.</p>
+        <div class="ma-progress" id="mwProgress" hidden><i></i></div>
+        <p class="ma-muted" id="mwStep" style="margin:0 0 10px"></p>
+        <button class="btn btn-primary" type="button" id="mwGithubBtn" onclick="mwFromGithub()"><i class="fab fa-github"></i> Publish latest from GitHub</button>
+        <details class="ma-alt">
+          <summary>Or upload the .exe yourself</summary>
+          <form id="mwForm" onsubmit="mwUpload(event)">
+            <label class="ma-drop">
+              <input type="file" id="mwFile" accept=".exe,application/vnd.microsoft.portable-executable">
+              <i class="fas fa-file-arrow-up"></i>
+              <span id="mwFileLabel">Choose <b>RankerNode-Setup-1.0.N.exe</b></span>
+            </label>
+            <label class="lp-field"><span>What's new <small>(optional)</small></span><input type="text" id="mwNotes" maxlength="500" placeholder="e.g. Faster notes"></label>
+            <div class="ma-progress" id="mwUpProgress" hidden><i></i></div>
+            <button class="btn btn-outline" type="submit" id="mwSubmit"><i class="fas fa-upload"></i> Upload &amp; publish</button>
+          </form>
+        </details>
+      </div>
+
+      <div class="section-card ma-help">
+        <h3><i class="fas fa-circle-info"></i> How to make a new version</h3>
+        <ol>
+          <li>Push your code to GitHub (or open <b>GitHub → Actions → "Windows app (installer)" → Run workflow</b>).</li>
+          <li>About 10 minutes later GitHub has built it, installed it on a Windows PC and tested it (release <b>windows-v1.0.N</b>).</li>
+          <li>Click <b>Publish latest from GitHub</b> above.</li>
+        </ol>
+        <p class="ma-muted">Students install it in one click — no admin password. Screenshots and screen recording show a black window. Until the app is code-signed (or in the Microsoft Store), Windows shows "Windows protected your PC" the first time: <b>More info → Run anyway</b>. The install guide on the website explains this.</p>
+      </div>
+    </div>`;
+}
+
+let _mwPollTimer = null;
+function _mwShowJob(job) {
+  const bar = document.getElementById('mwProgress');
+  const step = document.getElementById('mwStep');
+  const btn = document.getElementById('mwGithubBtn');
+  if (!bar || !step) return;
+  const running = job && job.state === 'running';
+  if (btn) btn.disabled = running;
+  bar.hidden = !running;
+  const pct = job && job.total ? Math.round((job.received || 0) / job.total * 100) : 3;
+  bar.firstElementChild.style.width = Math.max(3, Math.min(100, pct)) + '%';
+  step.textContent = running ? (job.step || 'Working…') + (job.total ? ` ${pct}%` : '') : '';
+}
+function _mwPoll() {
+  clearTimeout(_mwPollTimer);
+  _mwPollTimer = setTimeout(async () => {
+    if (!document.getElementById('mwStep')) return;                  // admin left this tab
+    let res = null;
+    try { res = await fetchJSON(`${API_BASE}/admin/app-release?_t=${Date.now()}`); } catch (_) { return _mwPoll(); }
+    const job = res && res.windowsJob;
+    if (job && job.state === 'running') { _mwShowJob(job); return _mwPoll(); }
+    if (job && job.state === 'done') showToast((job.code === 'PUBLISHED' ? '🪟 ' : '') + job.message, job.code === 'PUBLISHED' ? 'success' : 'info');
+    else if (job && job.state === 'error') showToast(job.message || 'Could not publish from GitHub.', 'error');
+    renderAdminMobileApp();
+  }, 1500);
+}
+async function mwFromGithub() {
+  const btn = document.getElementById('mwGithubBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetchJSON(`${API_BASE}/admin/app-release/windows/from-github`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})
+    });
+    if (!res.success && !res.windowsJob) throw new Error(res.message || 'Failed.');
+    _mwShowJob(res.windowsJob || { state: 'running', step: 'Starting…' });
+    _mwPoll();
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    showToast(e.message, 'error');
+  }
+}
+function mwUpload(e, force) {
+  if (e) e.preventDefault();
+  const f = document.getElementById('mwFile').files[0];
+  if (!f) return showToast('Choose the .exe file first.', 'error');
+  if (!/\.exe$/i.test(f.name)) return showToast('Please choose the RankerNode-Setup-….exe file.', 'error');
+  const fd = new FormData();
+  fd.append('file', f, f.name);
+  fd.append('notes', document.getElementById('mwNotes').value.trim());
+  if (force) fd.append('force', '1');
+  const btn = document.getElementById('mwSubmit');
+  const bar = document.getElementById('mwUpProgress');
+  btn.disabled = true; bar.hidden = false; bar.firstElementChild.style.width = '0%';
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', `${API_BASE}/admin/app-release/windows`);
+  try { const t = sessionStorage.getItem('aero_token'); if (t) xhr.setRequestHeader('Authorization', 'Bearer ' + t); } catch (_) {}
+  xhr.upload.onprogress = (ev) => { if (ev.lengthComputable) bar.firstElementChild.style.width = Math.round(ev.loaded / ev.total * 100) + '%'; };
+  xhr.onload = () => {
+    btn.disabled = false; bar.hidden = true;
+    let data = null;
+    try { data = JSON.parse(xhr.responseText); } catch (_) {}
+    if (xhr.status === 409 && data && data.code === 'OLDER_VERSION') {
+      if (confirm(data.message + '\n\nPublish it anyway (e.g. to roll back)? Computers that already have a newer version keep it.')) return mwUpload(null, true);
+      return;
+    }
+    if (xhr.status === 413 && !data) return showToast('The server refused a file this large. Use "Publish latest from GitHub" instead.', 'error');
+    if (!data || !data.success) return showToast((data && data.message) || `Upload failed (HTTP ${xhr.status}).`, 'error');
+    showToast(`🪟 Windows ${data.windows.version} is live — students can download it now.`, 'success');
+    renderAdminMobileApp();
+  };
+  xhr.onerror = () => { btn.disabled = false; bar.hidden = true; showToast('Network error during upload.', 'error'); };
+  xhr.send(fd);
+}
+async function mwRemoveRelease() {
+  if (!confirm('Stop offering the Windows app? The Get App button will go back to the browser install. (Installed apps keep working.)')) return;
+  try {
+    const res = await fetchJSON(`${API_BASE}/admin/app-release/windows`, { method: 'DELETE' });
+    if (!res.success) throw new Error(res.message || 'Failed.');
+    showToast('The Windows app is no longer offered.', 'info');
+    renderAdminMobileApp();
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
 async function maRemoveRelease() {
   if (!confirm('Stop offering the Android app? The Get App button will go back to the browser install. (Installed apps keep working.)')) return;
   try {
@@ -24776,3 +29148,1401 @@ async function maRemoveRelease() {
     renderAdminMobileApp();
   } catch (e) { showToast(e.message, 'error'); }
 }
+
+/* ============================================================
+   ⭐ DASHBOARD "GET APP" PILL (2026-10-07)
+   ------------------------------------------------------------
+   The same install button as the landing-page navbar, now also
+   in the signed-in app header (#appInstallPill in index.html).
+   Same look (styles.css → .landing-install-pill) and the same
+   priority order as landing.html:
+     0. Android phone + published APK  → download the real app
+     1. Browser install prompt ready    → one-tap install
+     2. Otherwise                       → step-by-step guide for
+                                          this device
+   Hidden inside the RankerNode Android app itself.
+   ============================================================ */
+/* ============================================================
+   ⭐ ANDROID APP — downloads (2026-10-09)
+   ------------------------------------------------------------
+   Inside the RankerNode Android app a WebView cannot save "blob:"
+   downloads (notes PDF/PNG, exports, contribution files). The app
+   exposes window.RankerNodeAndroid; files are streamed to it in small
+   base64 chunks and land in Downloads › RankerNode. In a normal
+   browser nothing here runs.
+   ============================================================ */
+/* ============================================================
+   ⭐ GOOGLE PLAY BUILD — no buying inside the app (2026-10-12)
+   ------------------------------------------------------------
+   Google Play requires Play's own billing for digital content
+   bought inside a Play Store app. The Play version of the
+   RankerNode app (user-agent "RankerNodeApp/x Store/Play") therefore
+   shows no prices, Buy / Unlock / Subscribe buttons or plans, and
+   never opens checkout. Courses bought on the website open in the
+   app as usual. Browsers and the website APK are unchanged.
+   ============================================================ */
+function aeroPlayBlocksPurchase() {
+  if (!AERO_PLAY_STORE) return false;
+  try { showToast('Purchases aren\'t available in this app.', 'info'); } catch (_) {}
+  return true;
+}
+
+(function aeroNativeDownloads() {
+  'use strict';
+  const B = window.RankerNodeAndroid;
+  if (!B || typeof B.begin !== 'function') return;
+  const CHUNK = 393216;                                   // 384 KB — a multiple of 3, so every chunk is valid base64
+  function b64(buf) {
+    const u8 = new Uint8Array(buf); let bin = '';
+    for (let i = 0; i < u8.length; i += 32768) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 32768));
+    return btoa(bin);
+  }
+  const say = (m, t) => { try { (window.showToast || console.log)(m, t || 'info'); } catch (_) {} };
+  async function saveBlob(blob, name) {
+    const ok = B.begin(String(name || 'download'), blob.type || '');
+    if (ok !== 'ok') { say(ok === 'denied' ? 'Downloads are only available on RankerNode pages.' : 'Could not save the file on this phone.', 'error'); return; }
+    try {
+      for (let i = 0; i < blob.size; i += CHUNK) {
+        if (!B.chunk(b64(await blob.slice(i, i + CHUNK).arrayBuffer()))) throw new Error('write failed');
+      }
+      B.end();
+    } catch (e) { try { B.abort(); } catch (_) {} say('Could not save the file.', 'error'); }
+  }
+  window.__aeroSaveBlob = saveBlob;
+  window.__aeroSaveUrl = async function (url, name) {
+    try {
+      const r = await fetch(url, { credentials: 'include' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      await saveBlob(await r.blob(), name);
+    } catch (e) { say('Download failed — please try again.', 'error'); }
+  };
+  /* every <a download href="blob:…|data:…"> the site clicks (notes export, CSV, ZIP…) */
+  document.addEventListener('click', (e) => {
+    const a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+    if (!a) return;
+    const href = a.getAttribute('href') || '';
+    if (!/^(blob:|data:)/i.test(href)) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    fetch(href).then(r => r.blob()).then(b => saveBlob(b, a.getAttribute('download') || 'download'))
+      .catch(() => say('Download failed — please try again.', 'error'));
+  }, true);
+})();
+
+(function initDashboardInstallPill() {
+  'use strict';
+  if (window.__aeroDashInstallInstalled) return;
+  window.__aeroDashInstallInstalled = true;
+
+  const UA = navigator.userAgent || '';
+  const IN_NATIVE_APP = /RankerNodeApp\//.test(UA);
+  if (IN_NATIVE_APP) { document.documentElement.classList.add('aero-in-app'); return; }
+
+  let IS_STANDALONE = false;
+  try {
+    IS_STANDALONE = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  } catch (_) {}
+
+  let apkInfo = window.__aeroApk || null;
+  let winInfo = window.__aeroWin || null;     // the real Windows app, once the admin publishes it
+  const fmtMB = (n) => (Number(n || 0) / 1048576).toFixed(1) + ' MB';
+
+  function detectPlatform() {
+    const ua = UA.toLowerCase();
+    const platform = (navigator.platform || '').toLowerCase();
+    if (/android/.test(ua)) return 'android';
+    if (/iphone|ipad|ipod/.test(ua)) return 'ios';
+    if (/windows|win32|win64/.test(ua) || /^win/.test(platform)) return 'windows';
+    if (/macintosh|mac os x|macppc|macintel/.test(ua) || /mac/.test(platform)) return 'mac';
+    if (/linux/.test(ua)) return 'linux';
+    return 'other';
+  }
+
+  const btn = () => document.getElementById('appInstallPill');
+  const dot = () => document.getElementById('appInstallPillDot');
+
+  function setReady(isReady) {
+    const b = btn(); if (!b || b.classList.contains('is-installed')) return;
+    b.classList.toggle('is-ready', !!isReady);
+    const d = dot(); if (d) d.style.display = isReady ? 'inline-block' : 'none';
+  }
+  function setInstalled() {
+    const b = btn(); if (!b) return;
+    b.classList.remove('is-ready');
+    b.classList.add('is-installed');
+    const d = dot(); if (d) d.style.display = 'none';
+    const label = b.querySelector('.landing-install-pill-text');
+    if (label) label.textContent = 'Installed';
+    const icon = b.querySelector('i');
+    if (icon) { icon.classList.remove('fa-download'); icon.classList.add('fa-check'); }
+    b.title = 'RankerNode is installed';
+    b.setAttribute('aria-label', 'RankerNode is installed');
+  }
+
+  /* the browser-installed web app ("Installed") can still upgrade to the real Windows app */
+  function setGetApp() {
+    const b = btn(); if (!b) return;
+    b.classList.remove('is-installed');
+    const label = b.querySelector('.landing-install-pill-text');
+    if (label) label.textContent = 'Get App';
+    const icon = b.querySelector('i');
+    if (icon) { icon.classList.remove('fa-check'); icon.classList.add('fa-download'); }
+    b.title = 'Get the RankerNode app for Windows';
+    b.setAttribute('aria-label', 'Get the RankerNode app for Windows');
+  }
+
+  /* ---- Published Android / Windows app? ---- */
+  fetch('/api/app-release', { cache: 'no-cache' })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      const a = d && d.android;
+      if (a && a.available) {
+        apkInfo = a;
+        window.__aeroApk = a;
+        if (detectPlatform() === 'android') setReady(true);
+      }
+      const w = d && d.windows;
+      if (w && w.available) {
+        winInfo = w;
+        window.__aeroWin = w;
+        if (detectPlatform() === 'windows') { setGetApp(); setReady(true); }
+      }
+    })
+    .catch(() => {});
+
+  /* ---- Browser install prompt (an early copy may have been
+          captured by the inline script in index.html <head>) ---- */
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    window.__pwaInstallPrompt = e;
+    setReady(true);
+  });
+  window.addEventListener('rankernode:pwa-ready', () => setReady(true));
+  window.addEventListener('appinstalled', () => {
+    window.__pwaInstallPrompt = null;
+    document.documentElement.dataset.aeroAppInstalled = '1';
+    setInstalled();
+    if (typeof window.showToast === 'function') window.showToast('App installed successfully! 🎉', 'success');
+  });
+
+  function initialSync() {
+    if (IS_STANDALONE || document.documentElement.dataset.aeroAppInstalled === '1') setInstalled();
+    else if (window.__pwaInstallPrompt) setReady(true);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialSync);
+  else initialSync();
+
+  /* ---- Install guide — same overlay as the landing page ---- */
+  function guideFor(platform) {
+    const host = location.host;
+    if (platform === 'android') return { title: 'Install on Android', steps: [
+      'Open <strong>' + host + '</strong> in <strong>Google Chrome</strong> on your Android phone.',
+      'Tap the <strong>⋮ menu</strong> (top right).',
+      'Tap <strong>“Install app”</strong> (not “Add to Home screen”, which only makes a browser shortcut).',
+      'Confirm — RankerNode appears in your app drawer.'] };
+    if (platform === 'ios') return { title: 'Install on iPhone / iPad', steps: [
+      'Open <strong>' + host + '</strong> in <strong>Safari</strong> on your iPhone or iPad. <em>(Chrome, Firefox, and Edge cannot install PWAs on iOS — Apple requires Safari.)</em>',
+      'Tap the <strong>Share button</strong> — the square with an arrow pointing up ⬆️, at the bottom of the screen.',
+      'Scroll down in the share sheet and tap <strong>“Add to Home Screen”</strong>.',
+      'Tap <strong>“Add”</strong> in the top-right corner — the RankerNode icon will appear on your home screen.'] };
+    if (platform === 'windows') return { title: 'Install on Windows', steps: [
+      'Open <strong>' + host + '</strong> in <strong>Microsoft Edge</strong> or <strong>Google Chrome</strong>.',
+      'Look for the <strong>install icon</strong> (⊕ or monitor symbol) in the address bar.',
+      'Click it, then click <strong>“Install”</strong>.',
+      'RankerNode will pin to your taskbar and Start menu.'] };
+    if (platform === 'mac') return { title: 'Install on macOS', steps: [
+      'Open <strong>' + host + '</strong> in <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong>.',
+      'Look for the <strong>install icon</strong> in the address bar (or <em>File → Install RankerNode</em>).',
+      'Click <strong>“Install”</strong>.',
+      'The app appears in Launchpad and the Dock.'] };
+    return { title: 'Install on your device', steps: [
+      'Open this page in a modern browser (Chrome, Edge, or Safari).',
+      'Look for an <strong>Install</strong> option in the browser menu or address bar.',
+      'Confirm the installation.'] };
+  }
+
+  function showInstallGuide(title, steps) {
+    const existing = document.getElementById('lpInstallGuide');
+    if (existing) existing.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'lpInstallGuide';
+    overlay.className = 'aero-install-guide';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    const stepsHtml = steps.map((s, i) =>
+      `<li><span class="aig-num">${i + 1}</span><span class="aig-text">${s}</span></li>`).join('');
+    const otherApk = apkInfo && detectPlatform() !== 'android'
+      ? `<p class="aig-more">Want it on your Android phone? Download <a href="${apkInfo.url || '/download/android'}">RankerNode.apk</a> (${fmtMB(apkInfo.size)}) and send it to your phone.</p>`
+      : '';
+    overlay.innerHTML = `
+      <div class="aig-card">
+        <div class="aig-head">
+          <div class="aig-icon"><i class="fas fa-download"></i></div>
+          <div>
+            <h3>${title}</h3>
+            <p>One-time setup · takes about 15 seconds</p>
+          </div>
+        </div>
+        <ol class="aig-steps">${stepsHtml}</ol>
+        <div class="aig-tip">
+          <i class="fas fa-lightbulb"></i>
+          <span>Already installed? The app icon lives on your home screen, taskbar, or Launchpad — just tap it.</span>
+        </div>
+        ${otherApk}
+        <div class="aig-actions">
+          <a class="aig-link" href="/#apps" target="_blank" rel="noopener">All download options</a>
+          <button type="button" class="aig-close" id="lpInstallGuideClose">Got it</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const escHandler = (e) => { if (e.key === 'Escape') close(); };
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', escHandler); };
+    overlay.querySelector('#lpInstallGuideClose').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', escHandler);
+    try { overlay.querySelector('#lpInstallGuideClose').focus(); } catch (_) {}
+  }
+
+  function downloadApk() {
+    const url = (apkInfo && apkInfo.url) || '/download/android';
+    const a = document.createElement('a');
+    a.href = url; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+    showInstallGuide('Install the RankerNode app', [
+      'Your download has started' + (apkInfo ? ' — <strong>RankerNode ' + apkInfo.version + '</strong> (' + fmtMB(apkInfo.size) + ')' : '') + '.',
+      'Open it from the <strong>download notification</strong> or your <strong>Downloads</strong> folder.',
+      'If Android asks, tap <strong>Settings</strong> and turn on <strong>“Allow from this source”</strong> for your browser, then go back. <em>(Only needed the first time.)</em>',
+      'Tap <strong>Install</strong>, then <strong>Open</strong>. RankerNode is now a normal app in your app drawer — no browser, no badge.',
+      'Had added the website to your home screen before? You can remove that old shortcut.'
+    ]);
+  }
+
+  function downloadWindows() {
+    const a = document.createElement('a');
+    a.href = (winInfo && winInfo.url) || '/download/windows'; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+    showInstallGuide('Install RankerNode for Windows', [
+      'Your download has started' + (winInfo ? ' — <strong>RankerNode-Setup-' + escapeHtml(String(winInfo.version)) + '.exe</strong> (' + fmtMB(winInfo.size) + ')' : '') + '.',
+      'Open it from your browser\'s <strong>Downloads</strong> (<strong>Ctrl + J</strong>). If the browser says it “isn\'t commonly downloaded”, choose <strong>⋯ → Keep</strong> (Edge: <strong>Keep anyway</strong>).',
+      'If Windows shows <strong>“Windows protected your PC”</strong>, click <strong>More info → Run anyway</strong>. <em>(Only the first time — the app is new, so Windows doesn\'t know it yet.)</em>',
+      'RankerNode installs in a few seconds — no admin password — and opens by itself. It is on your <strong>Desktop</strong> and in the <strong>Start menu</strong>.',
+      'Updates install automatically. Installed the website from your browser before? You can remove that old version.'
+    ]);
+  }
+
+  window.appInstallClick = function (event) {
+    if (event) event.preventDefault();
+    const b = btn();
+    // Windows PC and the real app is published → download the installer
+    if (winInfo && detectPlatform() === 'windows') return downloadWindows();
+    if (b && b.classList.contains('is-installed')) {
+      if (typeof window.showToast === 'function') window.showToast('App is already installed on this device. 🎉', 'success');
+      return;
+    }
+    const platform = detectPlatform();
+
+    // 0) Android phone and the real app is published → download the APK
+    if (apkInfo && platform === 'android') return downloadApk();
+
+    // 1) Browser install prompt ready → one-tap install
+    const prompt = window.__pwaInstallPrompt;
+    if (prompt) {
+      (async () => {
+        try {
+          prompt.prompt();
+          const { outcome } = await prompt.userChoice;
+          if (outcome === 'accepted' && typeof window.showToast === 'function') window.showToast('Installing RankerNode…', 'success');
+        } catch (err) {
+          console.warn('[app-install] prompt failed:', err);
+          const g = guideFor(platform); showInstallGuide(g.title, g.steps);
+        } finally {
+          window.__pwaInstallPrompt = null;
+          setReady(false);
+        }
+      })();
+      return;
+    }
+
+    // 2) No prompt → step-by-step guide for this device
+    const g = guideFor(platform);
+    showInstallGuide(g.title, g.steps);
+  };
+})();
+
+/* ============================================================
+   ⭐ PROFESSOR ROLE — client (2026-10-07)
+   ------------------------------------------------------------
+   • Login page: "Professor" tab + "Register as a Professor"
+     (email OTP, then the account waits for admin approval).
+   • Professor dashboard: My Courses (only admin-approved ones) +
+     Request Course Access (course name + code → admin).
+   • Course editor reused in "professor mode": add & edit only.
+     Every delete / admin-only control is hidden (body.aero-prof)
+     and guarded here; the server refuses them regardless.
+   • Admin → "Professor Access" tab: approve / reject applications,
+     grant / decline course requests, revoke, remove a course.
+   ============================================================ */
+function isProfessor(u) {
+  return !!u && String(u.role || '').trim().toLowerCase() === 'professor';
+}
+function profCanEdit(courseId) {
+  if (!isProfessor(currentUser) || !courseId) return false;
+  const mine = ((currentUser.professor && currentUser.professor.courses) || []).map(String);
+  return mine.includes(String(courseId));
+}
+function navigateProfessor(tab) {
+  professorNav = ['requests', 'profile', 'grading'].includes(tab) ? tab : 'courses';
+  editingCourseId = null; currentCourseId = null; window.currentSelectedCourseId = null;
+  quizEditingCourseId = null; quizEditingMaterialId = null; addingMaterialCourseId = null;
+  pushHash(professorNav === 'courses' ? '#/professor' : '#/professor/' + professorNav);
+  renderApp();
+}
+
+/* ---------- small dialogs (prompt()/alert() do not work in the Android app) ---------- */
+function aeroInfoDialog(title, html, icon) {
+  const ov = document.createElement('div');
+  ov.className = 'aero-dialog-ov';
+  ov.innerHTML = `<div class="aero-dialog" role="dialog" aria-modal="true">
+      <div class="aero-dialog-icon"><i class="fas ${icon || 'fa-circle-info'}"></i></div>
+      <h3>${escapeHtml(title)}</h3><p>${html}</p>
+      <div class="aero-dialog-actions"><button type="button" class="btn btn-primary">OK</button></div></div>`;
+  const close = () => ov.remove();
+  ov.querySelector('button').onclick = close;
+  ov.addEventListener('click', (e) => { if (e.target === ov) close(); });
+  document.body.appendChild(ov);
+  setTimeout(() => { try { ov.querySelector('button').focus(); } catch (_) {} }, 30);
+}
+function aeroAskText(title, label, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    const ov = document.createElement('div');
+    ov.className = 'aero-dialog-ov';
+    ov.innerHTML = `<div class="aero-dialog" role="dialog" aria-modal="true">
+        <h3>${escapeHtml(title)}</h3>
+        <label class="aero-dialog-label">${escapeHtml(label)}</label>
+        <textarea rows="3" maxlength="500" placeholder="${escapeHtml(opts.placeholder || '')}"></textarea>
+        <div class="aero-dialog-actions">
+          <button type="button" class="btn btn-outline" data-a="cancel">Cancel</button>
+          <button type="button" class="btn ${opts.danger ? 'btn-danger' : 'btn-primary'}" data-a="ok">${escapeHtml(opts.okText || 'Confirm')}</button>
+        </div></div>`;
+    const ta = ov.querySelector('textarea');
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.querySelector('[data-a="cancel"]').onclick = () => done(null);
+    ov.querySelector('[data-a="ok"]').onclick = () => {
+      const v = ta.value.trim();
+      if (opts.required && !v) { ta.focus(); ta.classList.add('aero-shake'); setTimeout(() => ta.classList.remove('aero-shake'), 400); return; }
+      done(v);
+    };
+    document.body.appendChild(ov);
+    setTimeout(() => ta.focus(), 30);
+  });
+}
+function aeroConfirm(title, html, okText, danger) {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div');
+    ov.className = 'aero-dialog-ov';
+    ov.innerHTML = `<div class="aero-dialog" role="dialog" aria-modal="true"><h3>${escapeHtml(title)}</h3><p>${html}</p>
+        <div class="aero-dialog-actions"><button type="button" class="btn btn-outline" data-a="no">Cancel</button>
+        <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-a="yes">${escapeHtml(okText || 'Confirm')}</button></div></div>`;
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.querySelector('[data-a="no"]').onclick = () => done(false);
+    ov.querySelector('[data-a="yes"]').onclick = () => done(true);
+    document.body.appendChild(ov);
+  });
+}
+
+/* ---------- registration ---------- */
+let _profRegData = null;
+function showProfessorRegisterModal() {
+  const f = $('professorRegisterForm');
+  if (f) f.reset();
+  openModal('professorRegisterModal');
+  setTimeout(() => { try { $('prRegFullName').focus(); } catch (_) {} }, 50);
+}
+async function registerProfessor(e) {
+  e.preventDefault();
+  const v = (id) => (($(id) && $(id).value) || '').trim();
+  const data = {
+    fullName: v('prRegFullName'), username: v('prRegUsername').toLowerCase(), email: v('prRegEmail').toLowerCase(),
+    phone: v('prRegPhone'), password: ($('prRegPassword') && $('prRegPassword').value) || '',
+    designation: v('prRegDesignation'), department: v('prRegDepartment'), institution: v('prRegInstitution'),
+    qualification: v('prRegQualification'), specialization: v('prRegSpecialization'),
+    experienceYears: parseInt(v('prRegExperience'), 10) || 0, employeeId: v('prRegEmployeeId'),
+    profileUrl: v('prRegProfileUrl'), bio: v('prRegBio')
+  };
+  if (!data.fullName || !data.username || !data.email || !data.phone || !data.password) return showToast('Please fill in all the basic details.', 'error');
+  if (!data.designation || !data.department || !data.institution) return showToast('Designation, department and institution are required.', 'error');
+  if (!/^[a-z0-9._-]{3,40}$/.test(data.username)) return showToast('Username: 3–40 letters, numbers, dot, dash or underscore.', 'error');
+  if (data.password.length < 8) return showToast('Password must be at least 8 characters.', 'error');
+  if (data.password !== (($('prRegPassword2') && $('prRegPassword2').value) || '')) return showToast('The two passwords do not match.', 'error');
+  if (!/^\d{10,15}$/.test(data.phone.replace(/\D/g, ''))) return showToast('Please enter a valid contact number.', 'error');
+  if (data.profileUrl && !/^https?:\/\//i.test(data.profileUrl)) return showToast('Profile URL must start with http:// or https://', 'error');
+
+  const btn = e.target.querySelector('button[type="submit"]');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending OTP…'; }
+  try {
+    const res = await fetch(`${API_BASE}/send-otp`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: data.email, username: data.username, phone: data.phone }) });
+    const d = await res.json().catch(() => ({}));
+    if (!d.success) return showToast(d.message || 'Could not send the OTP.', 'error');
+    _profRegData = data;
+    closeModal('professorRegisterModal');
+    openOtpModal({ title: 'Verify your email', subtitle: `We've sent a 6-digit code to ${data.email}. Enter it to submit your application.`,
+                   type: 'professor-register', data });
+  } catch (_) {
+    showToast('Network error — please try again.', 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane"></i> Verify email &amp; submit'; }
+  }
+}
+async function _handleProfessorRegisterOtp(otp) {
+  const res = await fetch(`${API_BASE}/professor/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({}, _otpContext.data, { otp })) });
+  const data = await res.json().catch(() => ({}));
+  if (!data.success) throw new Error(data.message || 'Registration failed.');
+  _otpContext = null; _profRegData = null;
+  closeModal('otpVerificationModal');
+  aeroInfoDialog('Application submitted',
+    'Thank you! Your professor account is now <strong>waiting for admin approval</strong>. You will get an email as soon as it is approved — then sign in with the <strong>Professor</strong> tab.',
+    'fa-hourglass-half');
+}
+
+/* ---------- professor dashboard ---------- */
+let _profMe = null, _profMeAt = 0, _profMeLoading = null;
+async function loadProfessorMe(force) {
+  if (!force && _profMe && Date.now() - _profMeAt < 15000) return _profMe;
+  if (_profMeLoading) return _profMeLoading;
+  _profMeLoading = (async () => {
+    try {
+      const d = await fetchJSON(`${API_BASE}/professor/me?_t=${Date.now()}`, { cache: 'no-store' });
+      if (d && d.success) {
+        _profMe = d; _profMeAt = Date.now();
+        /* keep the session copy current — course list drives what can be edited */
+        const before = JSON.stringify(((currentUser && currentUser.professor) || {}).courses || []);
+        if (currentUser) { currentUser.professor = d.professor; try { saveSessionUser(currentUser); } catch (_) {} }
+        const loaded = (liveCourses || []).map(c => String(c.id)).sort().join(',');
+        const wanted = (d.professor.courses || []).map(String).sort().join(',');
+        if (before !== JSON.stringify(d.professor.courses || []) || loaded !== wanted) {
+          try { await fetchCoursesFromDB(true); } catch (_) {}
+        }
+      }
+      return _profMe;
+    } finally { _profMeLoading = null; }
+  })();
+  return _profMeLoading;
+}
+
+function renderProfessorDashboard() {
+  const root = $('professorContent');
+  if (!root) return;
+  const me = _profMe;
+  if (!me) {
+    root.innerHTML = `<div class="prof-loading">${typeof renderCoursesLoadingSkeleton === 'function' ? renderCoursesLoadingSkeleton('Loading your dashboard…') : 'Loading…'}</div>`;
+    loadProfessorMe(true).then(() => { if (isProfessor(currentUser)) renderProfessorDashboard(); }).catch(() => {});
+    return;
+  }
+  /* refresh quietly in the background (≤ once per 15 s) */
+  if (Date.now() - _profMeAt > 15000) loadProfessorMe(true).then(() => renderProfessorDashboard()).catch(() => {});
+
+  /* ⭐ 2026-10-08 — redesigned professor workspace */
+  const p = me.professor || {};
+  const name = (currentUser && (currentUser.fullName || currentUser.username)) || 'Professor';
+  const myIds = (p.courses || []).map(String);
+  const myCourses = (liveCourses || []).filter(c => myIds.includes(String(c.id)));
+  const reqs = p.requests || [];
+  const pendingReqs = reqs.filter(r => r.status === 'pending').length;
+  const count = (c, fn) => (c.materials || []).filter(fn).length;
+  const totals = myCourses.reduce((t, c) => {
+    t.materials += (c.materials || []).length;
+    t.videos += count(c, m => m.type === 'video');
+    t.quizzes += count(c, m => (m.quizCount || 0) > 0);
+    t.ann += (c.announcements || []).length;
+    return t;
+  }, { materials: 0, videos: 0, quizzes: 0, ann: 0 });
+  const hr = new Date().getHours();
+  const greet = hr < 12 ? 'Good morning' : hr < 17 ? 'Good afternoon' : 'Good evening';
+  const initials = escapeHtml(name.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase());
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const fmtDate = (d, withYear) => d ? new Date(d).toLocaleDateString('en-IN', withYear === false ? { day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+  let html = `
+    <section class="pw-hero">
+      <div class="pw-hero-main">
+        <div class="pw-avatar">${initials}</div>
+        <div class="pw-hero-text">
+          <div class="pw-hero-chips">
+            <span class="pw-chip"><i class="fas fa-circle-check"></i> Approved professor</span>
+            <span class="pw-chip ghost"><i class="fas fa-envelope-circle-check"></i> Email-verified sign-in</span>
+          </div>
+          <h2>${greet}, ${escapeHtml(name)}</h2>
+          <p>${escapeHtml([p.designation, p.department, p.institution].filter(Boolean).join(' · ')) || 'Professor workspace'}</p>
+        </div>
+      </div>
+      <div class="pw-hero-actions">
+        ${myCourses.length && professorNav !== 'grading' ? `<button class="btn pw-btn-light" onclick="navigateProfessor('grading')"><i class="fas fa-marker"></i> Grading & results</button>` : ''}
+        <button class="btn pw-btn-light" onclick="navigateProfessor('requests')"><i class="fas fa-plus"></i> Request a course</button>
+      </div>
+    </section>
+
+    <div class="pw-stats">
+      <div class="pw-stat"><span class="pw-stat-ic c1"><i class="fas fa-chalkboard"></i></span><div><strong>${myCourses.length}</strong><span>${myCourses.length === 1 ? 'Course' : 'Courses'}</span></div></div>
+      <div class="pw-stat"><span class="pw-stat-ic c2"><i class="fas fa-layer-group"></i></span><div><strong>${totals.materials}</strong><span>Materials</span></div></div>
+      <div class="pw-stat"><span class="pw-stat-ic c3"><i class="fas fa-bullhorn"></i></span><div><strong>${totals.ann}</strong><span>Announcements</span></div></div>
+      <div class="pw-stat"><span class="pw-stat-ic c4"><i class="fas fa-hourglass-half"></i></span><div><strong>${pendingReqs}</strong><span>Pending ${pendingReqs === 1 ? 'request' : 'requests'}</span></div></div>
+    </div>
+
+    <div class="pw-tabs" role="tablist">
+      <button role="tab" aria-selected="${professorNav === 'courses'}" class="${professorNav === 'courses' ? 'active' : ''}" onclick="navigateProfessor('courses')"><i class="fas fa-chalkboard"></i> My Courses</button>
+      <button role="tab" aria-selected="${professorNav === 'grading'}" class="${professorNav === 'grading' ? 'active' : ''}" onclick="navigateProfessor('grading')"><i class="fas fa-marker"></i> Grading${window._profToGrade ? ` <span class="nav-count">${window._profToGrade}</span>` : ''}</button>
+      <button role="tab" aria-selected="${professorNav === 'requests'}" class="${professorNav === 'requests' ? 'active' : ''}" onclick="navigateProfessor('requests')"><i class="fas fa-paper-plane"></i> Course Requests${pendingReqs ? ` <span class="nav-count">${pendingReqs}</span>` : ''}</button>
+      <button role="tab" aria-selected="${professorNav === 'profile'}" class="${professorNav === 'profile' ? 'active' : ''}" onclick="navigateProfessor('profile')"><i class="fas fa-id-badge"></i> Profile</button>
+    </div>`;
+
+  if (professorNav === 'grading') {
+    /* ⭐ 2026-10-11 — the Grading section for the professor's own courses.
+       The same screens as the admin's Grading tab; the server limits every
+       list and action to the courses this professor was approved for. */
+    html += myCourses.length
+      ? `<div id="profGradingSlot"></div>`
+      : `<div class="pw-card pw-empty"><i class="fas fa-marker"></i><h3>No courses yet</h3><p>Grading opens once the admin approves you for a course.</p>
+           <button class="btn btn-primary" onclick="navigateProfessor('requests')"><i class="fas fa-paper-plane"></i> Request course access</button></div>`;
+  } else if (professorNav === 'requests') {
+    html += `
+      <div class="pw-grid-2">
+        <div class="pw-card">
+          <div class="pw-card-head"><span class="pw-card-ic"><i class="fas fa-paper-plane"></i></span>
+            <div><h3>Request access to a course</h3><p>Type the course exactly as in your timetable. Once the admin approves, it appears under <strong>My Courses</strong>.</p></div></div>
+          <form onsubmit="submitProfessorCourseRequest(event)" class="pw-form">
+            <div class="pw-form-row">
+              <div class="form-group"><label for="profReqCode">Course code *</label><input type="text" id="profReqCode" maxlength="40" required placeholder="e.g. AE21001" style="text-transform:uppercase;"></div>
+              <div class="form-group"><label for="profReqName">Course name *</label><input type="text" id="profReqName" maxlength="160" required placeholder="e.g. Physics — Class 11"></div>
+            </div>
+            <div class="form-group"><label for="profReqMsg">Message to the admin <span class="pw-optional">optional</span></label><textarea id="profReqMsg" rows="3" maxlength="600" placeholder="e.g. I teach this course in the autumn semester."></textarea></div>
+            <button type="submit" class="btn btn-primary btn-block"><i class="fas fa-paper-plane"></i> Send request</button>
+          </form>
+        </div>
+        <div class="pw-card">
+          <div class="pw-card-head"><span class="pw-card-ic alt"><i class="fas fa-list-check"></i></span>
+            <div><h3>My requests</h3><p>${reqs.length ? `${plural(reqs.length, 'request')} · ${pendingReqs} waiting for the admin` : 'Requests you send show up here with their status.'}</p></div></div>
+          ${reqs.length ? `<div class="pw-req-list">${reqs.slice().reverse().map(r => {
+            const granted = r.courseId ? (me.courses || []).find(c => c.id === r.courseId) : null;
+            const st = r.status === 'approved' ? 'ok' : r.status === 'rejected' ? 'bad' : 'wait';
+            return `<div class="pw-req ${st}">
+              <span class="pw-req-dot"></span>
+              <div class="pw-req-body">
+                <div class="pw-req-top"><strong>${escapeHtml(r.courseCode)}</strong><span class="pw-req-name">${escapeHtml(r.courseName)}</span>
+                  <span class="prof-chip ${st}">${st === 'ok' ? '<i class="fas fa-check"></i> Approved' : st === 'bad' ? '<i class="fas fa-xmark"></i> Declined' : '<i class="fas fa-hourglass-half"></i> Pending'}</span></div>
+                <div class="pw-req-meta">Sent ${fmtDate(r.requestedAt)}${r.reviewedAt ? ' · reviewed ' + fmtDate(r.reviewedAt, false) : ''}</div>
+                ${r.message ? `<div class="pw-req-msg">“${escapeHtml(r.message)}”</div>` : ''}
+                ${granted ? `<div class="prof-req-note ok"><i class="fas fa-unlock"></i> Access granted to ${escapeHtml((granted.code ? granted.code + ' — ' : '') + granted.name)}</div>` : ''}
+                ${st === 'bad' && r.reviewNote ? `<div class="prof-req-note bad"><i class="fas fa-comment"></i> ${escapeHtml(r.reviewNote)}</div>` : ''}
+              </div>
+            </div>`; }).join('')}</div>`
+          : `<div class="pw-empty-mini"><i class="fas fa-inbox"></i><span>No requests yet.</span></div>`}
+        </div>
+      </div>`;
+  } else if (professorNav === 'profile') {
+    const row = (label, val, icon) => val ? `<div class="pw-field"><span><i class="fas ${icon}"></i> ${label}</span><strong>${val}</strong></div>` : '';
+    html += `
+      <div class="pw-grid-2">
+        <div class="pw-card">
+          <div class="pw-card-head"><span class="pw-card-ic"><i class="fas fa-id-badge"></i></span>
+            <div><h3>Your details</h3><p>Shown to the admin when reviewing your requests. To change them, contact the admin.</p></div></div>
+          <div class="pw-fields">
+            ${row('Full name', escapeHtml(name), 'fa-user')}
+            ${row('Username', escapeHtml((currentUser && currentUser.username) || ''), 'fa-at')}
+            ${row('Email', escapeHtml((currentUser && currentUser.email) || ''), 'fa-envelope')}
+            ${row('Designation', escapeHtml(p.designation), 'fa-briefcase')}
+            ${row('Department', escapeHtml(p.department), 'fa-building-columns')}
+            ${row('Institution', escapeHtml(p.institution), 'fa-school')}
+            ${row('Qualification', escapeHtml(p.qualification), 'fa-graduation-cap')}
+            ${row('Specialisation', escapeHtml(p.specialization), 'fa-atom')}
+            ${row('Experience', p.experienceYears ? plural(p.experienceYears, 'year') : '', 'fa-clock-rotate-left')}
+            ${row('Employee ID', escapeHtml(p.employeeId), 'fa-hashtag')}
+            ${p.profileUrl && /^https?:\/\//i.test(p.profileUrl) ? row('Profile page', `<a href="${escapeHtml(p.profileUrl)}" target="_blank" rel="noopener">${escapeHtml(p.profileUrl.replace(/^https?:\/\//i, '').slice(0, 48))}</a>`, 'fa-link') : ''}
+            ${row('Approved on', fmtDate(p.reviewedAt), 'fa-calendar-check')}
+          </div>
+          ${p.bio ? `<div class="pw-bio"><span>About</span><p>${escapeHtml(p.bio)}</p></div>` : ''}
+        </div>
+        <div class="pw-card">
+          <div class="pw-card-head"><span class="pw-card-ic alt"><i class="fas fa-shield-halved"></i></span>
+            <div><h3>Account security</h3><p>How your professor account is protected.</p></div></div>
+          <ul class="pw-checks">
+            <li class="ok"><i class="fas fa-envelope-circle-check"></i><span><strong>Email code at every sign-in.</strong> After your password we send a 6-digit code to ${escapeHtml(((currentUser && currentUser.email) || 'your email').replace(/^(.{2}).*(@.*)$/, '$1•••$2'))}.</span></li>
+            <li class="ok"><i class="fas fa-mobile-screen-button"></i><span><strong>One device at a time.</strong> Signing in somewhere else signs this device out.</span></li>
+            <li class="ok"><i class="fas fa-key"></i><span><strong>Forgot your password?</strong> Use “Forgot password?” on the sign-in page.</span></li>
+          </ul>
+        </div>
+      </div>`;
+  } else {
+    if (myCourses.length) {
+      html += `
+        <div class="pw-toolbar">
+          <h3 class="pw-section-title">My courses <span>${myCourses.length}</span></h3>
+          ${myCourses.length > 3 ? `<div class="pw-search"><i class="fas fa-magnifying-glass"></i><input type="search" id="profCourseSearch" placeholder="Search by name or code" oninput="filterProfessorCourses(this.value)" aria-label="Search courses"></div>` : ''}
+        </div>
+        <div class="pw-course-grid" id="profCourseGrid">${myCourses.map(c => {
+          const mats = (c.materials || []).length, vids = count(c, m => m.type === 'video'), qz = count(c, m => (m.quizCount || 0) > 0);
+          const ann = (c.announcements || []).length;
+          return `
+          <article class="pw-course" data-q="${escapeHtml(((c.code || '') + ' ' + (c.name || '')).toLowerCase())}">
+            <div class="pw-course-top" style="${typeof accentStyle === 'function' ? accentStyle(c.code || c.name) : ''}">
+              <span class="pw-course-code">${escapeHtml(c.code || 'COURSE')}</span>
+              <h3>${escapeHtml(c.name)}</h3>
+              ${c.semester ? `<span class="pw-course-sem"><i class="fas fa-calendar"></i> ${escapeHtml(String(c.semester))}</span>` : ''}
+            </div>
+            <div class="pw-course-body">
+              <div class="pw-course-stats">
+                <div><strong>${mats}</strong><span>materials</span></div>
+                <div><strong>${vids}</strong><span>videos</span></div>
+                <div><strong>${qz}</strong><span>quizzes</span></div>
+                <div><strong>${ann}</strong><span>notices</span></div>
+              </div>
+              ${c.updatedAt ? `<div class="pw-course-upd"><i class="fas fa-clock-rotate-left"></i> Updated ${fmtDate(c.updatedAt)}</div>` : ''}
+              <div class="pw-course-actions">
+                <button class="btn btn-primary btn-sm" onclick="openCourseEditor('${c.id}')"><i class="fas fa-pen-to-square"></i> Add &amp; edit content</button>
+                <button class="btn btn-outline btn-sm" onclick="viewCourseDetail('${c.id}')"><i class="fas fa-eye"></i> Student view</button>
+              </div>
+            </div>
+          </article>`; }).join('')}</div>
+        <div class="pw-empty-mini" id="profCourseNoMatch" hidden><i class="fas fa-magnifying-glass"></i><span>No course matches your search.</span></div>`;
+    } else {
+      html += `
+        <div class="pw-empty">
+          <div class="pw-empty-ic"><i class="fas fa-chalkboard"></i></div>
+          <h3>No courses assigned yet</h3>
+          <p>Ask the admin for access to the courses you teach — they appear here as soon as they are approved.</p>
+          ${pendingReqs ? `<p class="pw-empty-note"><i class="fas fa-hourglass-half"></i> ${plural(pendingReqs, 'request')} waiting for the admin.</p>` : ''}
+          <button class="btn btn-primary" onclick="navigateProfessor('requests')"><i class="fas fa-paper-plane"></i> Request course access</button>
+        </div>`;
+    }
+    html += `
+      <div class="pw-rules">
+        <div class="pw-rule ok"><i class="fas fa-circle-check"></i><div><strong>You can</strong><span>Add materials, question papers, playlists and announcements, and edit existing content in your courses.</span></div></div>
+        <div class="pw-rule lock"><i class="fas fa-lock"></i><div><strong>Admin only</strong><span>Deleting content, prices and course settings — ask the admin if something needs to be removed.</span></div></div>
+      </div>`;
+  }
+  /* the grading area survives the dashboard's background refreshes (every
+     15 s) — rebuilding it would reload and flicker; it is moved back in */
+  const keepGrading = professorNav === 'grading' ? document.getElementById('profGradingContent') : null;
+  root.innerHTML = html;
+  const slot = document.getElementById('profGradingSlot');
+  if (slot) {
+    if (keepGrading) { slot.appendChild(keepGrading); GR.host = keepGrading; }
+    else {
+      const g = document.createElement('div');
+      g.id = 'profGradingContent'; g.className = 'gr-root';
+      slot.appendChild(g);
+      GR.host = g; GR.view = 'home';
+      grRender();
+    }
+  } else if (GR.host && GR.host.id === 'profGradingContent') {
+    GR.host = null;
+  }
+  /* "to grade" badge on the Grading tab, refreshed quietly every 2 min */
+  if (myCourses.length && professorNav !== 'grading' && Date.now() - (window._profGradeAt || 0) > 120000) {
+    window._profGradeAt = Date.now();
+    fetchJSON(`${API_BASE}/admin/grading/overview?_t=${Date.now()}`, { cache: 'no-store' }).then(d => {
+      if (!d || !d.success || window._profToGrade === d.totals.toGrade) return;
+      window._profToGrade = d.totals.toGrade;
+      try { buildNav(); } catch (_) {}
+      if (isProfessor(currentUser) && professorNav !== 'grading') renderProfessorDashboard();
+    }).catch(() => {});
+  }
+}
+
+function filterProfessorCourses(q) {
+  q = String(q || '').trim().toLowerCase();
+  let shown = 0;
+  document.querySelectorAll('#profCourseGrid .pw-course').forEach(el => {
+    const hit = !q || (el.getAttribute('data-q') || '').includes(q);
+    el.hidden = !hit;
+    if (hit) shown++;
+  });
+  const none = document.getElementById('profCourseNoMatch');
+  if (none) none.hidden = shown > 0;
+}
+
+async function submitProfessorCourseRequest(e) {
+  e.preventDefault();
+  const courseName = (($('profReqName') || {}).value || '').trim();
+  const courseCode = (($('profReqCode') || {}).value || '').trim();
+  const message = (($('profReqMsg') || {}).value || '').trim();
+  if (!courseName || !courseCode) return showToast('Course name and code are both required.', 'error');
+  const btn = e.target.querySelector('button[type="submit"]');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending…'; }
+  try {
+    const d = await fetchJSON(`${API_BASE}/professor/course-requests`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ courseName, courseCode, message }) });
+    if (!d.success) throw new Error(d.message || 'Could not send the request.');
+    showToast('✅ Request sent to the admin.', 'success');
+    await loadProfessorMe(true);
+    renderProfessorDashboard();
+  } catch (err) {
+    showToast(err.message || 'Could not send the request.', 'error');
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send request'; }
+  }
+}
+
+/* live updates from the server (approval / new request …) */
+function aeroOnProfessorsChanged() {
+  if (isAdmin(currentUser)) {
+    _profAccessBadgeAt = 0;
+    refreshProfAccessBadge();
+    if (adminTab === 'profaccess' && !editingCourseId) renderAdminProfAccess();
+  } else if (isProfessor(currentUser)) {
+    loadProfessorMe(true).then(() => {
+      if (!editingCourseId && !currentCourseId && !quizEditingCourseId) renderProfessorDashboard();
+    }).catch(() => {});
+  }
+}
+
+/* ---------- professor mode guards (defence in depth; the server refuses too) ---------- */
+(function guardProfessorDeletes() {
+  const blocked = ['deleteMaterialFromEditor', 'deleteAnnouncement', 'deletePlaylist', 'removeVideoFromPlaylist', 'removeThumbnail',
+                   'removeQuizQuestion', 'renamePlaylist', 'autoGeneratePlaylist', 'downloadCourseZip', 'publishQuizResultsNow', 'openMaterialViewers'];
+  blocked.forEach((name) => {
+    const orig = window[name];
+    if (typeof orig !== 'function') return;
+    window[name] = function () {
+      if (isProfessor(currentUser)) { showToast('This action is reserved for the admin.', 'info'); return; }
+      return orig.apply(this, arguments);
+    };
+  });
+})();
+
+/* ---------- admin: Professor Access tab ---------- */
+let _profAccessSub = 'applications';
+let _profAccessBadgeAt = 0;
+async function refreshProfAccessBadge() {
+  if (!isAdmin(currentUser) || Date.now() - _profAccessBadgeAt < 30000) return;
+  _profAccessBadgeAt = Date.now();
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/professors?status=pending&_t=${Date.now()}`, { cache: 'no-store' });
+    const n = d && d.counts ? (d.counts.pending || 0) + (d.counts.pendingRequests || 0) : 0;
+    const b = $('profAccessBadge');
+    if (b) { b.textContent = n; b.style.display = n ? 'inline-flex' : 'none'; }
+  } catch (_) {}
+}
+function switchProfAccessSub(sub) { _profAccessSub = sub; renderAdminProfAccess(); }
+
+async function renderAdminProfAccess() {
+  const box = $('adminTabProfaccess');
+  if (!box) return;
+  if (!box.innerHTML.trim()) box.innerHTML = typeof renderCoursesLoadingSkeleton === 'function' ? renderCoursesLoadingSkeleton('Loading professors…') : 'Loading…';
+  let profs, reqs;
+  try {
+    [profs, reqs] = await Promise.all([
+      fetchJSON(`${API_BASE}/admin/professors?status=all&_t=${Date.now()}`, { cache: 'no-store' }),
+      fetchJSON(`${API_BASE}/admin/professor-requests?status=all&_t=${Date.now()}`, { cache: 'no-store' })
+    ]);
+  } catch (e) {
+    box.innerHTML = `<div class="empty-state"><p>Could not load: ${escapeHtml(e.message || '')}</p><button class="btn btn-outline" onclick="renderAdminProfAccess()">Try again</button></div>`;
+    return;
+  }
+  if (adminTab !== 'profaccess') return;
+  const list = (profs && profs.professors) || [];
+  const counts = (profs && profs.counts) || {};
+  const allReqs = (reqs && reqs.requests) || [];
+  const courses = (reqs && reqs.courses) || [];
+  const b = $('profAccessBadge');
+  const badgeN = (counts.pending || 0) + (counts.pendingRequests || 0);
+  if (b) { b.textContent = badgeN; b.style.display = badgeN ? 'inline-flex' : 'none'; }
+
+  const fmt = (d) => d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+  const detailRows = (p) => {
+    const x = p.professor || {};
+    const row = (k, v) => v ? `<div><span>${k}</span><strong>${v}</strong></div>` : '';
+    return `<div class="pa-details">
+      ${row('Designation', escapeHtml(x.designation))}${row('Department', escapeHtml(x.department))}${row('Institution', escapeHtml(x.institution))}
+      ${row('Qualification', escapeHtml(x.qualification))}${row('Specialization', escapeHtml(x.specialization))}
+      ${row('Experience', x.experienceYears ? escapeHtml(String(x.experienceYears)) + ' yrs' : '')}${row('Employee ID', escapeHtml(x.employeeId))}
+      ${row('Email', escapeHtml(p.email))}${row('Phone', escapeHtml(p.phone))}${row('Username', escapeHtml(p.username))}
+      ${x.profileUrl ? `<div><span>Profile</span><strong><a href="${escapeHtml(x.profileUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(x.profileUrl)}</a></strong></div>` : ''}
+      ${row('Applied', fmt(x.appliedAt))}
+    </div>${x.bio ? `<p class="pa-bio">${escapeHtml(x.bio)}</p>` : ''}`;
+  };
+  const pendingApps = list.filter(p => p.professor.status === 'pending');
+  const pendingReqs = allReqs.filter(r => r.status === 'pending');
+  const approved = list.filter(p => p.professor.status === 'approved');
+  const closed = list.filter(p => p.professor.status === 'rejected' || p.professor.status === 'revoked');
+
+  let html = `
+    <div class="pa-intro">Two-step access: <strong>1.</strong> approve the professor's account → <strong>2.</strong> approve each course they request. Professors can add and edit content in their approved courses but can never delete anything.</div>
+    <div class="pa-subtabs">
+      <button class="${_profAccessSub === 'applications' ? 'active' : ''}" onclick="switchProfAccessSub('applications')"><i class="fas fa-user-clock"></i> Applications ${counts.pending ? `<span class="nav-count">${counts.pending}</span>` : ''}</button>
+      <button class="${_profAccessSub === 'requests' ? 'active' : ''}" onclick="switchProfAccessSub('requests')"><i class="fas fa-key"></i> Course requests ${pendingReqs.length ? `<span class="nav-count">${pendingReqs.length}</span>` : ''}</button>
+      <button class="${_profAccessSub === 'professors' ? 'active' : ''}" onclick="switchProfAccessSub('professors')"><i class="fas fa-chalkboard-user"></i> Professors (${approved.length})</button>
+      <button class="${_profAccessSub === 'history' ? 'active' : ''}" onclick="switchProfAccessSub('history')"><i class="fas fa-clock-rotate-left"></i> History</button>
+    </div>`;
+
+  if (_profAccessSub === 'applications') {
+    html += pendingApps.length ? pendingApps.map(p => `
+      <div class="pa-card">
+        <div class="pa-card-head"><div><h4>${escapeHtml(p.fullName || p.username)}</h4><span class="prof-chip wait"><i class="fas fa-hourglass-half"></i> Waiting for approval</span></div>
+          <div class="pa-actions">
+            <button class="btn btn-success btn-sm" onclick="adminDecideProfessor('${p._id}', 'approve')"><i class="fas fa-check"></i> Approve</button>
+            <button class="btn btn-outline btn-sm" onclick="adminDecideProfessor('${p._id}', 'reject')"><i class="fas fa-xmark"></i> Reject</button>
+          </div></div>
+        ${detailRows(p)}
+      </div>`).join('') : `<div class="empty-state"><i class="fas fa-user-check"></i><p>No applications waiting.</p></div>`;
+  } else if (_profAccessSub === 'requests') {
+    html += pendingReqs.length ? pendingReqs.map(r => {
+      const opts = courses.map(c => `<option value="${c.id}" ${r.suggestedCourse && r.suggestedCourse.id === c.id ? 'selected' : ''}>${escapeHtml((c.code ? c.code + ' — ' : '') + c.name)}</option>`).join('');
+      return `<div class="pa-card">
+        <div class="pa-card-head"><div><h4>${escapeHtml(r.courseCode)} · ${escapeHtml(r.courseName)}</h4>
+          <span class="pa-sub">Requested by <strong>${escapeHtml(r.professorName)}</strong> (${escapeHtml([r.designation, r.department, r.institution].filter(Boolean).join(', '))}) · ${fmt(r.requestedAt)}</span></div></div>
+        ${r.message ? `<p class="pa-bio"><i class="fas fa-comment"></i> ${escapeHtml(r.message)}</p>` : ''}
+        ${r.professorStatus !== 'approved' ? `<p class="pa-warn"><i class="fas fa-triangle-exclamation"></i> This professor's account is ${escapeHtml(r.professorStatus)} — approve the account first.</p>` : ''}
+        <div class="pa-grant">
+          <label>Grant this course:</label>
+          <select id="paCourse_${r._id}"><option value="">— choose a course —</option>${opts}</select>
+          ${r.suggestedCourse ? `<span class="pa-match"><i class="fas fa-wand-magic-sparkles"></i> matched by ${r.suggestedCourse.by}${r.alreadyHasSuggested ? ' · already has it' : ''}</span>` : '<span class="pa-match none">no exact match — pick the course</span>'}
+        </div>
+        <div class="pa-actions">
+          <button class="btn btn-success btn-sm" onclick="adminDecideCourseRequest('${r.professorId}', '${r._id}', 'approve')"><i class="fas fa-unlock"></i> Approve access</button>
+          <button class="btn btn-outline btn-sm" onclick="adminDecideCourseRequest('${r.professorId}', '${r._id}', 'reject')"><i class="fas fa-xmark"></i> Decline</button>
+        </div>
+      </div>`; }).join('') : `<div class="empty-state"><i class="fas fa-key"></i><p>No course requests waiting.</p></div>`;
+  } else if (_profAccessSub === 'professors') {
+    html += approved.length ? approved.map(p => `
+      <div class="pa-card">
+        <div class="pa-card-head"><div><h4>${escapeHtml(p.fullName || p.username)}</h4><span class="prof-chip ok"><i class="fas fa-circle-check"></i> Approved ${p.professor.reviewedAt ? '· ' + fmt(p.professor.reviewedAt) : ''}</span></div>
+          <div class="pa-actions"><button class="btn btn-outline btn-sm" onclick="adminDecideProfessor('${p._id}', 'revoke')"><i class="fas fa-user-slash"></i> Revoke access</button></div></div>
+        ${detailRows(p)}
+        <div class="pa-courses"><span>Courses:</span> ${(p.professor.courseList || []).length ? p.professor.courseList.map(c => `
+          <span class="pa-course-chip">${escapeHtml((c.code ? c.code + ' — ' : '') + c.name)}
+            <button title="Remove this course from the professor" onclick="adminRemoveProfessorCourse('${p._id}', '${c.id}', ${jsStr((c.code ? c.code + ' — ' : '') + c.name)})"><i class="fas fa-xmark"></i></button></span>`).join('') : '<em>none yet</em>'}</div>
+      </div>`).join('') : `<div class="empty-state"><i class="fas fa-chalkboard-user"></i><p>No approved professors yet.</p></div>`;
+  } else {
+    const decided = allReqs.filter(r => r.status !== 'pending');
+    html += `<div class="section-card"><h3><i class="fas fa-user-xmark"></i> Rejected / revoked accounts</h3>
+      ${closed.length ? closed.map(p => `<div class="pa-hist"><strong>${escapeHtml(p.fullName || p.username)}</strong> — ${escapeHtml(p.professor.status)} ${fmt(p.professor.reviewedAt)}
+        ${p.professor.reviewNote ? `<span class="pa-sub">“${escapeHtml(p.professor.reviewNote)}”</span>` : ''}
+        <button class="btn btn-outline btn-sm" onclick="adminDecideProfessor('${p._id}', 'approve')"><i class="fas fa-rotate-left"></i> Approve now</button></div>`).join('') : '<p class="editor-hint">None.</p>'}</div>
+      <div class="section-card"><h3><i class="fas fa-clock-rotate-left"></i> Decided course requests</h3>
+      ${decided.length ? decided.map(r => `<div class="pa-hist"><strong>${escapeHtml(r.courseCode)}</strong> ${escapeHtml(r.courseName)} — ${escapeHtml(r.professorName)}
+        <span class="prof-chip ${r.status === 'approved' ? 'ok' : 'bad'}">${escapeHtml(r.status)}</span> ${fmt(r.reviewedAt)}
+        ${r.reviewNote ? `<span class="pa-sub">“${escapeHtml(r.reviewNote)}”</span>` : ''}</div>`).join('') : '<p class="editor-hint">None.</p>'}</div>`;
+  }
+  box.innerHTML = html;
+}
+
+async function adminDecideProfessor(id, action) {
+  let body = {};
+  if (action === 'reject' || action === 'revoke') {
+    const reason = await aeroAskText(action === 'reject' ? 'Reject this application' : 'Revoke professor access',
+      'Reason (the professor will see this):', { required: true, danger: true, okText: action === 'reject' ? 'Reject' : 'Revoke' });
+    if (reason == null) return;
+    body.reason = reason;
+  } else if (!(await aeroConfirm('Approve professor', 'They will be able to sign in and request course access. They will not see any course until you approve it separately.', 'Approve'))) return;
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/professors/${id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!d.success) throw new Error(d.message || 'Failed.');
+    showToast(d.message || 'Done.', 'success');
+    _profAccessBadgeAt = 0;
+    renderAdminProfAccess();
+  } catch (e) { showToast(e.message || 'Failed.', 'error'); }
+}
+async function adminDecideCourseRequest(profId, reqId, action) {
+  const body = {};
+  if (action === 'approve') {
+    const sel = $('paCourse_' + reqId);
+    if (!sel || !sel.value) return showToast('Choose the course to grant first.', 'error');
+    body.courseId = sel.value;
+  } else {
+    const reason = await aeroAskText('Decline course request', 'Reason (the professor will see this):', { required: true, danger: true, okText: 'Decline' });
+    if (reason == null) return;
+    body.reason = reason;
+  }
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/professor-requests/${profId}/${reqId}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!d.success) throw new Error(d.message || 'Failed.');
+    showToast(d.message || 'Done.', 'success');
+    _profAccessBadgeAt = 0;
+    renderAdminProfAccess();
+  } catch (e) { showToast(e.message || 'Failed.', 'error'); }
+}
+async function adminRemoveProfessorCourse(profId, courseId, label) {
+  if (!(await aeroConfirm('Remove course access', `The professor will no longer see <strong>${escapeHtml(label)}</strong>. Nothing they added is deleted.`, 'Remove access', true))) return;
+  try {
+    const d = await fetchJSON(`${API_BASE}/admin/professors/${profId}/courses/${courseId}/remove`, { method: 'POST' });
+    if (!d.success) throw new Error(d.message || 'Failed.');
+    showToast('Course access removed.', 'success');
+    renderAdminProfAccess();
+  } catch (e) { showToast(e.message || 'Failed.', 'error'); }
+}
+
+/* ============================================================
+   ⭐ ADMIN SECTION NAVIGATOR (2026-10-08)
+   ------------------------------------------------------------
+   22 admin sections used to sit in one long strip. Now:
+   • the 5 most used sections come first (Main),
+   • the rest follow in named groups (Insights, People, Revenue,
+     Messages, Site & brand, System) in the same strip, reached by
+     scrolling sideways (mouse wheel, swipe or the ‹ › arrows),
+   • "All sections" opens a searchable, grouped panel.
+   Works on the existing .admin-tab buttons (including the ones other
+   blocks inject later), so every onclick / badge keeps working.
+   ============================================================ */
+const ADM_NAV_GROUPS = [
+  { id: 'main',     label: 'Main',          icon: 'fa-star',             tabs: ['overview', 'courses', 'students', 'grading', 'qbank', 'profaccess', 'live'] },
+  { id: 'insights', label: 'Insights',      icon: 'fa-chart-line',       tabs: ['traffic'] },
+  { id: 'people',   label: 'People',        icon: 'fa-users',            tabs: ['professors', 'community', 'feedback', 'contributions'] },
+  { id: 'revenue',  label: 'Revenue',       icon: 'fa-indian-rupee-sign', tabs: ['subscriptions', 'plans', 'coupons', 'referrals'] },
+  { id: 'messages', label: 'Messages',      icon: 'fa-envelope',         tabs: ['helpdesk', 'replies', 'popup'] },
+  { id: 'site',     label: 'Site & brand',  icon: 'fa-swatchbook',       tabs: ['organization', 'branding', 'certificates', 'mobileapp'] },
+  { id: 'system',   label: 'System',        icon: 'fa-gear',             tabs: ['security', 'backup'] }
+];
+const ADM_NAV_DESC = {
+  overview: 'Stats & quick actions', courses: 'Add & edit courses', students: 'Accounts, access & progress',
+  grading: 'Tests, answer sheets & results',
+  qbank: 'Reusable questions & auto papers',
+  profaccess: 'Approve professors & courses', live: 'Who is online now', traffic: 'Visitors & page views',
+  professors: 'Faculty profiles', community: 'Alumni & friends', feedback: 'Reviews to moderate',
+  contributions: 'Notes sent by students', subscriptions: 'Auto-pay & members', plans: 'Prices & durations',
+  coupons: 'Discount codes', referrals: 'Invite rewards', helpdesk: 'Premium students\' questions', replies: 'Replies to your emails',
+  popup: 'Announcement pop-up', organization: 'Owner & team details', branding: 'Logo, favicon & icons',
+  certificates: 'Course certificates', mobileapp: 'Android & Windows app downloads', security: 'Password, 2FA & devices',
+  backup: 'Export & restore data'
+};
+let _admNavObserver = null;
+let _admNavBusy = false;
+
+function _admNavDecorate(btn) {
+  if (btn.dataset.admDecorated === '1') return;
+  const icon = btn.querySelector('i');
+  const iconCls = icon ? Array.from(icon.classList).filter(c => c !== 'fas' && c !== 'fa-solid').join(' ') : 'fa-circle';
+  const badge = btn.querySelector('.nav-count, .ahd-badge');   // keep injected badges too (Help Desk, Grading)
+  let label = '';
+  btn.childNodes.forEach(n => { if (n.nodeType === 3) label += n.textContent; });
+  label = label.replace(/\s+/g, ' ').trim() || btn.dataset.tab;
+  const id = btn.dataset.tab;
+  btn.innerHTML = `<span class="adm-ic"><i class="fas ${iconCls}"></i></span>
+    <span class="adm-txt"><b>${escapeHtml(label)}</b><small>${escapeHtml(ADM_NAV_DESC[id] || '')}</small></span>`;
+  if (badge) btn.querySelector('.adm-txt b').appendChild(badge);
+  btn.dataset.admDecorated = '1';
+  btn.dataset.admLabel = label;
+  btn.title = label + (ADM_NAV_DESC[id] ? ' — ' + ADM_NAV_DESC[id] : '');
+}
+
+function _admNavGroupLabel(g) {
+  let el = document.querySelector(`.adm-group-label[data-group="${g.id}"]`);
+  if (!el) {
+    el = document.createElement('span');
+    el.className = 'adm-group-label';
+    el.dataset.group = g.id;
+    el.setAttribute('aria-hidden', 'true');
+    el.innerHTML = `<i class="fas ${g.icon}"></i><span>${escapeHtml(g.label)}</span>`;
+  }
+  return el;
+}
+
+function admNavBuild() {
+  const track = document.querySelector('#adminView .admin-tabs');
+  if (!track || _admNavBusy) return;
+  _admNavBusy = true;
+  try {
+    /* 1. wrap once: ‹ [track] › [All sections] */
+    if (!track.closest('.adm-nav')) {
+      const wrap = document.createElement('div');
+      wrap.className = 'adm-nav';
+      track.parentNode.insertBefore(wrap, track);
+      wrap.innerHTML = `<button type="button" class="adm-nav-arrow is-left" aria-label="Scroll sections left" tabindex="-1"><i class="fas fa-chevron-left"></i></button>
+        <div class="adm-nav-viewport"></div>
+        <button type="button" class="adm-nav-arrow is-right" aria-label="Scroll sections right" tabindex="-1"><i class="fas fa-chevron-right"></i></button>
+        <button type="button" class="adm-nav-all" aria-haspopup="dialog" aria-expanded="false" title="All sections"><i class="fas fa-table-cells-large"></i><span>All sections</span><b class="adm-nav-all-count"></b></button>`;
+      wrap.querySelector('.adm-nav-viewport').appendChild(track);
+      track.setAttribute('role', 'tablist');
+      track.setAttribute('aria-label', 'Admin sections');
+      wrap.querySelector('.adm-nav-arrow.is-left').addEventListener('click', () => _admNavScrollBy(-1));
+      wrap.querySelector('.adm-nav-arrow.is-right').addEventListener('click', () => _admNavScrollBy(1));
+      wrap.querySelector('.adm-nav-all').addEventListener('click', admToggleAllSections);
+      track.addEventListener('scroll', _admNavEdges, { passive: true });
+      /* vertical mouse wheel scrolls the strip sideways while the pointer is on it */
+      track.addEventListener('wheel', (e) => {
+        if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || e.ctrlKey) return;
+        const max = track.scrollWidth - track.clientWidth;
+        if (max <= 0) return;
+        const next = Math.max(0, Math.min(max, track.scrollLeft + e.deltaY));
+        if (next === track.scrollLeft) return;            // at an end → let the page scroll
+        e.preventDefault();
+        track.scrollLeft = next;
+      }, { passive: false });
+      window.addEventListener('resize', _admNavEdges);
+    }
+
+    /* 2. decorate + order the buttons by group */
+    const btns = Array.from(track.querySelectorAll('.admin-tab'));
+    btns.forEach(_admNavDecorate);
+    const byId = new Map(btns.map(b => [b.dataset.tab, b]));
+    const want = [];
+    const used = new Set();
+    ADM_NAV_GROUPS.forEach(g => {
+      const items = g.tabs.map(id => byId.get(id)).filter(Boolean);
+      if (!items.length) return;
+      if (g.id !== 'main') want.push(_admNavGroupLabel(g));
+      items.forEach(b => { want.push(b); used.add(b.dataset.tab); b.dataset.admGroup = g.id; });
+    });
+    const extra = btns.filter(b => !used.has(b.dataset.tab));
+    if (extra.length) {
+      want.push(_admNavGroupLabel({ id: 'more', label: 'More', icon: 'fa-ellipsis' }));
+      extra.forEach(b => { want.push(b); b.dataset.admGroup = 'more'; });
+    }
+    const cur = Array.from(track.children);
+    if (cur.length !== want.length || cur.some((c, i) => c !== want[i])) {
+      want.forEach(el => track.appendChild(el));
+      cur.filter(c => !want.includes(c)).forEach(c => { if (c.classList.contains('adm-group-label')) c.remove(); });
+    }
+    const cnt = document.querySelector('.adm-nav-all-count');
+    if (cnt) cnt.textContent = btns.length;
+  } finally {
+    _admNavBusy = false;
+  }
+  _admNavEdges();
+  if (!_admNavObserver && 'MutationObserver' in window) {
+    _admNavObserver = new MutationObserver(() => { if (!_admNavBusy) requestAnimationFrame(admNavBuild); });
+    _admNavObserver.observe(track, { childList: true });
+  }
+}
+
+function _admNavEdges() {
+  const wrap = document.querySelector('.adm-nav');
+  const track = wrap && wrap.querySelector('.admin-tabs');
+  if (!track) return;
+  /* size the cards so exactly the 5 main sections fill the visible strip */
+  if (window.innerWidth > 640) {
+    const w = Math.max(168, Math.floor((track.clientWidth - 12 - 4 * 6) / 5));
+    if (track.style.getPropertyValue('--adm-tab-w') !== w + 'px') track.style.setProperty('--adm-tab-w', w + 'px');
+  } else if (track.style.getPropertyValue('--adm-tab-w')) {
+    track.style.removeProperty('--adm-tab-w');
+  }
+  const max = track.scrollWidth - track.clientWidth;
+  wrap.classList.toggle('can-left', track.scrollLeft > 4);
+  wrap.classList.toggle('can-right', track.scrollLeft < max - 4);
+}
+function _admNavScrollBy(dir) {
+  const track = document.querySelector('.adm-nav .admin-tabs');
+  if (!track) return;
+  track.scrollBy({ left: dir * Math.max(240, track.clientWidth * 0.8), behavior: 'smooth' });
+}
+/* keep the open section in view (e.g. after picking it from the panel or a #/admin/… link) */
+function _admNavRevealActive(smooth) {
+  const track = document.querySelector('.adm-nav .admin-tabs');
+  const act = track && track.querySelector('.admin-tab.active');
+  if (!track || !act) return;
+  const a = act.offsetLeft, b = a + act.offsetWidth;
+  const v0 = track.scrollLeft, v1 = v0 + track.clientWidth;
+  if (a >= v0 + 8 && b <= v1 - 8) return;
+  let target = Math.max(0, a - 120);
+  if (act.dataset.admGroup === 'main') target = 0;
+  else {
+    /* show the group's name too when it fits */
+    const lab = track.querySelector(`.adm-group-label[data-group="${act.dataset.admGroup}"]`);
+    if (lab && b - lab.offsetLeft + 16 <= track.clientWidth) target = Math.max(0, lab.offsetLeft - 8);
+  }
+  track.scrollTo({ left: target, behavior: smooth ? 'smooth' : 'auto' });
+}
+
+/* ---------- "All sections" panel ---------- */
+function admCloseAllSections() {
+  ['admAllPanel', 'admAllOv'].forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
+  const b = document.querySelector('.adm-nav-all'); if (b) b.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('keydown', _admAllKeys, true);
+}
+function _admAllKeys(e) {
+  if (e.key === 'Escape') { e.preventDefault(); admCloseAllSections(); }
+}
+function admToggleAllSections() {
+  if (document.getElementById('admAllPanel')) return admCloseAllSections();
+  const btns = Array.from(document.querySelectorAll('.adm-nav .admin-tab'));
+  const groups = ADM_NAV_GROUPS.concat([{ id: 'more', label: 'More', icon: 'fa-ellipsis' }]).map(g => ({
+    g, items: btns.filter(b => b.dataset.admGroup === g.id)
+  })).filter(x => x.items.length);
+  const ov = document.createElement('div');
+  ov.id = 'admAllOv'; ov.className = 'adm-all-ov';
+  ov.addEventListener('click', admCloseAllSections);
+  const panel = document.createElement('div');
+  panel.id = 'admAllPanel'; panel.className = 'adm-all'; panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', 'All admin sections');
+  panel.innerHTML = `
+    <div class="adm-all-head">
+      <div class="adm-all-search"><i class="fas fa-magnifying-glass"></i><input type="search" id="admAllSearch" placeholder="Find a section…" autocomplete="off" aria-label="Find a section"></div>
+      <button type="button" class="adm-all-close" aria-label="Close"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="adm-all-body">
+      ${groups.map(({ g, items }) => `
+        <section class="adm-all-group" data-group="${g.id}">
+          <h4><i class="fas ${g.icon}"></i> ${escapeHtml(g.label)}</h4>
+          <div class="adm-all-grid">
+            ${items.map(b => {
+              const ic = (b.querySelector('.adm-ic i') || {}).className || 'fas fa-circle';
+              const badge = b.querySelector('.nav-count');
+              const n = badge && badge.style.display !== 'none' && badge.textContent.trim() !== '0' ? badge.textContent.trim() : '';
+              const label = b.dataset.admLabel || b.dataset.tab;
+              return `<button type="button" class="adm-all-item ${b.classList.contains('active') ? 'is-on' : ''}" data-adm-go="${escapeHtml(b.dataset.tab)}" data-q="${escapeHtml((label + ' ' + (ADM_NAV_DESC[b.dataset.tab] || '') + ' ' + g.label).toLowerCase())}">
+                <span class="adm-ic"><i class="${escapeHtml(ic)}"></i></span>
+                <span class="adm-txt"><b>${escapeHtml(label)}${n ? ` <span class="nav-count">${escapeHtml(n)}</span>` : ''}</b><small>${escapeHtml(ADM_NAV_DESC[b.dataset.tab] || '')}</small></span>
+              </button>`;
+            }).join('')}
+          </div>
+        </section>`).join('')}
+      <div class="adm-all-empty" hidden><i class="fas fa-magnifying-glass"></i> No section matches.</div>
+    </div>`;
+  panel.addEventListener('click', (e) => {
+    if (e.target.closest('.adm-all-close')) return admCloseAllSections();
+    const go = e.target.closest('[data-adm-go]');
+    if (go) { admCloseAllSections(); switchAdminTab(go.dataset.admGo); }
+  });
+  const search = panel.querySelector('#admAllSearch');
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    let shown = 0;
+    panel.querySelectorAll('.adm-all-group').forEach(sec => {
+      let n = 0;
+      sec.querySelectorAll('.adm-all-item').forEach(it => { const hit = !q || it.dataset.q.includes(q); it.hidden = !hit; if (hit) n++; });
+      sec.hidden = n === 0; shown += n;
+    });
+    panel.querySelector('.adm-all-empty').hidden = shown > 0;
+  });
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { const first = panel.querySelector('.adm-all-item:not([hidden])'); if (first) first.click(); }
+  });
+  document.body.appendChild(ov);
+  document.body.appendChild(panel);
+  /* place under the button on wide screens; bottom sheet on phones */
+  const btn = document.querySelector('.adm-nav-all');
+  if (btn) btn.setAttribute('aria-expanded', 'true');
+  if (window.innerWidth > 640 && btn) {
+    const r = btn.getBoundingClientRect();
+    const w = Math.min(760, window.innerWidth - 24);
+    panel.style.width = w + 'px';
+    panel.style.left = Math.max(12, Math.min(r.right - w, window.innerWidth - w - 12)) + 'px';
+    panel.style.top = (r.bottom + 8) + 'px';
+    panel.style.maxHeight = Math.max(320, window.innerHeight - r.bottom - 24) + 'px';
+  } else {
+    panel.classList.add('is-sheet'); ov.classList.add('is-dim');
+  }
+  document.addEventListener('keydown', _admAllKeys, true);
+  if (!matchMedia('(pointer: coarse)').matches) setTimeout(() => search.focus(), 30);
+}
+
+/* hook into the tab renderer (after every other wrapper) */
+(function wireAdminNavigator() {
+  const prev = window.updateAdminTabUI;
+  window.updateAdminTabUI = function () {
+    if (typeof prev === 'function') prev.apply(this, arguments);
+    try { admNavBuild(); _admNavRevealActive(true); } catch (e) { console.warn('[admin-nav]', e); }
+  };
+  try { admNavBuild(); } catch (e) { console.warn('[admin-nav]', e); }
+})();
+
+
+/* ============================================================
+   ⭐ LAYOUT METRICS (2026-10-08)
+   Publishes the real height of the sticky header and of the phone
+   bottom bar as CSS variables, so full-height screens (the AI
+   Solver) fit exactly between them on every device.
+   ============================================================ */
+(function publishLayoutMetrics() {
+  const root = document.documentElement;
+  let raf = 0;
+  function measure() {
+    raf = 0;
+    const h = document.getElementById('appHeader');
+    const hh = h && getComputedStyle(h).display !== 'none' ? Math.round(h.getBoundingClientRect().height) : 0;
+    root.style.setProperty('--aero-header-h', hh + 'px');
+    const nav = document.querySelector('.mobile-bottom-nav');
+    let nh = 0;
+    if (nav) {
+      const cs = getComputedStyle(nav);
+      if (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.position === 'fixed') {
+        const r = nav.getBoundingClientRect();
+        if (r.height && r.top < window.innerHeight) nh = Math.round(window.innerHeight - r.top);
+      }
+    }
+    root.style.setProperty('--aero-bnav-h', Math.max(0, nh) + 'px');
+  }
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(measure); };
+  measure();
+  window.addEventListener('resize', schedule);
+  window.addEventListener('orientationchange', schedule);
+  window.addEventListener('hashchange', () => setTimeout(schedule, 60));
+  if ('ResizeObserver' in window) {
+    const ro = new ResizeObserver(schedule);
+    const h = document.getElementById('appHeader');
+    if (h) ro.observe(h);
+    const watchNav = () => { const n = document.querySelector('.mobile-bottom-nav'); if (n && !n.__aeroObserved) { n.__aeroObserved = true; ro.observe(n); } };
+    watchNav(); setTimeout(watchNav, 1500);
+  }
+  setTimeout(schedule, 400);
+})();
+
+/* ============================================================
+   ⭐ SMART BACK (2026-10-10)
+   ------------------------------------------------------------
+   One back action for every way of going back — the phone's back
+   gesture, the Android app's back button, the Windows app's mouse
+   back button / Alt+←, and the ‹ Back button in the header:
+     1. close whatever is on top (full screen, file viewer, pop-up,
+        menu, dropdown) — most recent first;
+     2. never leave a running exam by accident;
+     3. otherwise go back one page — or, when there is no page to go
+        back to (opened from a link), up to the page above it.
+   window.aeroBack() returns true when it handled the back press;
+   false means "nothing left here" (the apps then go to the landing
+   page / offer to exit).
+   ============================================================ */
+(function () {
+  const IN_APP = /RankerNodeApp\//.test(navigator.userAgent || '');
+  const vis = (el) => !!(el && el.isConnected && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+
+  /* ---- what is open on top, most recent / top-most first ---- */
+  function topLayer() {
+    if (typeof quizPlayerState !== 'undefined' && quizPlayerState) {
+      const shell = document.getElementById('quizExamShell');
+      if (vis(shell)) {
+        if (typeof _inExam === 'function' && _inExam()) {
+          return { exam: true, close() { showToast('Your exam is still running — submit it to leave.', 'info'); } };
+        }
+        return { close() { exitQuizSession(); } };
+      }
+    }
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      return { close() { try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {} } };
+    }
+    for (const name of ['VideoPlayer', 'PDFViewer', 'DocumentViewer']) {
+      const v = window[name];
+      if (v && v.active && typeof v.close === 'function') return { close() { v.close(); } };
+    }
+    /* pop-ups: the notes editor's menus, then any modal (last in the page = on top) */
+    const ntPop = document.querySelector('.nt-pop-ov');
+    if (ntPop) return { close() { ntPop.dispatchEvent(new MouseEvent('click', { bubbles: true })); } };
+    const ai = document.getElementById('aiModelMenu');
+    if (ai && typeof aiCloseModelMenu === 'function') return { close() { aiCloseModelMenu(); } };
+    const modals = Array.from(document.querySelectorAll('.modal-overlay.active, .modal-overlay[style*="flex"], .modal-overlay[style*="block"]')).filter(vis);
+    if (modals.length) {
+      const m = modals[modals.length - 1];
+      return { close() { closeOverlayEl(m); } };
+    }
+    const gs = document.getElementById('globalSearchOverlay');
+    if (gs && gs.classList.contains('active')) return { close() { closeGlobalSearch(); } };
+    for (const id of ['notifWrap', 'userProfileWrap']) {
+      const w = document.getElementById(id);
+      if (w && w.classList.contains('open')) return { close() { w.classList.remove('open'); } };
+    }
+    const nav = document.getElementById('mainNav');
+    if (nav && nav.classList.contains('open')) return { close() { const t = document.getElementById('navToggle'); if (t) t.click(); else nav.classList.remove('open'); } };
+    return null;
+  }
+  /* pop-ups written into the page itself are reused — they are hidden,
+     never removed; pop-ups built later by scripts can be removed */
+  document.querySelectorAll('.modal-overlay').forEach(m => { m.dataset.aeroStatic = '1'; });
+  /* close one modal the way its own UI would: a tap on the dim backdrop,
+     else its own close (✕) button, else simply hide it */
+  function closeOverlayEl(m) {
+    m.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    if (!vis(m)) return;
+    const x = m.querySelector('.modal-close, [data-close], .premium-hub-x, .hd-icon-btn[aria-label="Close"], button[aria-label="Close"]');
+    if (x) { x.click(); if (!vis(m)) return; }
+    m.classList.remove('active');
+    if (vis(m) && !m.dataset.aeroStatic) m.remove();
+    else if (vis(m)) m.style.display = 'none';
+  }
+
+  /* ---- pages ---- */
+  function routeParts() { return (location.hash || '#/home').replace(/^#\/?/, '').split('/').filter(Boolean); }
+  function isRootView() {
+    if (!currentUser) return true;
+    const p = routeParts();
+    if (!p.length || p[0] === 'home') return true;
+    if (p[0] === 'admin') return !p[1] || (p[1] === 'overview' && !p[2]);
+    if (p[0] === 'professor') return !p[1] || p[1] === 'courses';
+    return false;
+  }
+  function parentRoute() {
+    const p = routeParts();
+    if (p[0] === 'course') return '#/courses';
+    if (p[0] === 'notes' && p[1]) return '#/notes';
+    if (p[0] === 'admin') return (p[1] === 'edit' || p[1] === 'quiz' || p[1] === 'course' || p[1] === 'professor' || p[1] === 'student') ? '#/admin/' + ({ edit: 'courses', quiz: 'courses', course: 'courses', professor: 'professors', student: 'students' }[p[1]]) : '#/admin/overview';
+    if (p[0] === 'professor') return '#/professor/courses';
+    return '#/home';
+  }
+  const navIndex = () => (history.state && history.state.aeroNav) || 0;
+
+  function aeroBack() {
+    const top = topLayer();
+    if (top) { top.close(); setTimeout(refreshBackBtn, 60); return true; }
+    if (isRootView()) return false;
+    if (navIndex() > 0) { history.back(); return true; }
+    /* opened straight on a deep page — go up instead of out of the app */
+    history.replaceState({ aeroNav: 0 }, '', parentRoute());
+    try { syncHashToState(); renderApp(); } catch (e) {}
+    return true;
+  }
+  window.aeroBack = aeroBack;
+
+  /* every in-app page change carries its depth, so "back" knows whether
+     there is an earlier RankerNode page to return to */
+  window.pushHash = function (path) {
+    if (location.hash === path) return;
+    history.pushState({ aeroNav: navIndex() + 1 }, '', path);
+  };
+
+  /* ---- phone browsers: the back gesture closes pop-ups first ----
+     When something opens on top, one extra history entry (same URL) is
+     added; going back pops it and closes the top layer instead of
+     leaving the page. If the layer is closed some other way, that
+     entry is quietly removed again. */
+  let guarded = false, skipPop = 0, scheduled = 0;
+  const isGuardState = () => !!(history.state && history.state.aeroLayer);
+  function syncGuard() {
+    scheduled = 0;
+    const open = !!topLayer();
+    if (open && !guarded) {
+      history.pushState({ aeroNav: navIndex(), aeroLayer: true }, '', location.href);
+      guarded = true;
+    } else if (!open && guarded) {
+      guarded = false;
+      if (isGuardState()) { skipPop++; history.back(); }
+    }
+  }
+  const scheduleGuard = () => { if (!scheduled) scheduled = setTimeout(syncGuard, 120); };
+  window.addEventListener('popstate', () => {
+    if (skipPop) { skipPop--; return; }
+    if (!guarded) return refreshBackBtn();
+    guarded = false;                          // the guard entry was just popped
+    const top = topLayer();
+    if (top) {
+      top.close();
+      if (top.exam) { history.pushState({ aeroNav: navIndex(), aeroLayer: true }, '', location.href); guarded = true; }
+    }
+    scheduleGuard();
+  });
+  new MutationObserver(scheduleGuard).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style'] });
+
+  /* ---- the ‹ Back button in the header ---- */
+  function ensureBackBtn() {
+    let b = document.getElementById('aeroBackBtn');
+    if (b) return b;
+    const header = document.getElementById('appHeader'), brand = header && header.querySelector('.brand');
+    if (!brand) return null;
+    b = document.createElement('button');
+    b.type = 'button'; b.id = 'aeroBackBtn'; b.className = 'aero-back-btn';
+    b.setAttribute('aria-label', 'Back'); b.title = 'Back';
+    b.innerHTML = '<i class="fas fa-chevron-left" aria-hidden="true"></i><span>Back</span>';
+    b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); if (!aeroBack()) navigateStudent('home'); });
+    brand.parentNode.insertBefore(b, brand);
+    return b;
+  }
+  function refreshBackBtn() {
+    const b = ensureBackBtn(); if (!b) return;
+    const show = !!currentUser && !isRootView();
+    b.hidden = !show;
+    document.documentElement.classList.toggle('aero-has-back', show);
+    document.documentElement.classList.toggle('aero-in-app', IN_APP || document.documentElement.classList.contains('aero-in-app'));
+  }
+  const _origRenderApp = window.renderApp;
+  window.renderApp = function () { const r = _origRenderApp.apply(this, arguments); try { refreshBackBtn(); } catch (e) {} return r; };
+  window.addEventListener('hashchange', refreshBackBtn);
+  window.addEventListener('popstate', () => setTimeout(refreshBackBtn, 0));
+  setTimeout(refreshBackBtn, 300);
+})();

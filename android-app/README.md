@@ -1,7 +1,7 @@
 # RankerNode Android app
 
-A real Android app (APK) for RankerNode — not a browser shortcut. It opens
-`https://rankernode.example/app` full-screen, with its own icon and name, no browser
+A real Android app (APK) for RankerNode — not a browser shortcut. It opens the landing page
+(`https://rankernode.example/`) full-screen, leading into `https://rankernode.example/app`, with its own icon and name, no browser
 bar and no browser badge.
 
 ## What it does
@@ -36,8 +36,31 @@ GitHub builds the APK for you:
 4. On the website: **Admin → Mobile App → Upload new version** → choose that APK.
    From then on the Android "Get App" button downloads it, and installed apps offer the update.
 
+## Two versions: website APK and Google Play
+The same project builds two versions of the app (same package `com.altitudeacademy.app`, same signing key):
+
+| | `direct` — website APK | `play` — Google Play |
+|---|---|---|
+| File | `RankerNode-1.0.N.apk` | `RankerNode-1.0.N-play.aab` |
+| Where | Admin → Apps on the website | Play Console → Create release |
+| Updates | offers new APKs itself | only through Google Play |
+| Buying courses | as on the website | hidden (Play policy) — students buy on the website |
+
+GitHub builds both on every push (workflow `android-app/ci/android-apk.yml`, which must be copied to
+`.github/workflows/android-apk.yml`). The app targets Android 16 (API 36), as Google Play requires.
+Everything for the Play listing (icon, feature graphic, texts, Data safety answers) is in `play-store/`.
+
 ## Settings
-`app.properties` → `APP_URL` (the page the app opens). Change it only if the domain changes.
+`app.properties`:
+- `START_URL` — the first page when the app opens: the landing page (`https://rankernode.example/`).
+  Its "Log in" / "Start learning" buttons lead into the app.
+- `APP_URL` — the app itself (`https://rankernode.example/app`); its domain decides which links stay
+  inside the app. Change these only if the domain changes.
+
+## Back button
+Back first asks the website (`window.aeroBack()`) to close whatever is open on top — a pop-up,
+menu, file viewer or full-screen video — or to go back a page; an exam in progress is never left
+by accident. With nothing left to go back to, the first press shows "Press back again to exit".
 
 ## Building on your own computer (optional)
 Android Studio → Open → `android-app/`. For a signed release set the environment variables

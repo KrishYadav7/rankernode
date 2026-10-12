@@ -55,15 +55,17 @@ Still shared, because the same keys were copied. Change them in `.env` if you wa
 
 ## Before going live
 1. **Domain.** Replace `rankernode.example` with the real domain in:
-   - `android-app/app.properties` (`APP_URL`)
+   - `android-app/app.properties` (`APP_URL` and `START_URL`)
+   - `desktop-app/src/main.js` (`APP_URL`, `START_URL` and `isOwnHost`)
    - `landing.html` (the email link in the "About" section)
+   - `android-app/play-store/PLAY-STORE-LISTING.md` (website, privacy and delete-account links)
 2. **Git.** This folder is **not** connected to AeroGyan's GitHub repository. Create a new repository and push there. Never add AeroGyan's remote.
    ```
    git init && git add -A && git commit -m "RankerNode"
    git remote add origin https://github.com/<you>/rankernode.git
    git push -u origin main
    ```
-3. **Android builds.** Move `android-app/ci/android-apk.yml` to `.github/workflows/android-apk.yml`. Then add the 4 secrets listed in `android-signing/GITHUB-SECRETS-README.txt` to the new repository.
+3. **Android and Windows builds.** The workflows are already in `.github/workflows/` (`android-apk.yml`, `windows-app.yml`). Add the 4 secrets listed in `android-signing/GITHUB-SECRETS-README.txt` to the new repository. The website offers app downloads from this repository's releases (`APP_GITHUB_REPO`, default `KrishYadav7/rankernode`).
 4. **On the server:**
    ```
    npm install
@@ -74,3 +76,22 @@ Still shared, because the same keys were copied. Change them in `.env` if you wa
    - create a course for each subject in **Courses → New Course**
    - add its chapters in the **Chapters** tab
    - upload content to each chapter
+
+## Features brought over from AeroGyan (2026-10-12)
+Everything AeroGyan gained after the copy (2026-10-05 → 2026-10-12) now runs here too, on top of the
+categories, subjects and chapters above:
+- **My Notes** — handwritten notebooks (7 pen types, shapes, lasso, text, PDF export) that work on every device.
+- **Learning** — question bank, test series, report cards; **LaTeX** in questions and answers.
+- **AI Doubt Solver** upgrades, **help & support tickets**, **Privacy** and **Delete account** pages.
+- **OTP sign-in** for admins and professors; an admin can stay signed in on several devices.
+- **Professors** — register, get approved, request courses, add and edit content (never delete or price);
+  here they can also add, rename and reorder chapters (deleting a chapter stays with the admin).
+- **Course and material order** — drag to reorder; materials are reordered inside each chapter.
+- **Guest catalog** — visitors can browse courses and are asked to sign up to open a lesson.
+- **Faster PDFs** — packed fast-view copies, range loading, instant posters (needs `qpdf` on the server;
+  PowerPoint/Word/Excel viewing needs LibreOffice).
+- **Apps** — Android Google Play build (`.aab`), in-app downloads and printing, and a Windows desktop app (`desktop-app/`).
+
+To check after deploying:
+- **Founder section** on the landing page now shows only what the admin saves (Admin → Organization & Owner). Until it is
+  filled in, the section is hidden.

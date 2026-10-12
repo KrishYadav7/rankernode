@@ -9,14 +9,16 @@
     (function () {
       try {
         var t = localStorage.getItem('aero_theme');
-        if (t !== 'light' && t !== 'dim' && t !== 'dark') {
+        if (t !== 'light' && t !== 'dim' && t !== 'dark' && t !== 'space' && t !== 'aurora') {
           t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
         }
-        document.documentElement.setAttribute('data-theme', t);
+        /* ⭐ Space = dark base + space skin · Aurora = light base + aurora skin */
+        if (t === 'space' || t === 'aurora') document.documentElement.setAttribute('data-skin', t);
+        document.documentElement.setAttribute('data-theme', t === 'space' ? 'dark' : t === 'aurora' ? 'light' : t);
       } catch (e) {}
     })();
   </script>
-<link rel="manifest" href="manifest.json?v=138">
+<link rel="manifest" href="manifest.json?v=160">
   <!-- Logo / Favicon -->
   <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=138">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=138">
@@ -56,7 +58,7 @@
   <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"></noscript>
 
   <!-- App stylesheet — blocking (must be, small) -->
-  <link rel="stylesheet" href="styles.css?v=138">
+  <link rel="stylesheet" href="styles.css?v=145">
 
 
   <!-- Inline critical fallback so icons don't flash before FA loads -->
@@ -80,22 +82,25 @@
         processEscapes: true,
         processEnvironments: true,
         processRefs: true,
-        tags: 'none',
-        packages: {
-          '[+]': [
-            'ams', 'newcommand', 'configmacros', 'noundefined', 'noerrors',
-            'mhchem', 'boldsymbol', 'html', 'textmacros', 'color',
-            'mathtools', 'physics', 'cancel', 'enclose', 'unicode'
-          ]
-        },
+        /* ⭐ 2026-10-10: numbered equations like LaTeX (\\label / \\eqref / \\tag work) */
+        tags: 'ams',
+        /* ⭐ every MathJax TeX package — each one is also LOADED below (before,
+           several were listed here but never loaded, so e.g. \\qty or \\cancel
+           could fail) */
+        packages: { '[+]': ['ams', 'newcommand', 'configmacros', 'noundefined', 'noerrors', 'mhchem', 'boldsymbol', 'html', 'textmacros', 'textcomp', 'color', 'colortbl', 'mathtools', 'physics', 'cancel', 'enclose', 'unicode', 'braket', 'bbox', 'cases', 'centernot', 'empheq', 'extpfeil', 'gensymb', 'upgreek', 'verb', 'action', 'amscd', 'bussproofs', 'tagformat', 'setoptions'] },
         macros: {
           RR: '\\mathbb{R}', NN: '\\mathbb{N}', ZZ: '\\mathbb{Z}',
           CC: '\\mathbb{C}', QQ: '\\mathbb{Q}', dd: '\\mathrm{d}',
-          braket: ['\\left\\langle #1 \\right\\rangle', 1],
-          ket:    ['\\left| #1 \\right\\rangle', 1],
-          bra:    ['\\left\\langle #1 \\right|', 1]
+          /* siunitx-style units inside math */
+          SI: ['#1\\,\\mathrm{#2}', 2], si: ['\\mathrm{#1}', 1], num: ['#1', 1], unit: ['\\mathrm{#1}', 1],
+          metre: 'm', meter: 'm', second: 's', kilogram: 'kg', gram: 'g', newton: 'N', joule: 'J', watt: 'W',
+          pascal: 'Pa', kelvin: 'K', ampere: 'A', volt: 'V', ohm: '\\Omega', hertz: 'Hz', mole: 'mol', coulomb: 'C',
+          litre: 'L', liter: 'L', radian: 'rad', celsius: '{}^{\\circ}\\mathrm{C}', degreeCelsius: '{}^{\\circ}\\mathrm{C}',
+          per: '/', squared: '^{2}', cubed: '^{3}',
+          kilo: 'k', mega: 'M', giga: 'G', milli: 'm', micro: '\\mu ', nano: 'n', centi: 'c'
         }
       },
+      loader: { load: ['[tex]/noerrors', '[tex]/mhchem', '[tex]/boldsymbol', '[tex]/html', '[tex]/textmacros', '[tex]/textcomp', '[tex]/color', '[tex]/colortbl', '[tex]/mathtools', '[tex]/physics', '[tex]/cancel', '[tex]/enclose', '[tex]/unicode', '[tex]/braket', '[tex]/bbox', '[tex]/cases', '[tex]/centernot', '[tex]/empheq', '[tex]/extpfeil', '[tex]/gensymb', '[tex]/upgreek', '[tex]/verb', '[tex]/action', '[tex]/amscd', '[tex]/bussproofs', '[tex]/tagformat', '[tex]/setoptions', 'ui/safe'] },
       options: {
         skipHtmlTags: ['script','noscript','style','textarea','pre','code'],
         ignoreHtmlClass: 'no-mathjax',
@@ -106,8 +111,21 @@
       startup: { typeset: false }
     };
   </script>
+  <script>
+    /* Capture the browser's install prompt as early as possible — it can
+       fire before the deferred app.js has run. app.js picks it up. */
+    window.addEventListener('beforeinstallprompt', function (e) {
+      e.preventDefault();
+      window.__pwaInstallPrompt = e;
+      try { window.dispatchEvent(new Event('rankernode:pwa-ready')); } catch (_) {}
+    });
+    if (/RankerNodeApp\//.test(navigator.userAgent || '')) document.documentElement.classList.add('aero-in-app');
+    if (/RankerNodeApp\/\S+ Store\/Play/.test(navigator.userAgent || '')) document.documentElement.classList.add('aero-play-store');
+  </script>
 </head>
 <body>
+  <!-- ⭐ Indian tricolour, drawn once and reused by every "Made in India" badge -->
+  <svg width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true" focusable="false"><symbol id="aeroFlagIN" viewBox="0 0 30 20"><rect width="30" height="20" fill="#fff"/><rect width="30" height="6.67" fill="#FF9933"/><rect y="13.33" width="30" height="6.67" fill="#138808"/><circle cx="15" cy="10" r="2.75" fill="none" stroke="#000080" stroke-width=".42"/><path d="M15 10L17.45 10.00 M15 10L17.37 10.63 M15 10L17.12 11.22 M15 10L16.73 11.73 M15 10L16.23 12.12 M15 10L15.63 12.37 M15 10L15.00 12.45 M15 10L14.37 12.37 M15 10L13.78 12.12 M15 10L13.27 11.73 M15 10L12.88 11.22 M15 10L12.63 10.63 M15 10L12.55 10.00 M15 10L12.63 9.37 M15 10L12.88 8.78 M15 10L13.27 8.27 M15 10L13.77 7.88 M15 10L14.37 7.63 M15 10L15.00 7.55 M15 10L15.63 7.63 M15 10L16.23 7.88 M15 10L16.73 8.27 M15 10L17.12 8.77 M15 10L17.37 9.37" stroke="#000080" stroke-width=".22"/><circle cx="15" cy="10" r=".55" fill="#000080"/></symbol></svg>
   <div id="app">
     <header id="appHeader" style="display:none;">
       <!-- UPDATED: Added onclick and cursor style to make the logo act as a Home button -->
@@ -178,6 +196,16 @@
           </span>
         </button>
 
+        <!-- ⬇️ Get App — same pill as the landing-page navbar (logic in app.js) -->
+        <button type="button" class="landing-install-pill app-install-pill" id="appInstallPill"
+                onclick="appInstallClick(event)"
+                title="Install RankerNode App"
+                aria-label="Install RankerNode App">
+          <i class="fas fa-download"></i>
+          <span class="landing-install-pill-text">Get App</span>
+          <span class="landing-install-pill-dot" id="appInstallPillDot" style="display:none;"></span>
+        </button>
+
         <span class="streak-badge" id="streakBadge" style="display:none;" title="Daily streak">
           <i class="fas fa-fire"></i> <span id="streakCount">0</span>
         </span>
@@ -212,53 +240,118 @@
 
     <main class="main-content">
 
-      <!-- LOGIN -->
+      <!-- LOGIN — ⭐ redesigned 2026-10-08 (split layout, OTP for staff) -->
       <section id="loginView" class="view active">
-        <div class="login-card">
-          <div class="login-icon"><i class="fas fa-graduation-cap"></i></div>
-          <h2>RankerNode</h2>
-          <p class="sub">Sign in to access course materials</p>
-          <div class="login-role-toggle">
-            <button class="active" data-role="student" onclick="setLoginRole('student')">
-              <i class="fas fa-user-graduate"></i> Student
-            </button>
-            <button data-role="admin" onclick="setLoginRole('admin')">
-              <i class="fas fa-user-cog"></i> Admin
-            </button>
-          </div>
-          <form id="loginForm" onsubmit="handleLogin(event)">
-            <div class="form-group">
-              <label>Username</label>
-              <div class="input-wrap"><i class="fas fa-user"></i>
-                <input type="text" id="loginUsername" placeholder="Enter your username" required>
+        <div class="login-card lg-shell">
+          <!-- brand panel (left on desktop, compact strip on phones) -->
+          <aside class="lg-brand" aria-hidden="true">
+            <svg class="lg-orbit" viewBox="0 0 400 400" focusable="false">
+              <circle cx="200" cy="200" r="120" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="3 7"/>
+              <circle cx="200" cy="200" r="175" fill="none" stroke="currentColor" stroke-width="1" opacity=".55"/>
+              <ellipse cx="200" cy="200" rx="190" ry="70" fill="none" stroke="currentColor" stroke-width="1" opacity=".35" transform="rotate(-24 200 200)"/>
+              <circle class="lg-sat" cx="375" cy="200" r="5" fill="currentColor"/>
+            </svg>
+            <div class="lg-brand-top">
+              <div class="login-icon lg-mark" aria-hidden="true"><svg viewBox="0 0 512 512" width="100%" height="100%" focusable="false"><path fill="#0EA5E9" d="M232 448 L352 236 L472 448 Z"/><path fill="#4F46E5" d="M40 448 L216 150 L392 448 Z"/><path fill="#FFFFFF" d="M216 150 L264 231 L240 218 L216 242 L192 218 L168 231 Z"/><path fill="none" stroke="#F59E0B" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" d="M164 104 L216 56 L268 104"/></svg></div>
+              <div>
+                <strong class="lg-brand-name">RankerNode</strong>
+                <span class="lg-brand-tag">Learn. Practice. Rank.</span>
               </div>
             </div>
-            <div class="form-group">
-              <label>Password</label>
-              <div class="input-wrap"><i class="fas fa-lock"></i>
-                <input type="password" id="loginPassword" placeholder="Enter your password" required>
-              </div>
+            <div class="lg-brand-body">
+              <h3>Lectures, notes, DPPs and tests for JEE, NEET and Class 11–12 — in one place.</h3>
+              <ul class="lg-points">
+                <li><i class="fas fa-layer-group"></i><span><strong>Course materials</strong> — slides, notes, papers and video playlists.</span></li>
+                <li><i class="fas fa-stopwatch"></i><span><strong>Timed quizzes</strong> with instant scores and progress tracking.</span></li>
+                <li><i class="fas fa-chalkboard-user"></i><span><strong>Professors publish directly</strong> to the courses they teach.</span></li>
+              </ul>
             </div>
-            <button type="submit" class="btn btn-primary btn-block btn-lg">
-              <i class="fas fa-sign-in-alt"></i> Sign In
-            </button>
-          </form>
-          <div class="login-footer" style="display:flex;flex-direction:column;gap:10px;align-items:center;">
-            <a href="#" onclick="showRegisterModal();return false;" class="link-inline">
-              <i class="fas fa-user-plus"></i> Register as Student
-            </a>
-            <a href="#" onclick="showForgotUsernameModal();return false;" class="link-inline">
-              <i class="fas fa-user-question"></i> Forgot Username?
-            </a>
-            <a href="#" onclick="showForgotPasswordModal();return false;" class="link-inline">
-              <i class="fas fa-key"></i> Forgot Password?
-            </a>
-                        <a href="#" onclick="openAlumniSubmitModal();return false;" class="link-inline" style="color:var(--gold-600);">
-              <i class="fas fa-graduation-cap"></i> Are you an alumni? Share your journey
-            </a>
+            <div class="lg-brand-foot"><i class="fas fa-shield-halved"></i> Staff sign-ins are protected by a one-time email code.</div>
+          </aside>
+
+          <!-- form panel -->
+          <div class="lg-panel">
+            <div class="lg-head">
+              <h2 id="loginHeading">Welcome back</h2>
+              <p class="sub" id="loginSub">Sign in to continue to your courses.</p>
+            </div>
+
+            <div class="login-role-toggle" role="tablist" aria-label="Sign in as">
+              <span class="lg-role-pill" aria-hidden="true"></span>
+              <button type="button" class="active" data-role="student" role="tab" aria-selected="true" onclick="setLoginRole('student')">
+                <i class="fas fa-user-graduate"></i> <span>Student</span>
+              </button>
+              <button type="button" data-role="professor" role="tab" aria-selected="false" onclick="setLoginRole('professor')">
+                <i class="fas fa-chalkboard-user"></i> <span>Professor</span>
+              </button>
+              <button type="button" data-role="admin" role="tab" aria-selected="false" onclick="setLoginRole('admin')">
+                <i class="fas fa-user-gear"></i> <span>Admin</span>
+              </button>
+            </div>
+
+            <form id="loginForm" onsubmit="handleLogin(event)" autocomplete="on">
+              <div class="form-group">
+                <label for="loginUsername">Username</label>
+                <div class="input-wrap"><i class="fas fa-user"></i>
+                  <input type="text" id="loginUsername" placeholder="Enter your username" autocomplete="username"
+                         autocapitalize="none" spellcheck="false" required>
+                </div>
+              </div>
+              <div class="form-group">
+                <div class="lg-label-row">
+                  <label for="loginPassword">Password</label>
+                  <a href="#" class="lg-mini-link" onclick="showForgotPasswordModal();return false;">Forgot password?</a>
+                </div>
+                <div class="input-wrap lg-pass-wrap"><i class="fas fa-lock"></i>
+                  <input type="password" id="loginPassword" placeholder="Enter your password" autocomplete="current-password" required>
+                  <button type="button" class="lg-eye" id="loginEyeBtn" aria-label="Show password" title="Show password" onclick="toggleLoginPasswordVisibility()">
+                    <i class="fas fa-eye"></i>
+                  </button>
+                </div>
+                <span class="lg-caps" id="loginCapsHint" hidden><i class="fas fa-triangle-exclamation"></i> Caps Lock is on</span>
+              </div>
+
+              <div class="lg-otp-note" id="loginOtpNote" hidden>
+                <i class="fas fa-envelope-circle-check"></i>
+                <span id="loginOtpNoteText">After your password, we'll email a 6-digit code to your registered address.</span>
+              </div>
+
+              <button type="submit" class="btn btn-primary btn-block btn-lg lg-submit">
+                <i class="fas fa-sign-in-alt"></i> Sign In
+              </button>
+              <div class="lg-forgot-row">
+                <a href="#" class="lg-mini-link" onclick="showForgotUsernameModal();return false;"><i class="fas fa-user-question"></i> Forgot username?</a>
+              </div>
+            </form>
+
+            <div class="login-footer lg-footer">
+              <div class="lg-divider"><span>New to RankerNode?</span></div>
+              <div class="lg-cta-row">
+                <button type="button" class="btn btn-outline lg-cta" onclick="showRegisterModal()">
+                  <i class="fas fa-user-plus"></i> Student sign-up
+                </button>
+                <button type="button" class="btn btn-outline lg-cta" onclick="showProfessorRegisterModal()">
+                  <i class="fas fa-chalkboard-user"></i> Apply as professor
+                </button>
+              </div>
+              <div class="lg-links">
+                <a href="#/courses" onclick="aeroStartGuestBrowse();return false;" class="link-inline">
+                  <i class="fas fa-compass"></i> Explore courses first
+                </a>
+                <a href="#" onclick="openAlumniSubmitModal();return false;" class="link-inline lg-alumni">
+                  <i class="fas fa-graduation-cap"></i> Alumni? Share your journey
+                </a>
+              </div>
+              <div class="lg-made-in"><span class="mii mii-login" title="Made in India"><span class="mii-text">Made in India</span><svg class="mii-flag" viewBox="0 0 30 20" role="img" aria-label="Flag of India"><use href="#aeroFlagIN"/></svg></span></div>
+            </div>
           </div>
         </div>
       </section>
+      <!-- ⭐ PROFESSOR DASHBOARD (content built by app.js → renderProfessorDashboard) -->
+      <section id="professorView" class="view">
+        <div id="professorContent"></div>
+      </section>
+
       <!-- ============================================================
            STUDENT — AI DOUBT SOLVER (NEW HOME PAGE)
            ============================================================ -->
@@ -349,7 +442,7 @@
 
       <!-- LOCATE AND REPLACE THE "ABOUT THE FOUNDER" SECTION IN index.html -->
 <!-- LOCATE AND REPLACE THE "ABOUT THE FOUNDER" SECTION IN index.html -->
-<section class="about-owner section-card" id="aboutOwnerSection">
+<section class="about-owner section-card" id="aboutOwnerSection" style="display:none;">
   <h2><i class="fas fa-user-tie"></i> About the Founder</h2>
   <div id="ownerProfileContainer"></div>
 </section>
@@ -443,6 +536,9 @@
           <button class="admin-tab" data-tab="professors" onclick="switchAdminTab('professors')">
             <i class="fas fa-user-tie"></i> Faculty
           </button>
+          <button class="admin-tab" data-tab="profaccess" onclick="switchAdminTab('profaccess')">
+            <i class="fas fa-user-shield"></i> Professor Access <span class="nav-count" id="profAccessBadge" style="display:none;">0</span>
+          </button>
           <button class="admin-tab" data-tab="students" onclick="switchAdminTab('students')">
             <i class="fas fa-user-graduate"></i> Students
           </button>
@@ -480,7 +576,7 @@
             <i class="fas fa-bullhorn"></i> Login Pop-up
           </button>
           <button class="admin-tab" data-tab="mobileapp" onclick="switchAdminTab('mobileapp')">
-            <i class="fas fa-mobile-screen"></i> Mobile App
+            <i class="fas fa-mobile-screen"></i> Apps
           </button>
         </div>
 
@@ -600,6 +696,7 @@
           <div id="adminProfessorList"></div>
         </div>
 
+        <div id="adminTabProfaccess" class="admin-tab-content"></div>
         <div id="adminTabStudents" class="admin-tab-content">
           <div class="tab-toolbar">
             <div class="tab-toolbar-text">
@@ -817,6 +914,11 @@
         <div id="studentSavedList"></div>
       </section>
 
+      <!-- ⭐ STUDENT PRACTICE (learning.js) -->
+      <section id="studentPracticeView" class="view">
+        <div id="practiceContent"></div>
+      </section>
+
       <!-- STUDENT ANALYTICS -->
       <section id="studentAnalyticsView" class="view">
         <div class="dash-header">
@@ -850,7 +952,7 @@
     </main>
 
     <footer class="app-footer" id="appFooter" style="display:none;">
-      &copy; 2026 RankerNode
+      <span>&copy; 2026 RankerNode</span><span class="app-footer-sep" aria-hidden="true">·</span><a href="/privacy" target="_blank" rel="noopener" style="color:inherit;">Privacy</a><span class="app-footer-sep" aria-hidden="true">·</span><span class="mii mii-footer" title="Made in India"><span class="mii-text">Made in India</span><svg class="mii-flag" viewBox="0 0 30 20" role="img" aria-label="Flag of India"><use href="#aeroFlagIN"/></svg></span>
     </footer>
   </div>
 
@@ -879,34 +981,73 @@
     </div>
   </div>
 
-  <!-- ============ SHARED OTP MODAL ============ -->
-  <div class="modal-overlay" id="otpVerificationModal">
-    <div class="modal-box" style="max-width:460px;">
-      <div style="text-align:center; margin-bottom:14px;">
-        <div style="display:inline-flex;align-items:center;justify-content:center;
-                    width:64px;height:64px;border-radius:50%;
-                    background:linear-gradient(135deg,var(--brand-600),var(--accent-500));
-                    color:#fff;font-size:26px;
-                    box-shadow:0 10px 26px rgba(99,102,241,.35);">
-          <i class="fas fa-shield-halved"></i>
+  <!-- ⭐ Professor Registration Modal -->
+  <div class="modal-overlay" id="professorRegisterModal">
+    <div class="modal-box prof-reg-box">
+      <h3><i class="fas fa-chalkboard-user"></i> Register as a Professor</h3>
+      <p class="modal-sub">Your account is reviewed by the RankerNode admin before you can sign in. Once approved, you can request access to the courses you teach.</p>
+      <form id="professorRegisterForm" onsubmit="registerProfessor(event)" autocomplete="on">
+        <div class="prof-reg-section"><i class="fas fa-user"></i> Basic details</div>
+        <div class="prof-reg-grid">
+          <div class="form-group"><label>Full Name *</label><input type="text" id="prRegFullName" placeholder="e.g. Dr. Asha Rao" required maxlength="120" autocomplete="name"></div>
+          <div class="form-group"><label>Username *</label><input type="text" id="prRegUsername" placeholder="e.g. asha.rao" required maxlength="40" autocomplete="username"></div>
+          <div class="form-group"><label>Official Email *</label><input type="email" id="prRegEmail" placeholder="name@institute.ac.in" required autocomplete="email"></div>
+          <div class="form-group"><label>Contact Number *</label><input type="tel" id="prRegPhone" placeholder="+91 98765 43210" required autocomplete="tel"></div>
+          <div class="form-group"><label>Password *</label><input type="password" id="prRegPassword" placeholder="At least 8 characters" required minlength="8" autocomplete="new-password"></div>
+          <div class="form-group"><label>Confirm Password *</label><input type="password" id="prRegPassword2" placeholder="Repeat the password" required minlength="8" autocomplete="new-password"></div>
         </div>
-      </div>
+        <div class="prof-reg-section"><i class="fas fa-briefcase"></i> Professional details</div>
+        <div class="prof-reg-grid">
+          <div class="form-group"><label>Designation *</label>
+            <select id="prRegDesignation" required>
+              <option value="">Select…</option>
+              <option>Professor</option><option>Associate Professor</option><option>Assistant Professor</option>
+              <option>Visiting / Guest Faculty</option><option>Adjunct Faculty</option><option>Lecturer</option>
+              <option>Teaching Assistant</option><option>Industry Expert</option><option>Other</option>
+            </select>
+          </div>
+          <div class="form-group"><label>Department *</label><input type="text" id="prRegDepartment" placeholder="e.g. Physics" required maxlength="120"></div>
+          <div class="form-group"><label>Institution / Organisation *</label><input type="text" id="prRegInstitution" placeholder="e.g. RankerNode Academy, Kota" required maxlength="160" autocomplete="organization"></div>
+          <div class="form-group"><label>Highest Qualification</label><input type="text" id="prRegQualification" placeholder="e.g. M.Sc. Physics" maxlength="120"></div>
+          <div class="form-group"><label>Specialization / Subjects</label><input type="text" id="prRegSpecialization" placeholder="e.g. Mechanics, Electrostatics" maxlength="160"></div>
+          <div class="form-group"><label>Teaching Experience (years)</label><input type="number" id="prRegExperience" min="0" max="70" step="1" placeholder="0"></div>
+          <div class="form-group"><label>Employee / Faculty ID</label><input type="text" id="prRegEmployeeId" placeholder="Optional — helps the admin verify you" maxlength="60"></div>
+          <div class="form-group"><label>Faculty Profile / LinkedIn URL</label><input type="url" id="prRegProfileUrl" placeholder="https://…" maxlength="300"></div>
+        </div>
+        <div class="form-group"><label>Short Bio</label><textarea id="prRegBio" rows="3" maxlength="1000" placeholder="Courses you teach, research areas…"></textarea></div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-outline" onclick="closeModal('professorRegisterModal')">Cancel</button>
+          <button type="submit" class="btn btn-primary"><i class="fas fa-paper-plane"></i> Verify email &amp; submit</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ SHARED OTP MODAL — ⭐ 6-box code entry (2026-10-08) ============ -->
+  <div class="modal-overlay" id="otpVerificationModal">
+    <div class="modal-box otp-box" style="max-width:440px;">
+      <div class="otp-badge"><i class="fas fa-shield-halved"></i></div>
       <h3 id="otpModalTitle" style="text-align:center;justify-content:center;">Verify OTP</h3>
       <p class="modal-sub" id="otpModalSub" style="text-align:center;">Enter the code we sent you.</p>
 
-      <div class="form-group">
-        <label style="text-align:center;display:block;">6-Digit OTP</label>
-        <input type="text" id="otpModalInput" placeholder="• • • • • •"
+      <div class="form-group otp-group">
+        <label class="otp-label" for="otpModalInput">6-digit code</label>
+        <!-- the real input (kept for every OTP flow) sits invisibly on top of the boxes -->
+        <div class="otp-field">
+        <input type="text" id="otpModalInput" class="otp-real-input" placeholder="• • • • • •"
                inputmode="numeric" autocomplete="one-time-code" maxlength="6"
-               oninput="this.value = this.value.replace(/[^0-9]/g, '')"
-               onkeydown="if(event.key==='Enter'){event.preventDefault();submitOtpVerification();}"
-               style="text-align:center;font-size:24px;letter-spacing:10px;font-weight:800;
-                      padding:16px;font-family:'Courier New',monospace;border-radius:12px;">
-        <span class="hint" style="text-align:center;display:block;margin-top:8px;">
+               oninput="this.value = this.value.replace(/[^0-9]/g, '').slice(0, 6); otpSyncBoxesFromInput();"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();submitOtpVerification();}">
+        <div class="otp-cells" id="otpCells" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span><span></span>
+        </div>
+        </div>
+        <span class="hint otp-expiry" id="otpExpiryText">
           <i class="fas fa-clock"></i> Code expires in 10 minutes.
         </span>
-        <div id="otpResendRow" style="display:none;text-align:center;margin-top:10px;">
-          <button type="button" class="link-inline" onclick="resendOtpForCurrentContext()" id="otpResendBtn" style="background:none;border:none;cursor:pointer;">
+        <div id="otpResendRow" class="otp-resend-row" style="display:none;">
+          <span class="otp-resend-wait" id="otpResendWait"></span>
+          <button type="button" class="link-inline" onclick="resendOtpForCurrentContext()" id="otpResendBtn">
             <i class="fas fa-rotate-right"></i> Resend OTP
           </button>
         </div>
@@ -1065,7 +1206,7 @@
         <div class="settings-row settings-row--stacked">
           <div class="settings-row-text">
             <strong>Theme</strong>
-            <span id="nightModeHint">The sun/moon switch in the top bar flips Light ↔ dark. Pick which dark style it uses here.</span>
+            <span id="nightModeHint">The sun/moon switch in the top bar flips light ↔ dark and remembers the styles you pick here — try the new Aurora theme.</span>
           </div>
         </div>
 
@@ -1075,6 +1216,11 @@
                   aria-checked="false" onclick="setThemeFromSettings('light')">
             <i class="fas fa-sun"></i> Light
           </button>
+          <button type="button" class="theme-choice theme-choice-aurora" data-theme-choice="aurora" role="radio"
+                  aria-checked="false" onclick="setThemeFromSettings('aurora')">
+            <i class="fas fa-wand-magic-sparkles"></i> Aurora
+            <span class="tc-new">New</span>
+          </button>
           <button type="button" class="theme-choice" data-theme-choice="dim" role="radio"
                   aria-checked="false" onclick="setThemeFromSettings('dim')">
             <i class="fas fa-circle-half-stroke"></i> Dim
@@ -1082,6 +1228,11 @@
           <button type="button" class="theme-choice" data-theme-choice="dark" role="radio"
                   aria-checked="false" onclick="setThemeFromSettings('dark')">
             <i class="fas fa-moon"></i> Night
+          </button>
+          <button type="button" class="theme-choice theme-choice-space" data-theme-choice="space" role="radio"
+                  aria-checked="false" onclick="setThemeFromSettings('space')">
+            <span class="tc-stars" aria-hidden="true"></span>
+            <i class="fas fa-user-astronaut"></i> Space
           </button>
         </div>
       </div>
@@ -1099,6 +1250,25 @@
                   onclick="toggleExpandBios()">
             <span class="switch-track"><span class="switch-thumb"></span></span>
           </button>
+        </div>
+      </div>
+
+      <!-- ⭐ 2026-10-12 — privacy + account deletion (Google Play requirement) -->
+      <div class="settings-section" id="settingsAccountSection" hidden>
+        <h4><i class="fas fa-user-shield"></i> Account</h4>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <strong>Privacy policy</strong>
+            <span>What RankerNode collects, why, and your choices.</span>
+          </div>
+          <a class="btn btn-outline btn-sm" href="/privacy" target="_blank" rel="noopener">Open</a>
+        </div>
+        <div class="settings-row" id="settingsDeleteRow">
+          <div class="settings-row-text">
+            <strong>Delete my account</strong>
+            <span>Permanently removes your account, progress, notes and purchases.</span>
+          </div>
+          <button type="button" class="btn btn-danger btn-sm" onclick="openDeleteAccountDialog()">Delete</button>
         </div>
       </div>
 
@@ -1724,23 +1894,33 @@
     const PDFJS_LIB_URL    = '/vendor/pdfjs/pdf.min.js';
     const PDFJS_WORKER_URL = '/vendor/pdfjs/pdf.worker.min.js';
 
+    /* ⚡ One shared in-flight load: hover warm-up, idle warm-up and the
+       click itself used to each append their own <script> tag, so the
+       300 KB library could be parsed and run two or three times. */
+    let _pdfjsLoading = null;
     window.loadPDFJS = function () {
-      return new Promise((resolve, reject) => {
-        if (window.pdfjsLib) {
-          if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
-            window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
-          }
-          return resolve();
+      if (window.pdfjsLib) {
+        if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
         }
+        return Promise.resolve();
+      }
+      if (_pdfjsLoading) return _pdfjsLoading;
+      _pdfjsLoading = new Promise((resolve, reject) => {
         const s = document.createElement('script');
         s.src = PDFJS_LIB_URL;
         s.onload = () => {
           window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
           resolve();
         };
-        s.onerror = reject;
+        s.onerror = (err) => {
+          _pdfjsLoading = null;          // allow a retry on the next click
+          try { s.remove(); } catch (_) {}
+          reject(err);
+        };
         document.head.appendChild(s);
       });
+      return _pdfjsLoading;
     };
     /* MathJax — loads ONLY when a quiz / AI answer needs it */
     window.loadMathJax = function () {
@@ -1762,7 +1942,7 @@
 
         window.__mathjaxLoaderPromise = new Promise((res, rej) => {
           const s = document.createElement('script');
-          s.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
+          s.src = 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js';
           s.async = true;
 
           s.onload = () => {
@@ -1791,11 +1971,20 @@
   <!-- Core app scripts — always loaded, deferred -->
   <!-- ⚡ Version query busts HTTP cache on every deploy.
        Just bump the number (v=29, v=30...) to force fresh files. -->
- 	<script src="media-viewer.js?v=138" defer></script>
-  <script src="content-shield.js?v=138" defer></script>
+ 	<script src="media-viewer.js?v=145" defer></script>
+  <script src="content-shield.js?v=145" defer></script>
   <script src="login-popup.js?v=1" defer></script>
-  <script src="document-viewer.js?v=138" defer></script>
-  <script src="app.js?v=138" defer></script>
+  <script src="document-viewer.js?v=145" defer></script>
+  <!-- ⭐ LaTeX renderer for quizzes (text-mode LaTeX + real TeX diagrams) -->
+  <script src="tex-render.js?v=1" defer></script>
+  <script src="app.js?v=145" defer></script>
+  <!-- ⭐ Practice · mistakes · daily challenge · question bank · test series -->
+  <script src="learning.js?v=1" defer></script>
+  <!-- ⭐ Loaded on demand by app.js (My Notes) — the server stamps the ?v= hashes -->
+  <template id="aeroLazyAssets">
+    <link rel="stylesheet" data-asset="notes-css" href="notes.css?v=1">
+    <script data-asset="notes-js" src="notes.js?v=1"></script>
+  </template>
   <!-- Service worker registration -->
 <script>
   if ('serviceWorker' in navigator) {
@@ -1803,7 +1992,7 @@
       // updateViaCache:'none' forces the browser to fetch the SW script
       // from the network on every update check — critical for iOS/Safari
       // which otherwise uses an HTTP-cached copy.
-      navigator.serviceWorker.register('/sw.js?v=138', { updateViaCache: 'none' })
+      navigator.serviceWorker.register('/sw.js?v=145', { updateViaCache: 'none' })
         .then(reg => {
           console.log('[SW] registered:', reg.scope);
 

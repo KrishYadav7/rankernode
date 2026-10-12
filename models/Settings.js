@@ -2,9 +2,9 @@ const mongoose = require('mongoose');
 
 /* ---------- Organization profile (Owner / Head Owner) ---------- */
 const ownerProfileSchema = new mongoose.Schema({
-  name:  { type: String, default: 'Krish Yadav' },
-  title: { type: String, default: 'Founder & Course Director' },
-  role:  { type: String, default: 'Founder' },
+  name:  { type: String, default: '' },     // ⭐ no built-in founder — only what the admin saves
+  title: { type: String, default: '' },
+  role:  { type: String, default: '' },
   bio:   { type: String, default: '' },
   email: { type: String, default: '' },
   phone: { type: String, default: '' },
@@ -177,10 +177,10 @@ const settingsSchema = new mongoose.Schema({
   ownerProfile: {
     type: ownerProfileSchema,
     default: () => ({
-      name:  'Kana Ram Yadav',
-      title: 'Co-founder',
+      name:  '',
+      title: '',
       role:  '',
-      bio:   'Academic achiever and experienced educator',
+      bio:   '',
       email: '',
       phone: '',
       photo: '',

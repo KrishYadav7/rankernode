@@ -36,3 +36,7 @@ android-app/.idea/
 node_modules/
 uploads/
 android-signing/
+
+# Desktop app (Windows / macOS) — build output
+desktop-app/dist/
+desktop-app/selftest-out/

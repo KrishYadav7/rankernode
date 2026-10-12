@@ -11,6 +11,12 @@ if (!appUrl.startsWith('https://')) {
     throw new GradleException('Set APP_URL=https://your-domain/app in android-app/app.properties')
 }
 def appHost = new URI(appUrl).host
+/* first page on launch — the landing page (same site as APP_URL) */
+def startUrl = (System.getenv('START_URL') ?: appProps.getProperty('START_URL', '')).trim()
+if (!startUrl) startUrl = "https://${appHost}/"
+if (!startUrl.startsWith('https://') || new URI(startUrl).host != appHost) {
+    throw new GradleException('START_URL must be an https page on the same site as APP_URL')
+}
 
 /* ---- version: the cloud build passes the build number ---- */
 def vCode = (System.getenv('VERSION_CODE') ?: '1').toInteger()
@@ -18,20 +24,36 @@ def vName = System.getenv('VERSION_NAME') ?: "1.0.${vCode}"
 
 android {
     namespace 'com.altitudeacademy.app'
-    compileSdk 34
+    compileSdk 36
 
     defaultConfig {
         applicationId 'com.altitudeacademy.app'
         minSdk 24
-        targetSdk 34
+        targetSdk 36
         versionCode vCode
         versionName vName
         buildConfigField 'String', 'APP_URL', "\"${appUrl}\""
+        buildConfigField 'String', 'START_URL', "\"${startUrl}\""
         manifestPlaceholders = [appHost: appHost]
     }
 
     buildFeatures {
         buildConfig true
+    }
+
+    /* Two versions of the same app (same package and signing key):
+       • direct — the APK students download from rankernode.example (offers its own updates)
+       • play   — the Google Play build (.aab): updates only through Play, no buying in the app */
+    flavorDimensions 'store'
+    productFlavors {
+        direct {
+            dimension 'store'
+            buildConfigField 'String', 'STORE', '"direct"'
+        }
+        play {
+            dimension 'store'
+            buildConfigField 'String', 'STORE', '"play"'
+        }
     }
 
     signingConfigs {

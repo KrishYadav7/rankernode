@@ -1341,8 +1341,249 @@ class VideoPlayer {
   /* ============================================================
      PDF VIEWER — with hardened capture deterrence
      ============================================================ */
+  /* ============================================================
+     ⚡ PDF LOADING PERFORMANCE (2026-10-05)
+     ------------------------------------------------------------
+     • ONE PDF.js worker for the whole page. Before, every open
+       started a new Web Worker (≈1 MB script to compile) and the
+       old one was never stopped, so each PDF stayed in memory and
+       a half-downloaded PDF kept downloading after its viewer was
+       closed — the next PDF opened slower and slower.
+     • The PDF goes straight to PDF.js (no extra probe request
+       first). PDFs the server has re-packed for fast viewing are
+       loaded on demand with small Range requests, so page 1 shows
+       after a few hundred KB instead of the whole file.
+     • Pages far from the reader give their canvas memory back
+       and re-render when scrolled to again (long documents).
+     ============================================================ */
+  const PDF_RANGE_CHUNK       = 2 * 1024 * 1024;  // range size for ordinary PDFs (unchanged)
+  /* ⚡ 2026-10-12: 128 KB (was 256 / 512 KB). Before page 1, PDF.js reads many
+     small dictionaries; each one cost a whole chunk, i.e. 0.5–1.5 s per read on
+     a phone. Big reads (page pictures) are still fetched as one request —
+     PDF.js joins neighbouring chunks. Measured page 1 at 200 ms / 8 Mbit:
+     5.9 s → 4.2 s on a scattered 8 MB file. */
+  const PDF_FAST_RANGE_CHUNK  = 128 * 1024;   // range size for server-packed "fast view" PDFs
+  const PDF_LARGE_RANGE_CHUNK = 128 * 1024;   // range size for other large PDFs
+  const PDF_RANGES_ONLY_BYTES = 3 * 1024 * 1024;  // above this, load only the pieces that are needed
+  const PDF_HEAD_BYTES        = 128 * 1024;   // start of the file, fetched at open (packed page dictionaries live here)
+  const PDF_TAIL_BYTES        = 64 * 1024;    // end of the file, fetched at open in parallel (the cross-reference index)
+  const PDF_MAX_DPR           = 2;            // 2× is already sharp; 3× phones paid 2.25× the work
+  const PDF_MAX_CANVAS_PIXELS = 12e6;         // ≈ 48 MB of pixels per page canvas
+  const PDF_KEEP_ALL_PAGES    = 12;           // documents this short keep every page
+  const PDF_RENDER_SETTLE_MS  = 120;          // page must stay in range this long before it renders
+  /* ⚡ PROGRESSIVE RENDERING (2026-10-07)
+     Phase 1 — the first PDF_PRIORITY_PAGES pages are drawn straight
+               away (page 1 first; the loader hides as soon as it is
+               on screen).
+     Phase 2 — the rest of the document is processed in the background,
+               one page at a time, in the browser's idle time, starting
+               just after the page being read:
+                 • short documents (≤ PDF_KEEP_ALL_PAGES): every page is
+                   fully drawn (canvas + selectable text) in the background;
+                 • long documents: every page gets a light JPEG "snapshot"
+                   so it is visible the instant it is scrolled to; the
+                   sharp canvas + text layer replace it when the reader
+                   stops on it. Snapshots stay within a memory budget.
+               Background work pauses while the reader scrolls, while a
+               visible page is being drawn, in presentation mode and when
+               the tab is hidden — the page on screen always comes first. */
+  const PDF_PRIORITY_PAGES    = 3;            // drawn immediately on open
+  const PDF_BG_START_DELAY_MS = 600;          // let the first pages settle first
+  const PDF_BG_SCROLL_QUIET_MS = 350;         // pause while the reader is scrolling
+  const PDF_SNAP_MAX_PIXELS   = 3.0e6;        // ≈ one A4 page at ~175 % zoom (was 2.2e6 — soft on laptops)
+  const PDF_SNAP_QUALITY      = 0.82;         // was 0.72 — snapshots are what a reopened PDF shows first
+  function _snapBudgetBytes() {
+    let mem = 0;
+    try { mem = Number(navigator.deviceMemory) || 0; } catch (_) {}
+    let coarse = false;
+    try { coarse = window.matchMedia('(pointer: coarse)').matches; } catch (_) {}
+    if (mem && mem <= 2) return 12 * 1048576;
+    if (coarse || (mem && mem <= 4)) return 32 * 1048576;
+    return 96 * 1048576;
+  }
+  const _idle = (fn, timeout) => (typeof window.requestIdleCallback === 'function')
+    ? window.requestIdleCallback(fn, { timeout: timeout || 1000 })
+    : setTimeout(fn, 16);
+
+  let _pdfvSessionSeq   = 0;
+  let _sharedPdfWorker  = null;
+
+  /* ============================================================
+     ⚡ ON-DEVICE PAGE CACHE (2026-10-07)
+     ------------------------------------------------------------
+     Pictures of pages already seen are kept in the browser's Cache
+     Storage, per student and per file version. Re-opening a PDF then
+     shows the whole document instantly — no waiting at all — while
+     the sharp pages are prepared behind the pictures.
+     • the newest 15 documents are kept, older ones are removed;
+     • cleared on log-out (AeroPdfCache.clearAll from app.js);
+     • nothing is shown unless the reader has full access.
+     ============================================================ */
+  const PAGE_CACHE = 'aero-pdf-pages-v1';
+  const PAGE_CACHE_DOCS = 15;
+  const PAGE_CACHE_INDEX = 'aero_pdf_cache_idx';
+  const _pcUrl = (key, name) => '/__aero_pages__/' + encodeURIComponent(key) + '/' + name;
+  const AeroPdfCache = {
+    ok() { try { return typeof caches !== 'undefined' && !!caches.open; } catch (_) { return false; } },
+    async load(key) {
+      if (!key || !this.ok()) return null;
+      try {
+        const c = await caches.open(PAGE_CACHE);
+        const mres = await c.match(_pcUrl(key, 'manifest.json'));
+        if (!mres) return null;
+        const manifest = await mres.json();
+        if (!manifest || !manifest.total || !manifest.pages) return null;
+        const pages = new Map();
+        await Promise.all(Object.keys(manifest.pages).map(async (n) => {
+          const r = await c.match(_pcUrl(key, 'p' + n + '.jpg'));
+          if (r) pages.set(Number(n), await r.blob());
+        }));
+        this.touch(key);
+        return { manifest, pages };
+      } catch (_) { return null; }
+    },
+    async put(key, n, blob) {
+      if (!key || !blob || !this.ok()) return;
+      try {
+        const c = await caches.open(PAGE_CACHE);
+        await c.put(_pcUrl(key, 'p' + n + '.jpg'), new Response(blob, { headers: { 'Content-Type': 'image/jpeg' } }));
+      } catch (_) {}
+    },
+    async putManifest(key, manifest) {
+      if (!key || !this.ok()) return;
+      try {
+        const c = await caches.open(PAGE_CACHE);
+        await c.put(_pcUrl(key, 'manifest.json'), new Response(JSON.stringify(manifest), { headers: { 'Content-Type': 'application/json' } }));
+        this.touch(key);
+      } catch (_) {}
+    },
+    touch(key) {
+      try {
+        let idx = JSON.parse(localStorage.getItem(PAGE_CACHE_INDEX) || '[]').filter(e => e && e.k !== key);
+        idx.unshift({ k: key, t: Date.now() });
+        const drop = idx.slice(PAGE_CACHE_DOCS);
+        idx = idx.slice(0, PAGE_CACHE_DOCS);
+        localStorage.setItem(PAGE_CACHE_INDEX, JSON.stringify(idx));
+        if (drop.length) this._drop(drop.map(e => e.k));
+      } catch (_) {}
+    },
+    async _drop(keys) {
+      try {
+        const c = await caches.open(PAGE_CACHE);
+        const prefixes = keys.map(k => _pcUrl(k, ''));
+        for (const req of await c.keys()) {
+          const u = new URL(req.url).pathname;
+          if (prefixes.some(pf => u.indexOf(pf) === 0)) await c.delete(req);
+        }
+      } catch (_) {}
+    },
+    async clearAll() {
+      try { localStorage.removeItem(PAGE_CACHE_INDEX); } catch (_) {}
+      try { if (this.ok()) await caches.delete(PAGE_CACHE); } catch (_) {}
+    }
+  };
+  window.AeroPdfCache = AeroPdfCache;
+
+  /* ============================================================
+     ⚡ RANGE TRANSPORT (2026-10-12)
+     ------------------------------------------------------------
+     Left to itself, PDF.js spends three round trips before it reads
+     any page: a full GET only to learn that the server supports byte
+     ranges (cancelled at once), then the start of the file, then the
+     end (where the cross-reference index is). At 200–300 ms per trip
+     on a phone that is close to a second of nothing.
+     Here the start and the end are asked for together, straight away,
+     in parallel. PDF.js gets the start as its initial data and the end
+     from memory; every further piece is a normal Range request.
+     Same-origin files only; anything unexpected returns null and the
+     caller uses the plain URL source exactly as before.
+     ============================================================ */
+  async function _rangeSource(src, signal) {
+    if (!src || !src.url || typeof fetch !== 'function' || !window.pdfjsLib ||
+        typeof pdfjsLib.PDFDataRangeTransport !== 'function') return null;
+    let href;
+    try {
+      const u = new URL(src.url, location.href);
+      if (u.origin !== location.origin) return null;
+      href = u.href;
+    } catch (_) { return null; }
+    const headers = src.httpHeaders || {};
+    const get = (range) => fetch(href, {
+      headers: Object.assign({ Range: range }, headers), credentials: 'same-origin', signal
+    });
+    const totalOf = (r) => { const m = /\/(\d+)\s*$/.exec(r.headers.get('Content-Range') || ''); return m ? Number(m[1]) : 0; };
+    const drop = (r) => { try { if (r && r.body) r.body.cancel(); } catch (_) {} };
+
+    const [h, t] = await Promise.all([get('bytes=0-' + (PDF_HEAD_BYTES - 1)), get('bytes=-' + PDF_TAIL_BYTES).catch(() => null)]);
+    if (h.status !== 206) { drop(h); drop(t); return null; }           // no ranges here — let PDF.js decide
+    const len = totalOf(h);
+    const head = new Uint8Array(await h.arrayBuffer());
+    if (!len || head.length > len) { drop(t); return null; }
+    if (head.length === len) { drop(t); return { data: head }; }     // small file: that was all of it
+    let tail = null;
+    if (t && t.status === 206 && totalOf(t) === len) tail = new Uint8Array(await t.arrayBuffer());
+    else drop(t);
+    const tailStart = tail ? len - tail.length : len;
+
+    const transport = new pdfjsLib.PDFDataRangeTransport(len, head);
+    let loaded = head.length + (tail ? tail.length : 0);
+    transport.requestDataRange = (begin, end) => {
+      if (tail && begin >= tailStart && end <= len) {
+        const piece = tail.slice(begin - tailStart, end - tailStart);
+        setTimeout(() => transport.onDataRange(begin, piece), 0);
+        return;
+      }
+      /* a dropped connection must not leave the page waiting forever */
+      const attempt = (n) => get('bytes=' + begin + '-' + (end - 1))
+        .then(r => { if (r.status !== 206) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+        .then(b => {
+          loaded += b.byteLength;
+          transport.onDataRange(begin, new Uint8Array(b));
+          transport.onDataProgress(Math.min(loaded, len), len);
+        })
+        .catch(err => {
+          if (signal.aborted || n >= 3) { if (!signal.aborted) console.warn('[PDFViewer] range failed:', err && err.message); return; }
+          setTimeout(() => { if (!signal.aborted) attempt(n + 1); }, 600 * (n + 1));
+        });
+      attempt(1);
+    };
+    return { range: transport };
+  }
+
+  function _getSharedPdfWorker() {
+    try {
+      if (!window.pdfjsLib || typeof pdfjsLib.PDFWorker !== 'function') return null;
+      if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.min.js';
+      }
+      if (!_sharedPdfWorker || _sharedPdfWorker.destroyed) {
+        _sharedPdfWorker = new pdfjsLib.PDFWorker({ name: 'aero-pdf' });
+      }
+      return _sharedPdfWorker;
+    } catch (e) {
+      _sharedPdfWorker = null;
+      return null;
+    }
+  }
+  /* Give a page's bitmap memory back right away (Safari in
+     particular holds on to detached canvases otherwise). */
+  function _freeCanvases(el) {
+    try {
+      el.querySelectorAll('canvas').forEach((c) => { c.width = 0; c.height = 0; });
+    } catch (e) {}
+  }
+  function _resetSharedPdfWorker() {
+    const w = _sharedPdfWorker;
+    _sharedPdfWorker = null;
+    try { if (w && !w.destroyed) w.destroy(); } catch (e) {}
+  }
+
   class PDFViewer {
     constructor() { this._init(); }
+
+    /* Start the PDF.js worker ahead of time (called when the student
+       hovers / touches a material). Safe to call many times. */
+    prewarmWorker() { _getSharedPdfWorker(); }
 
     _init() {
       this.active = false;
@@ -1376,6 +1617,23 @@ class VideoPlayer {
       this._saveProgressTimer = null;    // debounce handle for saves
       this._resumeApplied = false;       // guard: only scroll once per open
       this._paywallObserver = null;      // ⭐ scroll-triggered paywall observer
+      this._releaseObserver = null;      // ⚡ frees canvases of far-away pages
+      this._loadingTask = null;          // ⚡ PDF.js loading task (destroyed on close)
+      this._rangeAbort = null;           // ⚡ aborts the range transport's requests (see _rangeSource)
+      this._inflight = new Map();        // ⚡ page → in-progress render
+      this._renderTasks = new Map();     // ⚡ page → PDF.js render task (cancellable)
+      this._farPages = null;             // ⚡ pages outside the keep zone
+      this._bg = null;                   // ⚡ background renderer state
+      this._shell = false;               // ⚡ opened instantly, document not attached yet
+      this._shellToken = null;
+      this._instant = null;              // ⚡ pages already on screen from cache / posters
+      this._cacheKey = null;             // ⚡ on-device page cache key (full access only)
+      this._manifest = null;
+      this._manifestTimer = null;
+      this._userZoomed = false;
+      this._snaps = new Map();           // ⚡ page → { url, bytes, scale, w, h } light snapshots
+      this._snapBytes = 0;
+      this._lastScrollAt = 0;
 
       this._onSelectionChange = this._onSelectionChange.bind(this);
       this._onKeyDown = this._onKeyDown.bind(this);
@@ -1385,15 +1643,151 @@ class VideoPlayer {
       this._onVisibility = this._onVisibility.bind(this);
       this._onPageHide = this._onPageHide.bind(this);   // ⭐ new
     }
-    async open(opts) {
-      if (this.active) return;
+    /* ============================================================
+       ⚡ INSTANT OPEN (2026-10-07)
+       openShell() puts the reader on screen the moment a material is
+       tapped — before the server has answered — and fills it at once
+       with pages already on this device (cache) or the server's
+       instant posters. open() then attaches the real document to the
+       same reader (pass the returned token as opts.shellToken).
+       ============================================================ */
+    openShell(opts) {
+      if (this.active) return null;
+      opts = opts || {};
       this.active = true;
+      const session = ++_pdfvSessionSeq;
+      this._session = session;
+      this._shell = true;
+      this._shellToken = 'sh' + session + '-' + Date.now();
+      this.materialId = opts.materialId || 'doc';
+      this.courseId   = opts.courseId || null;
+      this.username   = opts.username || 'Student';
+      this.title      = opts.title || 'Document';
+      this.viewMode   = 'document';
+      this._cacheKey  = opts.cacheKey || null;
+      this._prevBodyOverflow = document.body.style.overflow;
+      this._buildUI();
+      this._loadHighlights();
+      this._loadReadingProgress();
+      const titleEl = this.modal.querySelector('#pdfvTitle');
+      if (titleEl) titleEl.textContent = this.title;
+      this.modal.classList.add('active');
+      document.body.style.overflow = 'hidden';
+      this.loaderEl.style.display = 'flex';
+      this._setLoaderText('Opening…');
+      this._fillInstant(opts, session);
+      return this._shellToken;
+    }
 
+    /* Cached pages first (whole document); otherwise the server posters */
+    async _fillInstant(opts, session) {
+      const live = () => this.active && this._session === session && !this.pdfDoc;
+      try {
+        const cached = this._cacheKey ? await AeroPdfCache.load(this._cacheKey) : null;
+        if (!live()) return;
+        if (cached && cached.pages.size) {
+          const m = cached.manifest;
+          this._manifest = m;
+          const sizes = new Map();
+          Object.keys(m.sizes || {}).forEach(n => sizes.set(Number(n), m.sizes[n]));
+          const w1 = (m.sizes && m.sizes[1] && m.sizes[1][0]) || 595;
+          this.scale = this._fitScale(w1);
+          cached.pages.forEach((blob, n) => {
+            const sz = sizes.get(n) || [w1, (m.sizes && m.sizes[1] && m.sizes[1][1]) || 842];
+            this._snaps.set(n, { url: URL.createObjectURL(blob), bytes: blob.size, scale: (m.pages[n] && m.pages[n].s) || this.scale,
+                                 w: sz[0], h: sz[1], persisted: true });
+            this._snapBytes += blob.size;
+          });
+          this._buildInstantLayout(m.total, sizes, 'cache');
+          return;
+        }
+        if (!opts.posterBase) return;
+        /* posters: page 1 first (fast), then 2 and 3 */
+        const one = await this._fetchPoster(opts.posterBase, 1);
+        if (!one || !live()) return;
+        this.scale = this._fitScale(one.w);
+        const sizes = new Map([[1, [one.w, one.h]]]);
+        this._snaps.set(1, { url: one.url, bytes: one.bytes, scale: this.scale, w: one.w, h: one.h, poster: true });
+        this._buildInstantLayout(one.total, sizes, 'poster');
+        for (const n of [2, 3]) {
+          if (n > one.total) break;
+          const p = await this._fetchPoster(opts.posterBase, n);
+          if (!p || !this.active || this._session !== session) break;
+          if (this._snaps.has(n)) { try { URL.revokeObjectURL(p.url); } catch (_) {} continue; }
+          this._snaps.set(n, { url: p.url, bytes: p.bytes, scale: this.scale, w: p.w, h: p.h, poster: true });
+          this._paintSnapshot(n);
+        }
+      } catch (_) { /* the normal loader simply stays */ }
+    }
+
+    async _fetchPoster(base, n) {
+      try {
+        const r = await fetch(base + n);
+        if (!r.ok) return null;
+        const total = parseInt(r.headers.get('X-Pdf-Pages'), 10) || 0;
+        const w = parseFloat(r.headers.get('X-Page-W')) || 0, h = parseFloat(r.headers.get('X-Page-H')) || 0;
+        if (!total || !w || !h) return null;
+        const blob = await r.blob();
+        return { url: URL.createObjectURL(blob), bytes: blob.size, total, w, h };
+      } catch (_) { return null; }
+    }
+
+    /* Page frames for the whole document, pictures where we have them */
+    _buildInstantLayout(total, sizes, source) {
+      if (!this.pagesEl || !total) return;
+      const s1 = sizes.get(1) || [595, 842];
+      this.pagesEl.innerHTML = '';
+      this.pageEls.clear();
+      const frag = document.createDocumentFragment();
+      for (let n = 1; n <= total; n++) {
+        const sz = sizes.get(n) || s1;
+        const el = document.createElement('div');
+        el.className = 'pdfv-page';
+        el.dataset.page = String(n);
+        el.style.width  = Math.round(sz[0] * this.scale) + 'px';
+        el.style.height = Math.round(sz[1] * this.scale) + 'px';
+        el.style.position = 'relative';
+        el.style.background = '#ffffff';
+        frag.appendChild(el);
+        this.pageEls.set(n, el);
+      }
+      this.pagesEl.appendChild(frag);
+      this._instant = { total, scale: this.scale, source };
+      this._snaps.forEach((_, n) => this._paintSnapshot(n));
+      const pc = this.modal && this.modal.querySelector('#pdfvPageCount');
+      if (pc) pc.textContent = total;
+      this._updateZoomLabel();
+      if (this._snaps.has(1) || (this._resumePage > 1 && this._snaps.has(this._resumePage))) {
+        this.loaderEl.style.display = 'none';
+      }
+      try { this._applyReadingResume(); } catch (_) {}
+    }
+
+    /* Page width that fits the screen (phones), never above 120 % */
+    _fitScale(widthPt) {
+      const bw = (this.bodyEl && this.bodyEl.clientWidth) || window.innerWidth || 800;
+      const gutter = bw < 760 ? 16 : 60;
+      const fit = (bw - gutter) / (widthPt || 595);
+      return Math.max(0.4, Math.min(1.2, isFinite(fit) && fit > 0 ? fit : 1.2));
+    }
+
+    async open(opts) {
+      /* ⚡ attach to the reader opened by openShell() */
+      const reuse = !!(opts && opts.shellToken && this.active && this._shell && opts.shellToken === this._shellToken);
+      if (opts && opts.shellToken && !reuse) return;      // the reader was closed meanwhile
+      if (this.active && !reuse) return;
       if (!window.pdfjsLib) {
-        this.active = false;
+        if (reuse) this.close();
         userToast('PDF engine not loaded. Please refresh.', 'error');
         return;
       }
+      this.active = true;
+      /* Each open gets its own id, so a slow load from a viewer that
+         was already closed can never write into the next one. */
+      const session = reuse ? this._session : ++_pdfvSessionSeq;
+      this._session = session;
+      this._shell = false;
+      const stale = () => !this.active || this._session !== session;
       try {
         if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
           /* Same-origin worker — see index.html loadPDFJS().
@@ -1406,7 +1800,8 @@ class VideoPlayer {
       this.materialId = opts.materialId || 'doc';
       this.username   = opts.username || 'Student';
       this.title      = opts.title || opts.fileName || 'Document';
-      this._prevBodyOverflow = document.body.style.overflow;
+      if (!reuse) this._prevBodyOverflow = document.body.style.overflow;
+      if (!reuse) this._cacheKey = opts.cacheKey || null;
 
       /* ⭐ CRITICAL — Premium-access fields.
          ------------------------------------------------------------
@@ -1448,20 +1843,34 @@ class VideoPlayer {
       /* ⭐ 'slides' = rendered PowerPoint → fit whole slide, highlight Present */
       this.viewMode       = opts.mode === 'slides' ? 'slides' : 'document';
 
-      this._buildUI();
-      if (this.viewMode === 'slides') this.modal.classList.add('pdfv-slides-mode');
-      this._loadHighlights();
-      this._renderWatermark();
-
-      this.modal.classList.add('active');
-      document.body.style.overflow = 'hidden';
-      this._setLoaderText('Loading document…');
-      this.loaderEl.style.display = 'flex';
+      if (!reuse) {
+        this._buildUI();
+        if (this.viewMode === 'slides') this.modal.classList.add('pdfv-slides-mode');
+        this._loadHighlights();
+        /* ⭐ FIX: the saved page was written on every scroll but never read
+           back, so "resume where you left off" never happened. */
+        this._loadReadingProgress();
+        this._renderWatermark();
+        this.modal.classList.add('active');
+        document.body.style.overflow = 'hidden';
+      }
+      if (!this._instant) {
+        this._setLoaderText('Opening…');
+        this.loaderEl.style.display = 'flex';
+      }
 
       try {
         let source;
         if (opts.url) {
-          source = await this._buildPdfSource(opts.url);
+          source = await this._buildPdfSource(opts.url, opts.fastView === true, opts.sigInHeader === true, Number(opts.fileSize) || 0);
+          /* ranges-only files: ask for the start and the end at once (see _rangeSource) */
+          if (source.disableStream && !stale()) {
+            const ctrl = this._rangeAbort = (typeof AbortController === 'function') ? new AbortController() : null;
+            let r = null;
+            if (ctrl) { try { r = await _rangeSource(source, ctrl.signal); } catch (_) { r = null; } }
+            if (r) source = Object.assign({ rangeChunkSize: source.rangeChunkSize, disableAutoFetch: source.disableAutoFetch,
+                                            disableStream: true, urlSource: source }, r);
+          }
         } else {
           const dataURL = String(opts.data || '').indexOf('data:') === 0
             ? opts.data
@@ -1475,11 +1884,15 @@ class VideoPlayer {
           source = { data: bytes };
         }
 
-        if (!this.active) return;
+        if (stale()) return;
 
+        const doc = await this._loadDocument(source, session);
+        if (stale()) {
+          try { doc.destroy(); } catch (_) {}
+          return;
+        }
+        this.pdfDoc = doc;
         this._setLoaderText('Rendering pages…');
-        this.pdfDoc = await pdfjsLib.getDocument(source).promise;
-        if (!this.active) return;
 
         /* Slides: pick the "whole slide fits the screen" zoom BEFORE the
            first layout, so pages are laid out once at the right size
@@ -1496,17 +1909,36 @@ class VideoPlayer {
               this._updateZoomLabel();
             }
           } catch (e) { /* keep default zoom */ }
-          if (!this.active) return;
+          if (stale()) return;
+        }
+
+        /* ⚡ Fit the page to the screen width (phones showed a 120 %
+           page wider than the screen: cut-off edges and 3–4× more pixels
+           to draw than needed). Desktop keeps 120 %. */
+        if (this.viewMode !== 'slides' && !this._userZoomed) {
+          try {
+            const p1 = await this.pdfDoc.getPage(1);
+            const vp = p1.getViewport({ scale: 1 });
+            const fit = this._fitScale(vp.width);
+            if (Math.abs(fit - this.scale) > 0.001) {
+              this.scale = fit;
+              this._updateZoomLabel();
+            }
+          } catch (_) {}
+          if (stale()) return;
         }
 
         await this._renderAllPages();
+        if (stale()) return;
         this.loaderEl.style.display = 'none';
         if (this.viewMode === 'slides') {
           userToast('Tip: press P (or the Present button) for a full-screen slideshow.', 'info');
         }
       } catch (err) {
+        if (stale()) return;            // viewer was closed — nothing to report
         console.error('[PDFViewer]', err);
         if (this.loaderEl) {
+          this.loaderEl.style.display = 'flex';
           this.loaderEl.innerHTML =
             '<div class="pdfv-error">' +
               '<i class="fas fa-exclamation-triangle"></i>' +
@@ -1525,174 +1957,102 @@ class VideoPlayer {
     }
 
     /* ============================================================
-       Smart PDF source loader
+       PDF source — v4 (2026-10-05)
        ------------------------------------------------------------
-       PDF.js normally fetches a PDF via dozens of small HTTP Range
-       requests (default chunk = 64 KB). On a high-latency campus
-       proxy, every one of those is a full round trip — a 5 MB PDF
-       can take 10-20 seconds even on fast Wi-Fi.
+       The PDF goes straight to PDF.js as a URL (the previous version
+       first sent a separate GET just to read the headers, cancelled
+       it, and only then started PDF.js — one wasted round trip and
+       wasted bytes before every PDF).
 
-       Strategy:
-         1. HEAD the URL → learn size + range support.
-         2. ≤ 25 MB  → fetch in ONE request as ArrayBuffer. One RTT
-                       total, with a streaming progress readout.
-         3. > 25 MB  → stream via PDF.js with a 1 MB range chunk
-                       (16× fewer requests than default).
-         4. On error → plain URL fallback so the viewer never breaks.
+       • fastView (the server's re-packed copy, see server.js
+         "FAST-VIEW COPIES"): every page's dictionary sits in a few
+         compressed blocks, so PDF.js only needs a handful of small
+         Range requests to show page 1. Streaming is switched off so
+         a background download of the whole file does not compete
+         with those requests; the rest of the file is still fetched
+         in the background (autofetch), chunk by chunk.
+       • Any other PDF: one streaming GET plus 2 MB Range requests,
+         exactly as before (best for files whose page dictionaries
+         are spread through the file).
+       Signed /uploads URLs are cacheable, so re-opening a PDF is
+       served from the browser cache.
        ============================================================ */
-        /* ============================================================
-       Smart PDF source loader — v2
-       ------------------------------------------------------------
-       WHY THIS WAS REWRITTEN
-       ----------------------
-       The previous version tried a HEAD probe first, and fell back
-       to Range-request streaming whenever:
-         • the HEAD request itself failed, OR
-         • the server did not return a Content-Length header, OR
-         • the response advertised Accept-Ranges: bytes.
-
-       On mobile data that was fine. On a campus / corporate proxy
-       it was catastrophic: every PDF.js Range request (default
-       chunk = 64 KB) has to traverse the proxy, and the proxy adds
-       150–400 ms per round trip. A 5 MB PDF = ~78 requests = 15–30
-       seconds of pure latency, while the same file downloads in
-       under a second on mobile data with no proxy in the way.
-
-       NEW STRATEGY
-       ------------
-         1. Probe size with HEAD (best-effort — failures are OK).
-         2. Anything under 60 MB → download in ONE request and hand
-            the complete ArrayBuffer to PDF.js. PDF.js then makes
-            ZERO further HTTP requests.
-         3. Only a genuinely huge PDF (> 60 MB) still streams with
-            an enlarged 1 MB chunk size.
-         4. If the single-shot GET itself fails, fall back to the
-            old streaming path as a last resort.
-       ============================================================ */
-       /* ============================================================
-       Smart PDF source loader — v3 (campus-network optimised)
-       ------------------------------------------------------------
-       KEY CHANGES vs v2:
-
-         • HEAD probe REMOVED. Every HEAD costs a full round trip
-           (~150-400 ms on a campus proxy) before the download
-           even begins. We now go straight for the GET and read
-           Content-Length from the response headers.
-
-         • Bigger range chunk (4 MB instead of 1 MB) for the
-           fallback streaming path. Halves the number of Range
-           requests on huge PDFs.
-
-         • `priority: 'high'` on the fetch tells Chrome/Edge/Safari
-           to schedule it sooner, ahead of background prefetches.
-
-         • Loader text updates THROTTLED to 4× per second. The
-           old version ran `_setLoaderText()` on every ~32 KB
-           chunk — 150+ DOM writes for a 5 MB PDF — which starved
-           the main thread and blocked PDF.js from rendering.
-       ============================================================ */
-    async _buildPdfSource(url) {
-      /* ------------------------------------------------------------
-         Two-tier strategy.
-
-         TIER 1 — Range streaming (default for anything over ~1.5 MB).
-           PDF.js issues "Range: bytes=N-M" requests and renders
-           page 1 as soon as the first chunk arrives. On a campus
-           proxy this is the difference between "wait 40 seconds for
-           the download bar" and "page 1 appears in 3 seconds".
-
-         TIER 2 — Single-shot buffered download (tiny files only).
-           Below ~1.5 MB, buffering in one request is genuinely
-           faster because PDF.js doesn't have to open a second
-           connection for the range chunks.
-         ------------------------------------------------------------ */
-
-      const SMALL_PDF_THRESHOLD = 1.5 * 1024 * 1024;   // 1.5 MB
-      const RANGE_CHUNK         = 2 * 1024 * 1024;     // 2 MB
-
-      /* Single GET — no HEAD probe (an extra round trip we don't need). */
-      let res;
-      try {
-        res = await fetch(url, {
-          credentials: 'same-origin',
-          cache: 'default',
-          priority: 'high'
-        });
-      } catch (e) {
-        console.warn('[PDFViewer] fetch failed, streaming fallback:', e.message);
-        return { url, rangeChunkSize: RANGE_CHUNK };
-      }
-
-      if (!res.ok) {
-        console.warn('[PDFViewer] HTTP', res.status, '— streaming fallback');
-        return { url, rangeChunkSize: RANGE_CHUNK };
-      }
-
-      const len = parseInt(res.headers.get('content-length') || '0', 10);
-      const acceptsRanges = (res.headers.get('accept-ranges') || '')
-                              .toLowerCase()
-                              .includes('bytes');
-
-      /* TIER 1 — range streaming path.
-         A missing Content-Length (some proxies strip it) is NOT a
-         reason to skip streaming — Range still works, we just can't
-         show a percentage in the loader. */
-      if (acceptsRanges && (len === 0 || len > SMALL_PDF_THRESHOLD)) {
-        try { if (res.body && res.body.cancel) res.body.cancel(); } catch (_) {}
-        console.log(
-          '[PDFViewer] Streaming ' +
-          (len ? (len / 1048576).toFixed(1) + ' MB' : '(unknown size)') +
-          ' with ' + (RANGE_CHUNK / 1048576) + ' MB chunks'
-        );
-        return { url, rangeChunkSize: RANGE_CHUNK };
-      }
-
-      /* TIER 2 — small file, buffer in one shot. */
-      if (res.body && typeof res.body.getReader === 'function') {
-        const reader  = res.body.getReader();
-        const chunks  = [];
-        let received  = 0;
-        let lastTick  = 0;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          received += value.length;
-
-          /* Throttle the UI update to 4× / second max — the old
-             version ran this on every ~32 KB chunk and starved the
-             main thread. */
-          const now = Date.now();
-          if (now - lastTick > 250) {
-            lastTick = now;
-            const label = len > 0
-              ? 'Downloading document… ' +
-                Math.min(100, Math.round((received / len) * 100)) + '%'
-              : 'Downloading document… ' +
-                (received / 1048576).toFixed(1) + ' MB';
-            this._setLoaderText(label);
+    async _buildPdfSource(url, fastView, sigInHeader, fileSize) {
+      /* ⚡ Stable, cacheable URL: the signed token rotates every few hours,
+         and because it sat in the URL the browser treated each rotation as
+         a brand-new file and downloaded the whole PDF again. Sending it as
+         a header keeps the URL the same, so a PDF opened before is read
+         from the device's own cache (served with a 30-day cache header). */
+      let httpHeaders = null;
+      if (sigInHeader) {
+        try {
+          const u = new URL(url, location.origin);
+          const st = u.searchParams.get('st');
+          if (st && u.origin === location.origin && u.pathname.indexOf('/uploads/') === 0) {
+            u.searchParams.delete('st');
+            url = u.pathname + u.search;
+            httpHeaders = { 'X-Aero-St': st };
           }
-        }
-
-        const merged = new Uint8Array(received);
-        let off = 0;
-        for (const c of chunks) { merged.set(c, off); off += c.length; }
-
-        console.log(
-          '[PDFViewer] Buffered small PDF (' +
-          (received / 1048576).toFixed(2) + ' MB)'
-        );
-        return { data: merged };
+        } catch (_) {}
       }
+      /* ⚡ Large files: read only the pieces of the file that the pages
+         being shown need, in the order they are needed. Before, the whole
+         file was streamed from the start AND background-fetched at the
+         same time — on a 60 MB PDF a phone had pulled ~12 MB before page 1
+         appeared. The background page renderer now drives what is fetched
+         next (the pages just after the one being read). Small files are
+         still fetched in one go. */
+      let src;
+      if (fastView || fileSize > PDF_RANGES_ONLY_BYTES) {
+        src = { url, rangeChunkSize: fastView ? PDF_FAST_RANGE_CHUNK : PDF_LARGE_RANGE_CHUNK,
+                disableStream: true, disableAutoFetch: !fastView };   // fast copies are light → keep fetching ahead
+      } else {
+        src = { url, rangeChunkSize: PDF_RANGE_CHUNK };
+      }
+      if (httpHeaders) src.httpHeaders = httpHeaders;
+      return src;
+    }
 
-      /* Last resort — one big buffer. */
-      const buf = await res.arrayBuffer();
-      console.log(
-        '[PDFViewer] Buffered PDF (' +
-        (buf.byteLength / 1048576).toFixed(2) + ' MB)'
-      );
-      return { data: new Uint8Array(buf) };
+    /* Open the document on the shared worker. If that worker has
+       died for any reason, retry once on a fresh one. */
+    async _loadDocument(source, session) {
+      const start = (useShared, src) => {
+        const params = Object.assign({}, src);
+        delete params.urlSource;
+        const worker = useShared ? _getSharedPdfWorker() : null;
+        if (worker) params.worker = worker;
+        const task = pdfjsLib.getDocument(params);
+        this._loadingTask = task;
+        let lastTick = 0;
+        task.onProgress = (p) => {
+          if (this._session !== session || this.pdfDoc || !p) return;
+          const now = Date.now();
+          if (now - lastTick < 250) return;
+          lastTick = now;
+          const loaded = Number(p.loaded) || 0;
+          const total  = Number(p.total)  || 0;
+          if (!loaded) return;
+          this._setLoaderText(total > 0
+            ? 'Loading document… ' + Math.min(99, Math.round(loaded / total * 100)) + '%'
+            : 'Loading document… ' + (loaded / 1048576).toFixed(1) + ' MB');
+        };
+        return task.promise;
+      };
+
+      try {
+        return await start(true, source);
+      } catch (err) {
+        const name = (err && err.name) || '';
+        const docProblem = /Password|InvalidPDF|MissingPDF|UnexpectedResponse/.test(name);
+        /* Only URL sources can be retried — a data buffer has already
+           been handed over to the worker, and a range transport is used
+           up (it is retried as the plain URL it was made from). */
+        const again = source.urlSource || source;
+        if (docProblem || !again.url || this._session !== session || !this.active) throw err;
+        console.warn('[PDFViewer] retrying on a fresh worker:', err && err.message);
+        _resetSharedPdfWorker();
+        return await start(false, again);
+      }
     }
     _buildUI() {
       const old = document.getElementById('pdfViewerModal');
@@ -1718,6 +2078,7 @@ class VideoPlayer {
               '</button>' +
               '<span class="pdfv-title" id="pdfvTitle"></span>' +
               '<span class="pdfv-hlcount" id="pdfvHlCount"></span>' +
+              '<span class="pdfv-bgstatus" id="pdfvBgStatus" hidden></span>' +
             '</div>' +
             '<div class="pdfv-toolbar-center">' +
               '<button type="button" class="pdfv-btn" data-act="prev" title="Previous page"><i class="fas fa-chevron-up"></i></button>' +
@@ -1744,8 +2105,8 @@ class VideoPlayer {
           '<div class="pdfv-body" id="pdfvBody">' +
             '<div class="pdfv-pages" id="pdfvPages"></div>' +
             '<div class="pdfv-loader" id="pdfvLoader">' +
-              '<div class="pdfv-spinner"></div>' +
-              '<p id="pdfvLoaderText">Connecting to server…</p>' +
+              '<div class="pdfv-skel-sheet" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>' +
+              '<p id="pdfvLoaderText">Opening…</p>' +
             '</div>' +
           '</div>' +
         '</div>' +
@@ -1836,13 +2197,22 @@ class VideoPlayer {
          resize) while this one is still awaiting, this one stops and
          never appends its stale placeholders. */
       const gen = (this._layoutGen = (this._layoutGen || 0) + 1);
-      this.pagesEl.innerHTML = '';
-      this.pageEls.clear();
+      this._stopBackgroundRender();
+      const inst = this._instant;
+      this._instant = null;
       this.textLayers.clear();
       this._disconnectPageObserver();
 
       const total = this.pdfDoc.numPages;
       this.totalPages = total;
+      /* ⚡ The pages shown instantly (cache / posters) stay on screen —
+         the real pages are drawn into the same frames. */
+      const reuse = !!(inst && inst.total === total && this.hasFullAccess &&
+                       Math.abs(inst.scale - this.scale) < 0.001 && this.pageEls.size === total);
+      if (!reuse) {
+        this.pagesEl.innerHTML = '';
+        this.pageEls.clear();
+      }
 
       /* ── Compute render ceiling (unchanged) ── */
       let renderLimit;
@@ -1909,21 +2279,30 @@ class VideoPlayer {
 
       if (!this.active || gen !== this._layoutGen) return;
 
-      /* Create page 1's placeholder */
-      const page1El = document.createElement('div');
-      page1El.className = 'pdfv-page';
-      page1El.dataset.page = '1';
-      page1El.style.width  = placeholderW + 'px';
-      page1El.style.height = placeholderH + 'px';
-      page1El.style.position = 'relative';
-      page1El.style.background = '#ffffff';
-      this.pagesEl.appendChild(page1El);
-      this.pageEls.set(1, page1El);
+      /* Create page 1's placeholder (or reuse the instant one) */
+      let page1El = reuse ? this.pageEls.get(1) : null;
+      if (!page1El) {
+        page1El = document.createElement('div');
+        page1El.className = 'pdfv-page';
+        page1El.dataset.page = '1';
+        page1El.style.width  = placeholderW + 'px';
+        page1El.style.height = placeholderH + 'px';
+        page1El.style.position = 'relative';
+        page1El.style.background = '#ffffff';
+        this.pagesEl.appendChild(page1El);
+        this.pageEls.set(1, page1El);
+      }
 
-      /* Render page 1 */
-      await this._renderPage(1);
-      if (!this.active || gen !== this._layoutGen) return;
-      page1El.dataset.rendered = '1';
+      if (reuse) {
+        /* Reader already sees pages: attach observers straight away so
+           whatever page they are on is drawn sharp first. */
+        this.loaderEl.style.display = 'none';
+      } else {
+        /* Render page 1 */
+        await this._renderPage(1);
+        if (!this.active || gen !== this._layoutGen) return;
+        this._markRendered(1, page1El);
+      }
 
       /* ⚡ Prefetch page 2 while page 1 is still on screen.
          Most readers scroll within 1 s — having page 2 already
@@ -1933,7 +2312,7 @@ class VideoPlayer {
         const page2El = this.pageEls.get(2);
         if (page2El && page2El.dataset.rendered !== '1') {
           this._renderPage(2)
-            .then(() => { page2El.dataset.rendered = '1'; })
+            .then(() => { this._markRendered(2, page2El); })
             .catch(() => {});
         }
       }
@@ -1965,6 +2344,7 @@ class VideoPlayer {
         const frag = document.createDocumentFragment();
 
         for (let i = 2; i <= renderLimit; i++) {
+          if (reuse && this.pageEls.get(i)) continue;
           const pageEl = document.createElement('div');
           pageEl.className = 'pdfv-page';
           pageEl.dataset.page = i;
@@ -1979,20 +2359,52 @@ class VideoPlayer {
 
         this.pagesEl.appendChild(frag);
 
+        /* ⚡ After a zoom / re-layout: show the snapshots we already
+           have, so pages never flash blank while being redrawn. */
+        if (this._snaps && this._snaps.size) {
+          this._snaps.forEach((_, n) => { if (n !== 1) this._paintSnapshot(n); });
+        }
+
         if (!this.hasFullAccess && renderLimit < total) {
           this._renderPaywallCard(total, renderLimit);
         }
 
         this._setupPageObserver();
+        this._startSharpGuard();
 
         /* ⭐ NEW: Restore the last reading position on this PDF.
            Runs AFTER every placeholder div exists so scrollIntoView
            can find the target page. The IntersectionObserver we
            just attached will lazy-render it on demand. */
         this._applyReadingResume();
+
+        /* ⚡ PHASE 1b — the rest of the priority pages, right away
+           (one after the other, so page 2 is ready first). Skipped
+           when the reader is resuming deep inside the document. */
+        const priorityEnd = Math.min(PDF_PRIORITY_PAGES, renderLimit);
+        const resuming = (this._resumePage || 1) > priorityEnd;
+        let chain = Promise.resolve();
+        if (!resuming) {
+          for (let i = 2; i <= priorityEnd; i++) {
+            chain = chain.then(() => {
+              if (!this.active || gen !== this._layoutGen) return;
+              const el = this.pageEls.get(i);
+              if (!el || el.dataset.rendered === '1') return;
+              return this._renderPage(i).then(() => { this._markRendered(i, el); }).catch(() => {});
+            });
+          }
+        }
+
+        /* ⚡ PHASE 2 — everything else, in the background */
+        chain.then(() => {
+          if (!this.active || gen !== this._layoutGen) return;
+          setTimeout(() => this._startBackgroundRender(gen), PDF_BG_START_DELAY_MS);
+        });
       };
 
-      if (typeof window.requestIdleCallback === 'function') {
+      if (reuse) {
+        buildRest();
+      } else if (typeof window.requestIdleCallback === 'function') {
         window.requestIdleCallback(buildRest, { timeout: 400 });
       } else {
         setTimeout(buildRest, 0);
@@ -2004,49 +2416,97 @@ class VideoPlayer {
       if (typeof IntersectionObserver !== 'function') {
         this.pageEls.forEach((el, n) => {
           if (el.dataset.rendered !== '1') {
-            this._renderPage(n).then(() => { el.dataset.rendered = '1'; });
+            this._renderPage(n).then(() => { this._markRendered(n, el); });
           }
         });
         return;
       }
 
+      /* ⚡ A page starts rendering only if it is still near the screen
+         a moment after it came into range. Flicking or jumping through
+         a long document no longer queues dozens of pages the reader
+         never stopped at (which delayed the page they did stop at). */
+      this._nearPages = new Set();
+      /* ⚡ Is the page actually on screen (not just in the look-ahead margin)? */
+      const onScreen = (el) => {
+        try {
+          const r = el.getBoundingClientRect(), b = this.bodyEl.getBoundingClientRect();
+          return r.bottom > b.top && r.top < b.bottom;
+        } catch (_) { return true; }
+      };
+      const startRender = (pageEl, pageNum) => {
+        if (!this._pageObserver || !this._nearPages || !this._nearPages.has(pageNum)) return;
+        if (pageEl.dataset.rendered === '1' || this.pageEls.get(pageNum) !== pageEl) return;
+        if (!this._renderingPages) this._renderingPages = new Set();
+        if (this._renderingPages.has(pageNum)) return;
+        /* ⚡ Pages on screen first: a page that is only in the look-ahead
+           margin waits while an on-screen page is still being drawn (on
+           heavy scanned pages, drawing the page above first used to delay
+           the page actually being looked at by seconds). */
+        if (!onScreen(pageEl)) {
+          let visibleBusy = false;
+          this._renderingPages.forEach((n) => {
+            const el = this.pageEls.get(n);
+            if (el && onScreen(el)) visibleBusy = true;
+          });
+          if (visibleBusy) { setTimeout(() => startRender(pageEl, pageNum), 150); return; }
+        } else {
+          /* An on-screen page needs drawing → pause every off-screen page
+             still being drawn (they are re-queued and finish afterwards).
+             The PDF engine works on one page at a time, so without this the
+             page being looked at waited behind its neighbours. */
+          this._pauseOffscreenRenders(onScreen);
+        }
+
+        /* Inject the loading skeleton only for pages the user is
+           about to see. Off-screen pages stay as plain white
+           rectangles — no shimmer animation, no spinner, no CPU
+           cost. This is critical for 200+ page PDFs. */
+        if (!pageEl.querySelector('.pdfv-page-skeleton') && !pageEl.querySelector('.pdfv-canvas') &&
+            !pageEl.querySelector('.pdfv-snap')) {
+          const skel = document.createElement('div');
+          skel.className = 'pdfv-page-skeleton';
+          skel.innerHTML =
+            '<div class="pdfv-skeleton-spinner"></div>' +
+            '<div class="pdfv-skeleton-text">Loading page ' + pageNum + '…</div>';
+          pageEl.appendChild(skel);
+        }
+
+        this._renderingPages.add(pageNum);
+        this._pageObserver.unobserve(pageEl);
+
+        this._renderPage(pageNum)
+          .then(() => {
+            if (this._renderingPages) this._renderingPages.delete(pageNum);
+            this._markRendered(pageNum, pageEl);
+          })
+          .catch((err) => {
+            if (!err || err.name !== 'RenderingCancelledException') {
+              console.warn('[PDFViewer] lazy render failed page ' + pageNum, err);
+            }
+            if (this._renderingPages) this._renderingPages.delete(pageNum);
+            /* paused or skipped → watch it again so it is drawn when due */
+            if (err && err.name === 'RenderingCancelledException' && this._pageObserver &&
+                this.pageEls.get(pageNum) === pageEl && pageEl.dataset.rendered !== '1') {
+              this._pageObserver.observe(pageEl);
+            }
+          });
+      };
+
       this._pageObserver = new IntersectionObserver((entries) => {
         entries.forEach((entry) => {
           const pageEl = entry.target;
-          if (!entry.isIntersecting) return;
+          const pageNum = parseInt(pageEl.dataset.page, 10);
+          if (!entry.isIntersecting) {
+            if (this._nearPages) this._nearPages.delete(pageNum);
+            return;
+          }
           if (pageEl.dataset.rendered === '1') {
             this._pageObserver.unobserve(pageEl);
             return;
           }
-          const pageNum = parseInt(pageEl.dataset.page, 10);
-          if (!this._renderingPages) this._renderingPages = new Set();
-          if (this._renderingPages.has(pageNum)) return;
-
-          /* Inject the loading skeleton only for pages the user is
-             about to see. Off-screen pages stay as plain white
-             rectangles — no shimmer animation, no spinner, no CPU
-             cost. This is critical for 200+ page PDFs. */
-          if (!pageEl.querySelector('.pdfv-page-skeleton') && !pageEl.querySelector('.pdfv-canvas')) {
-            const skel = document.createElement('div');
-            skel.className = 'pdfv-page-skeleton';
-            skel.innerHTML =
-              '<div class="pdfv-skeleton-spinner"></div>' +
-              '<div class="pdfv-skeleton-text">Loading page ' + pageNum + '…</div>';
-            pageEl.appendChild(skel);
-          }
-
-          this._renderingPages.add(pageNum);
-          this._pageObserver.unobserve(pageEl);
-
-          this._renderPage(pageNum)
-            .then(() => {
-              pageEl.dataset.rendered = '1';
-              this._renderingPages.delete(pageNum);
-            })
-            .catch((err) => {
-              console.warn('[PDFViewer] lazy render failed page ' + pageNum, err);
-              this._renderingPages.delete(pageNum);
-            });
+          if (this._nearPages) this._nearPages.add(pageNum);
+          setTimeout(() => startRender(pageEl, pageNum), onScreen(pageEl) ? PDF_RENDER_SETTLE_MS : PDF_RENDER_SETTLE_MS + 60);
         });
       }, {
         root: this.bodyEl,
@@ -2057,6 +2517,120 @@ class VideoPlayer {
       this.pageEls.forEach((el) => {
         if (el.dataset.rendered !== '1') this._pageObserver.observe(el);
       });
+
+      /* ⚡ Long documents: pages more than ~3 screens away from the
+         reader hand their canvas back to the browser and are drawn
+         again when scrolled to. Without this, reading a 300-page
+         PDF kept every page's bitmap alive (hundreds of MB), which
+         made phones sluggish and could crash the tab. */
+      if (this.pageEls.size > PDF_KEEP_ALL_PAGES) {
+        this._farPages = new Set();
+        this._releaseObserver = new IntersectionObserver((entries) => {
+          entries.forEach((entry) => {
+            const n = parseInt(entry.target.dataset.page, 10);
+            if (entry.isIntersecting) { this._farPages.delete(n); return; }
+            this._farPages.add(n);
+            this._releasePage(n);
+          });
+        }, {
+          root: this.bodyEl,
+          rootMargin: '300% 0px 300% 0px',
+          threshold: 0
+        });
+        this.pageEls.forEach((el) => this._releaseObserver.observe(el));
+      }
+    }
+
+    _isPageOnScreen(n) {
+      const el = this.pageEls.get(n);
+      if (!el || !this.bodyEl) return false;
+      try {
+        const r = el.getBoundingClientRect(), b = this.bodyEl.getBoundingClientRect();
+        return r.bottom > b.top && r.top < b.bottom;
+      } catch (_) { return false; }
+    }
+    _onScreenRenderBusy(except) {
+      if (!this._inflight) return false;
+      for (const n of this._inflight.keys()) {
+        if (n !== except && this._isPageOnScreen(n)) {
+          const el = this.pageEls.get(n);
+          if (el && el.dataset.rendered !== '1') return true;
+        }
+      }
+      return false;
+    }
+
+    /* Cancel the drawing of off-screen pages (and the background job) so
+       the page on screen gets the PDF engine first. Cancelled pages are
+       put back under observation and drawn again when they are due. */
+    _pauseOffscreenRenders(onScreen) {
+      if (this._bg && this._bg.task && !this._bg.ownRender) { try { this._bg.task.cancel(); } catch (_) {} }
+      if (!this._renderTasks) return;
+      this._renderTasks.forEach((task, n) => {
+        const el = this.pageEls.get(n);
+        if (!el || onScreen(el)) return;
+        try { task.cancel(); } catch (_) {}
+        if (this._pageObserver && el.dataset.rendered !== '1') {
+          try { this._pageObserver.observe(el); } catch (_) {}
+        }
+      });
+    }
+
+    /* ⭐ 2026-10-12 — a page counts as drawn only when its sharp canvas is
+       really on it. _renderPage() can finish without drawing (the reader
+       scrolled away, a re-layout started, the document changed…); before,
+       the page was still marked "rendered" and kept showing the blurry
+       JPEG snapshot (cache / poster / scroll copy) for good — most often
+       on the page a reopened PDF resumes at. */
+    _markRendered(n, el) {
+      if (!el || this.pageEls.get(n) !== el) return false;
+      if (el.querySelector('canvas.pdfv-canvas')) { el.dataset.rendered = '1'; return true; }
+      delete el.dataset.rendered;
+      if (this._pageObserver) { try { this._pageObserver.unobserve(el); this._pageObserver.observe(el); } catch (_) {} }
+      return false;
+    }
+
+    /* Safety net: while the viewer is open, a page that is on screen but
+       still shows a snapshot (or nothing) is drawn sharp once the reader
+       is not scrolling. */
+    _startSharpGuard() {
+      clearInterval(this._sharpGuard);
+      this._sharpGuard = setInterval(() => {
+        if (!this.active || !this.pdfDoc) { clearInterval(this._sharpGuard); this._sharpGuard = null; return; }
+        if (document.hidden || Date.now() - (this._lastScrollAt || 0) < 400) return;   // wait until the reader stops
+        const limit = this.previewLimit || this.totalPages || 0;
+        this.pageEls.forEach((el, n) => {
+          if (n > limit || !this._isPageOnScreen(n)) return;
+          if (el.querySelector('canvas.pdfv-canvas')) return;
+          if ((this._inflight && this._inflight.has(n)) || (this._renderingPages && this._renderingPages.has(n))) return;
+          delete el.dataset.rendered;
+          this._renderPage(n).then(() => { this._markRendered(n, el); }).catch(() => {});
+        });
+      }, 1200);
+    }
+
+    _releasePage(n) {
+      const el = this.pageEls.get(n);
+      if (!el) return;
+      /* Still drawing a page that is now far away → cancel it; the
+         render's own clean-up calls back here once it has stopped. */
+      const rt = this._renderTasks && this._renderTasks.get(n);
+      if (rt) { try { rt.cancel(); } catch (_) {} return; }
+      if (this._inflight && this._inflight.has(n)) return;
+      if (this._renderingPages && this._renderingPages.has(n)) return;
+      if (el.dataset.rendered === '1' || el.querySelector('canvas')) {
+        _freeCanvases(el);
+        el.innerHTML = '';               // keeps its width/height → no scroll jump
+        delete el.dataset.rendered;
+        this.textLayers.delete(n);
+        this._paintSnapshot(n);          // ⚡ light snapshot instead of a blank page
+        const doc = this.pdfDoc;
+        if (doc) {
+          doc.getPage(n).then((pg) => { try { pg.cleanup(); } catch (_) {} }).catch(() => {});
+        }
+      }
+      /* (re-)watch it so it is drawn again when it comes back into view */
+      if (this._pageObserver) this._pageObserver.observe(el);
     }
 
     _disconnectPageObserver() {
@@ -2064,12 +2638,18 @@ class VideoPlayer {
         try { this._pageObserver.disconnect(); } catch (e) {}
         this._pageObserver = null;
       }
+      if (this._releaseObserver) {
+        try { this._releaseObserver.disconnect(); } catch (e) {}
+        this._releaseObserver = null;
+      }
+      this._farPages = null;
       /* ⭐ Also detach the paywall attention observer */
       if (this._paywallObserver) {
         try { this._paywallObserver.disconnect(); } catch (e) {}
         this._paywallObserver = null;
       }
       if (this._renderingPages) this._renderingPages.clear();
+      this._nearPages = null;
     }
 
     async _renderVisiblePagesNow() {
@@ -2081,7 +2661,7 @@ class VideoPlayer {
         if (r.bottom >= bodyRect.top - 200 && r.top <= bodyRect.bottom + 200) {
           tasks.push(
             this._renderPage(n)
-              .then(() => { pageEl.dataset.rendered = '1'; })
+              .then(() => { this._markRendered(n, pageEl); })
               .catch(() => {})
           );
         }
@@ -2267,23 +2847,78 @@ class VideoPlayer {
         userToast('Payment is unavailable right now.', 'error');
       }
     }
-    async _renderPage(n) {
-      const page = await this.pdfDoc.getPage(n);
+    /* One render per page at a time: the observer, the resume jump,
+       "go to page" and zoom can all ask for the same page at once. */
+    _renderPage(n) {
+      if (!this._inflight) this._inflight = new Map();
+      const gen = this._layoutGen || 0;
+      const cur = this._inflight.get(n);
+      if (cur && cur.gen === gen) return cur.p;
+      /* ⚡ A page the reader needs beats background work */
+      if (this._bg && this._bg.task && !this._bg.ownRender) {
+        try { this._bg.task.cancel(); } catch (_) {}
+      }
+      const p = this._renderPageNow(n).finally(() => {
+        const c = this._inflight && this._inflight.get(n);
+        if (c && c.p === p) this._inflight.delete(n);
+        /* Finished drawing a page the reader has already scrolled far
+           away from → give its memory back straight away. */
+        if (this._farPages && this._farPages.has(n)) {
+          setTimeout(() => {
+            if (this._farPages && this._farPages.has(n)) this._releasePage(n);
+          }, 0);
+        }
+      });
+      this._inflight.set(n, { gen, p });
+      return p;
+    }
 
-      // ⚡ CRISP RENDER — render at devicePixelRatio so text is sharp
-      // on Retina / high-DPI screens and mobile.
-      // Cap at 3 to avoid blowing up memory on ultra-dense screens.
-      const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+    async _renderPageNow(n) {
+      const doc = this.pdfDoc;
+      if (!doc) return;
+      const page = await doc.getPage(n);
+      /* ⚡ On-screen pages first: an off-screen page (look-ahead margin,
+         priority pages) waits here while a page that is actually on
+         screen is being drawn — the PDF engine handles one page at a time. */
+      if (!this._isPageOnScreen(n)) {
+        let waited = 0;
+        while (this.active && this.pdfDoc === doc && waited < 15000 && this._onScreenRenderBusy(n)) {
+          await new Promise((r) => setTimeout(r, 80));
+          waited += 80;
+        }
+        if (!this.active || this.pdfDoc !== doc) return;
+      }
+      /* The reader skimmed past this page while it was queued → skip it
+         (it is drawn again when scrolled back to). Keeps the worker free
+         for the pages actually on screen. */
+      if (this._farPages && this._farPages.has(n)) {
+        const skip = new Error('Page skipped (scrolled away)');
+        skip.name = 'RenderingCancelledException';
+        throw skip;
+      }
 
       // CSS-space viewport (what the user sees — used for layout & text layer)
       const cssViewport = page.getViewport({ scale: this.scale });
+
+      // ⚡ CRISP RENDER — render at devicePixelRatio so text is sharp
+      // on Retina / high-DPI screens and mobile.
+      // Cap at 3 to avoid blowing up memory on ultra-dense screens,
+      // and keep one canvas under PDF_MAX_CANVAS_PIXELS (high zoom on
+      // a dense screen used to allocate 70+ MB for a single page).
+      let dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, PDF_MAX_DPR));
+      const cssArea = cssViewport.width * cssViewport.height;
+      if (cssArea > 0 && cssArea * dpr * dpr > PDF_MAX_CANVAS_PIXELS) {
+        dpr = Math.max(1, Math.sqrt(PDF_MAX_CANVAS_PIXELS / cssArea));
+      }
       // Render-space viewport (higher res — what gets painted on the canvas)
       const renderViewport = page.getViewport({ scale: this.scale * dpr });
 
       const pageEl = this.pageEls.get(n);
       if (!pageEl) return;
 
-      pageEl.innerHTML = '';
+      /* ⚡ The new canvas is drawn off-screen and swapped in when it is
+         finished, so whatever is showing now (snapshot, previous zoom,
+         skeleton) stays visible instead of a blank white page. */
       pageEl.style.width  = cssViewport.width  + 'px';
       pageEl.style.height = cssViewport.height + 'px';
       pageEl.style.position = 'relative';
@@ -2295,17 +2930,35 @@ class VideoPlayer {
       canvas.style.width  = cssViewport.width  + 'px';
       canvas.style.height = cssViewport.height + 'px';
       canvas.className = 'pdfv-canvas';
-      pageEl.appendChild(canvas);
 
       const ctx = canvas.getContext('2d', { alpha: false });
       // Improves text legibility on some browsers
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
 
-      await page.render({
+      const renderTask = page.render({
         canvasContext: ctx,
         viewport: renderViewport
-      }).promise;
+      });
+      /* Kept so a page the reader has already scrolled far past can be
+         cancelled instead of keeping the worker busy (_releasePage). */
+      if (!this._renderTasks) this._renderTasks = new Map();
+      this._renderTasks.set(n, renderTask);
+      try {
+        await renderTask.promise;
+      } catch (err) {
+        canvas.width = 0; canvas.height = 0;     // free the unused bitmap
+        throw err;
+      } finally {
+        if (this._renderTasks && this._renderTasks.get(n) === renderTask) this._renderTasks.delete(n);
+      }
+      if (this.pageEls.get(n) !== pageEl || !this.active) {
+        canvas.width = 0; canvas.height = 0;
+        return;
+      }
+      _freeCanvases(pageEl);
+      pageEl.innerHTML = '';
+      pageEl.appendChild(canvas);
 
       // Text layer uses the CSS viewport (correct CSS pixel coordinates)
       const textLayer = document.createElement('div');
@@ -2341,6 +2994,252 @@ class VideoPlayer {
 
       /* Apply saved highlights for this page as soon as it renders */
       this._applyPageHighlights(n);
+      this._snapFromCanvas(n, canvas, cssViewport.width / this.scale, cssViewport.height / this.scale);
+    }
+
+    /* ============================================================
+       ⚡ BACKGROUND RENDERER (phase 2) — see PDF_PRIORITY_PAGES above
+       ============================================================ */
+    _startBackgroundRender(gen) {
+      this._stopBackgroundRender();
+      const doc = this.pdfDoc;
+      const limit = this.previewLimit || 0;
+      if (!doc || !this.active || limit <= 1 || gen !== this._layoutGen) return;
+
+      const session = this._session;
+      const shortDoc = limit <= PDF_KEEP_ALL_PAGES;
+      const bg = { gen, session, stopped: false, task: null, timer: null, ownRender: false,
+                   failed: new Set(), budget: _snapBudgetBytes(), shortDoc, limit };
+      this._bg = bg;
+
+      const alive = () => !bg.stopped && this._bg === bg && this.active &&
+                          this._session === session && this._layoutGen === gen && this.pdfDoc === doc;
+      const fresh = (n) => {
+        const s = this._snaps.get(n);
+        return !!s && s.scale > this.scale * 0.8 && s.scale < this.scale * 1.25;
+      };
+      const needsWork = (n) => {
+        if (bg.failed.has(n)) return false;
+        const el = this.pageEls.get(n);
+        if (!el) return false;
+        if (shortDoc) return el.dataset.rendered !== '1' && !(this._inflight && this._inflight.has(n));
+        return !fresh(n);
+      };
+      const countDone = () => {
+        let d = 0;
+        for (let n = 1; n <= limit; n++) {
+          const el = this.pageEls.get(n);
+          if (shortDoc ? (el && el.dataset.rendered === '1') : (fresh(n) || (el && el.dataset.rendered === '1'))) d++;
+        }
+        return d;
+      };
+      /* Reading order: from the current page forward, then backward.
+         ⚡ Heavy pages (scans / photos: > 250 ms each to prepare) are only
+         prepared in a window around the reader (12 ahead, 3 behind) that
+         moves along as they read — so background work never delays the
+         page actually being looked at. Light documents are done in full. */
+      bg.times = [];
+      const heavy = () => bg.times.length >= 3 &&
+        (bg.times.reduce((a, b) => a + b, 0) / bg.times.length) > 250;
+      const pickNext = () => {
+        const cur = Math.max(1, Math.min(limit, this.currentPage || 1));
+        const hi = heavy() ? Math.min(limit, cur + 12) : limit;
+        const lo = heavy() ? Math.max(1, cur - 3) : 1;
+        for (let n = cur; n <= hi; n++) if (needsWork(n)) return n;
+        for (let n = cur - 1; n >= lo; n--) if (needsWork(n)) return n;
+        return 0;
+      };
+      const busy = () =>
+        document.hidden || !!this._present ||
+        (Date.now() - (this._lastScrollAt || 0) < PDF_BG_SCROLL_QUIET_MS) ||
+        (this._inflight && this._inflight.size > 0);
+      const schedule = (delay) => {
+        if (!alive()) return;
+        clearTimeout(bg.timer);
+        bg.timer = setTimeout(() => _idle(step, 1200), delay);
+      };
+
+      const step = async () => {
+        if (!alive()) return;
+        if (busy()) return schedule(400);
+        if (!shortDoc && this._snapBytes >= bg.budget) {
+          this._setBgStatus(null);
+          bg.stopped = true;               // memory budget reached — the observer handles the rest
+          return;
+        }
+        const n = pickNext();
+        if (!n) {
+          /* heavy document: the window is done — check again as the reader moves */
+          if (heavy() && countDone() < limit) { this._setBgStatus(countDone(), limit, false); return schedule(1500); }
+          this._setBgStatus(limit, limit, true);
+          bg.stopped = true;
+          return;
+        }
+        const tStart = performance.now();
+        try {
+          if (shortDoc) {
+            const el = this.pageEls.get(n);
+            bg.ownRender = true;
+            try { await this._renderPage(n); } finally { bg.ownRender = false; }
+            if (el && this.pageEls.get(n) === el) this._markRendered(n, el);
+          } else {
+            await this._snapshotPage(n, bg, alive);
+          }
+        } catch (err) {
+          /* Cancelled because the reader needed another page → retry later.
+             Anything else: skip this page (the observer still draws it). */
+          if (!err || err.name !== 'RenderingCancelledException') bg.failed.add(n);
+        }
+        if (!alive()) return;
+        bg.times.push(performance.now() - tStart);
+        if (bg.times.length > 8) bg.times.shift();
+        this._setBgStatus(countDone(), limit, false);
+        schedule(heavy() ? 150 : 0);
+      };
+
+      this._setBgStatus(countDone(), limit, false);
+      schedule(0);
+    }
+
+    _stopBackgroundRender() {
+      const bg = this._bg;
+      if (!bg) return;
+      bg.stopped = true;
+      clearTimeout(bg.timer);
+      if (bg.task && !bg.ownRender) { try { bg.task.cancel(); } catch (_) {} }
+      this._bg = null;
+    }
+
+    /* Draw one page into a small off-screen canvas and keep it as a
+       compressed JPEG (≈ 60–150 KB instead of 4–8 MB for a live canvas). */
+    async _snapshotPage(n, bg, alive) {
+      const doc = this.pdfDoc;
+      const page = await doc.getPage(n);
+      if (!alive()) return;
+      const scale = this.scale;
+      /* sharp enough to read on the device (≤ 2× density, ≤ 2.2 MP) */
+      const dens = Math.max(1, Math.min(window.devicePixelRatio || 1, PDF_MAX_DPR));
+      let vp = page.getViewport({ scale: scale * dens });
+      const px = vp.width * vp.height;
+      if (px > PDF_SNAP_MAX_PIXELS) vp = page.getViewport({ scale: scale * dens * Math.sqrt(PDF_SNAP_MAX_PIXELS / px) });
+
+      const canvas = document.createElement('canvas');
+      canvas.width  = Math.max(1, Math.floor(vp.width));
+      canvas.height = Math.max(1, Math.floor(vp.height));
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const task = page.render({ canvasContext: ctx, viewport: vp });
+      bg.task = task;
+      try { await task.promise; }
+      catch (err) { canvas.width = 0; canvas.height = 0; throw err; }
+      finally { if (bg.task === task) bg.task = null; }
+
+      const blob = await new Promise((resolve) => {
+        try { canvas.toBlob(resolve, 'image/jpeg', PDF_SNAP_QUALITY); } catch (_) { resolve(null); }
+      });
+      canvas.width = 0; canvas.height = 0;
+      if (!blob) throw new Error('snapshot encode failed');
+      /* Keep the snapshot even if a zoom happened meanwhile — it is
+         still the right page; only a closed viewer drops it. */
+      if (!this.active || this._session !== bg.session || !this._snaps) return;
+
+      const unscaled = page.getViewport({ scale: 1 });
+      const old = this._snaps.get(n);
+      if (old) { try { URL.revokeObjectURL(old.url); } catch (_) {} this._snapBytes -= old.bytes; }
+      this._snaps.set(n, { url: URL.createObjectURL(blob), bytes: blob.size, scale, w: unscaled.width, h: unscaled.height });
+      this._snapBytes += blob.size;
+      this._persistSnap(n, blob, unscaled.width, unscaled.height, scale);
+      /* Free the worker's parsed copy of this page unless it is on screen */
+      const el = this.pageEls.get(n);
+      if (!el || el.dataset.rendered !== '1') { try { page.cleanup(); } catch (_) {} }
+      this._paintSnapshot(n);
+    }
+
+    /* ⚡ After a page is drawn sharp, keep a light copy of it (made from
+       the finished canvas — no second decode) for scrolling back, for
+       the background status and for the on-device cache. */
+    _snapFromCanvas(n, canvas, wPt, hPt) {
+      const scale = this.scale;
+      const cur = this._snaps.get(n);
+      if (cur && !cur.poster && cur.scale > scale * 0.8 && cur.scale < scale * 1.25) return;
+      const session = this._session;
+      _idle(() => {
+        if (!this.active || this._session !== session || !canvas.width) return;
+        try {
+          const k = Math.min(1, Math.sqrt(PDF_SNAP_MAX_PIXELS / (canvas.width * canvas.height)));
+          const c = document.createElement('canvas');
+          c.width = Math.max(1, Math.round(canvas.width * k));
+          c.height = Math.max(1, Math.round(canvas.height * k));
+          c.getContext('2d', { alpha: false }).drawImage(canvas, 0, 0, c.width, c.height);
+          c.toBlob((blob) => {
+            c.width = 0; c.height = 0;
+            if (!blob || !this.active || this._session !== session) return;
+            const old = this._snaps.get(n);
+            if (old) { try { URL.revokeObjectURL(old.url); } catch (_) {} this._snapBytes -= old.bytes || 0; }
+            this._snaps.set(n, { url: URL.createObjectURL(blob), bytes: blob.size, scale, w: wPt, h: hPt });
+            this._snapBytes += blob.size;
+            this._persistSnap(n, blob, wPt, hPt, scale);
+          }, 'image/jpeg', PDF_SNAP_QUALITY);
+        } catch (_) {}
+      }, 1500);
+    }
+
+    _persistSnap(n, blob, wPt, hPt, scale) {
+      const key = this._cacheKey;
+      if (!key || !this.hasFullAccess || !this.pdfDoc) return;
+      AeroPdfCache.put(key, n, blob);
+      const m = this._manifest && this._manifest.key === key ? this._manifest
+              : { v: 1, key, total: this.pdfDoc.numPages, sizes: {}, pages: {} };
+      m.total = this.pdfDoc.numPages;
+      m.sizes[n] = [Math.round(wPt * 100) / 100, Math.round(hPt * 100) / 100];
+      m.pages[n] = { s: scale };
+      this._manifest = m;
+      clearTimeout(this._manifestTimer);
+      this._manifestTimer = setTimeout(() => AeroPdfCache.putManifest(key, m), 800);
+    }
+
+    /* Show a page's snapshot if the page has no sharp canvas yet */
+    _paintSnapshot(n) {
+      const snap = this._snaps && this._snaps.get(n);
+      const el = this.pageEls.get(n);
+      if (!snap || !el) return;
+      if (el.dataset.rendered === '1' || el.querySelector('.pdfv-canvas')) return;
+      let img = el.querySelector('img.pdfv-snap');
+      if (!img) {
+        img = document.createElement('img');
+        img.className = 'pdfv-snap';
+        img.alt = '';
+        img.draggable = false;
+        img.decoding = 'async';
+        el.appendChild(img);
+      }
+      if (img.getAttribute('src') !== snap.url) img.src = snap.url;
+      const sk = el.querySelector('.pdfv-page-skeleton');
+      if (sk) sk.remove();
+      /* Real size of this page (pages can differ from page 1) */
+      const w = Math.round(snap.w * this.scale), h = Math.round(snap.h * this.scale);
+      if (w > 0 && h > 0) { el.style.width = w + 'px'; el.style.height = h + 'px'; }
+    }
+
+    _freeSnapshots() {
+      if (this._snaps) this._snaps.forEach((s) => { try { URL.revokeObjectURL(s.url); } catch (_) {} });
+      if (this._snaps) this._snaps.clear();
+      this._snapBytes = 0;
+    }
+
+    /* Small "⚡ 42 / 310 pages ready" chip in the toolbar */
+    _setBgStatus(done, total, finished) {
+      const el = this.modal && this.modal.querySelector('#pdfvBgStatus');
+      if (!el) return;
+      clearTimeout(this._bgStatusTimer);
+      if (done == null || !total || total <= PDF_PRIORITY_PAGES) { el.hidden = true; return; }
+      el.hidden = false;
+      el.classList.toggle('is-done', !!finished);
+      el.textContent = finished ? '✓ All pages ready' : ('⚡ ' + done + ' / ' + total + ' pages ready');
+      el.title = finished ? 'Every page has been prepared' : 'Pages are being prepared in the background';
+      if (finished) this._bgStatusTimer = setTimeout(() => { if (el) el.hidden = true; }, 2500);
     }
 
     _scrollToPage(n) {
@@ -2349,6 +3248,7 @@ class VideoPlayer {
     }
 
     _onBodyScroll() {
+      this._lastScrollAt = Date.now();
       this._hideSelMenu();
       if (!this.modal || !this.bodyEl) return;
       const scrollTop = this.bodyEl.scrollTop;
@@ -2417,17 +3317,28 @@ class VideoPlayer {
 
     async _setZoom(scale) {
       scale = Math.max(0.4, Math.min(3.5, scale));
+      this._userZoomed = true;
       if (Math.abs(scale - this.scale) < 0.01) return;
+      /* Zoom pressed while the document is still loading (or after the
+         viewer closed) — nothing to re-lay out yet. */
+      if (!this.active || !this.pdfDoc || !this.bodyEl) return;
+      const bodyEl = this.bodyEl;
 
-      const ratio = this.bodyEl.scrollTop / Math.max(1, this.bodyEl.scrollHeight);
+      const ratio = bodyEl.scrollTop / Math.max(1, bodyEl.scrollHeight);
       this.scale = scale;
       this._updateZoomLabel();
 
-      this.bodyEl.style.visibility = 'hidden';
-      await this._renderAllPages();
-      this.bodyEl.scrollTop = ratio * this.bodyEl.scrollHeight;
-      await this._renderVisiblePagesNow();
-      this.bodyEl.style.visibility = '';
+      bodyEl.style.visibility = 'hidden';
+      try {
+        await this._renderAllPages();
+        if (!this.active || this.bodyEl !== bodyEl) return;
+        bodyEl.scrollTop = ratio * bodyEl.scrollHeight;
+        await this._renderVisiblePagesNow();
+      } catch (e) {
+        if (this.active) console.warn('[PDFViewer] zoom:', e && e.message);
+      } finally {
+        bodyEl.style.visibility = '';
+      }
     }
 
     _updateZoomLabel() {
@@ -2440,7 +3351,8 @@ class VideoPlayer {
       if (!this.pdfDoc) return;
       const page = await this.pdfDoc.getPage(1);
       const vp = page.getViewport({ scale: 1 });
-      const target = (this.bodyEl.clientWidth - 60) / vp.width;
+      const gutter = this.bodyEl.clientWidth < 760 ? 16 : 60;
+      const target = (this.bodyEl.clientWidth - gutter) / vp.width;
       this._setZoom(target);
     }
 
@@ -2673,6 +3585,11 @@ class VideoPlayer {
         clearTimeout(this._saveProgressTimer);
         this._saveProgressTimer = null;
       }
+      /* Nothing on screen yet, or the saved page has not been restored
+         yet → keep the saved page (closing while loading used to reset
+         it to page 1). */
+      if (!this.pageEls || !this.pageEls.size) return;
+      if ((this._resumePage || 1) > 1 && !this._resumeApplied) return;
       try {
         const payload = {
           page: this.currentPage || 1,
@@ -2723,7 +3640,7 @@ class VideoPlayer {
            already kicked it off. */
         if (pageEl.dataset.rendered !== '1') {
           this._renderPage(target)
-            .then(() => { pageEl.dataset.rendered = '1'; })
+            .then(() => { this._markRendered(target, pageEl); })
             .catch(() => {});
         }
 
@@ -2912,32 +3829,113 @@ class VideoPlayer {
       st.ov.querySelector('[data-p="next"]').disabled = n >= st.max;
       try {
         if (st.task) { try { st.task.cancel(); } catch (e) {} }
+        const W = window.innerWidth, H = window.innerHeight;
+        const dpr = Math.min(window.devicePixelRatio || 1, PDF_MAX_DPR);
+        const key = W + 'x' + H + 'x' + dpr;
+        if (!st.cache) st.cache = new Map();
+
+        /* ⚡ The slide was pre-rendered in the background → instant */
+        if (st.pre && st.pre.n === n && st.pre.key === key) {
+          try { await st.pre.p; } catch (_) {}
+          if (!this._present || st.page !== n) return;
+        } else if (st.pre && st.pre.task) {
+          try { st.pre.task.cancel(); } catch (_) {}
+        }
+        const hit = st.cache.get(n);
+        if (hit && hit.key === key) {
+          const c = st.canvas;
+          c.width = hit.canvas.width;
+          c.height = hit.canvas.height;
+          c.style.width = hit.cssW + 'px';
+          c.style.height = hit.cssH + 'px';
+          c.getContext('2d', { alpha: false }).drawImage(hit.canvas, 0, 0);
+          this._presentPrefetch(n, key);
+          return;
+        }
+
         const page = await this.pdfDoc.getPage(n);
         if (!this._present || st.page !== n) return;
         const base = page.getViewport({ scale: 1 });
-        const W = window.innerWidth, H = window.innerHeight;
         const fit = Math.min(W / base.width, H / base.height);
-        const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
         const vp = page.getViewport({ scale: fit * dpr });
         const c = st.canvas;
         c.width = Math.floor(vp.width);
         c.height = Math.floor(vp.height);
         c.style.width = Math.floor(vp.width / dpr) + 'px';
         c.style.height = Math.floor(vp.height / dpr) + 'px';
-        st.task = page.render({ canvasContext: c.getContext('2d', { alpha: false }), viewport: vp });
+        const ctx = c.getContext('2d', { alpha: false });
+        /* Background snapshot as an instant stand-in while the sharp
+           slide is drawn on top of it */
+        const snap = this._snaps && this._snaps.get(n);
+        if (snap) {
+          try {
+            const img = new Image();
+            img.src = snap.url;
+            await img.decode();
+            if (!this._present || st.page !== n) return;
+            ctx.drawImage(img, 0, 0, c.width, c.height);
+          } catch (_) {}
+        }
+        st.task = page.render({ canvasContext: ctx, viewport: vp });
         await st.task.promise;
-        /* warm the next slide */
-        if (n < st.max) this.pdfDoc.getPage(n + 1).catch(() => {});
+        /* ⚡ prepare the next slides while this one is being presented */
+        this._presentPrefetch(n, key);
       } catch (e) {
         if (e && e.name === 'RenderingCancelledException') return;
         console.warn('[present]', e && e.message);
       }
     }
 
+    /* ⚡ Slideshow look-ahead: the next two slides (and the previous
+       one) are drawn off-screen, so "Next" shows them instantly.
+       Phones keep only the next slide to save memory. */
+    _presentPrefetch(n, key) {
+      const st = this._present;
+      if (!st || !this.pdfDoc) return;
+      let lowMem = false;
+      try { lowMem = (Number(navigator.deviceMemory) || 8) <= 4 || window.matchMedia('(pointer: coarse)').matches; } catch (_) {}
+      const want = (lowMem ? [n + 1] : [n + 1, n + 2, n - 1]).filter(x => x >= 1 && x <= st.max);
+      const keep = new Set(want.concat([n]));
+      st.cache.forEach((v, k) => {
+        if (!keep.has(k) || v.key !== key) { v.canvas.width = 0; v.canvas.height = 0; st.cache.delete(k); }
+      });
+      const token = (st.preToken = (st.preToken || 0) + 1);
+      const run = async () => {
+        for (const m of want) {
+          if (this._present !== st || st.preToken !== token) return;
+          const have = st.cache.get(m);
+          if (have && have.key === key) continue;
+          const job = { n: m, key, task: null, p: null };
+          job.p = (async () => {
+            const page = await this.pdfDoc.getPage(m);
+            const W = window.innerWidth, H = window.innerHeight;
+            const dpr = Math.min(window.devicePixelRatio || 1, PDF_MAX_DPR);
+            const base = page.getViewport({ scale: 1 });
+            const vp = page.getViewport({ scale: Math.min(W / base.width, H / base.height) * dpr });
+            const cv = document.createElement('canvas');
+            cv.width = Math.floor(vp.width);
+            cv.height = Math.floor(vp.height);
+            job.task = page.render({ canvasContext: cv.getContext('2d', { alpha: false }), viewport: vp });
+            try { await job.task.promise; }
+            catch (err) { cv.width = 0; cv.height = 0; throw err; }
+            if (this._present !== st) { cv.width = 0; cv.height = 0; return; }
+            st.cache.set(m, { key, canvas: cv, cssW: Math.floor(vp.width / dpr), cssH: Math.floor(vp.height / dpr) });
+          })();
+          st.pre = job;
+          try { await job.p; } catch (_) { /* cancelled or failed — drawn on demand instead */ }
+          if (st.pre === job) st.pre = null;
+        }
+      };
+      setTimeout(run, 60);
+    }
+
     _endPresentation(silent) {
       const st = this._present;
       if (!st) return;
       this._present = null;
+      st.preToken = (st.preToken || 0) + 1;
+      if (st.pre && st.pre.task) { try { st.pre.task.cancel(); } catch (_) {} }
+      if (st.cache) { st.cache.forEach((v) => { v.canvas.width = 0; v.canvas.height = 0; }); st.cache.clear(); }
       document.removeEventListener('keydown', st.onKey, true);
       window.removeEventListener('resize', st.onResize);
       document.removeEventListener('fullscreenchange', st.onFs);
@@ -3013,6 +4011,7 @@ class VideoPlayer {
 
     close() {
       if (!this.active) return;
+      clearInterval(this._sharpGuard); this._sharpGuard = null;
       if (this._present) { try { this._endPresentation(true); } catch (e) {} }
 
       /* ⭐ Persist the last read page synchronously before the DOM
@@ -3040,6 +4039,23 @@ class VideoPlayer {
         setTimeout(() => { try { m.remove(); } catch(e){} }, 240);
       }
       this._disconnectPageObserver();
+      this._stopBackgroundRender();
+      if (this._manifestTimer && this._manifest && this._cacheKey) {
+        clearTimeout(this._manifestTimer);
+        AeroPdfCache.putManifest(this._cacheKey, this._manifest);
+      }
+      this._freeSnapshots();
+      /* ⚡ Stop any download still in progress and free the document
+         in the worker (the shared worker itself stays ready for the
+         next PDF). */
+      if (this._rangeAbort) { try { this._rangeAbort.abort(); } catch (_) {} }   // range requests still on their way
+      const task = this._loadingTask;
+      this._loadingTask = null;
+      if (task) {
+        try { Promise.resolve(task.destroy()).catch(() => {}); } catch (e) {}
+      }
+      if (this._inflight) this._inflight.clear();
+      if (this._renderTasks) this._renderTasks.clear();
       this.pdfDoc = null;
       this.pageEls.clear();
       this.textLayers.clear();

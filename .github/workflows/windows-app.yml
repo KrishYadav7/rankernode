@@ -1,0 +1,96 @@
+# ============================================================
+#  Build + test the RankerNode Windows app in the cloud.
+#  Runs when desktop-app/ changes on main, or by hand:
+#  GitHub → Actions → "Windows app (installer)" → Run workflow.
+#
+#  Result: a GitHub Release "windows-v1.0.<N>" with
+#    • RankerNode-Setup-1.0.<N>.exe   ← publish it in Admin → Apps
+#    • windows-test-report.txt + screenshots (the app tested
+#      itself on a real Windows machine: install, open the site,
+#      downloads, pop-ups, outside links, offline screen…)
+#  No secrets needed.
+# ============================================================
+name: Windows app (installer)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop-app/**'
+      - '.github/workflows/windows-app.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VERSION: 1.0.${{ github.run_number }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install tools
+        working-directory: desktop-app
+        shell: bash
+        run: npm install --no-audit --no-fund
+
+      - name: Set the version (1.0.${{ github.run_number }})
+        working-directory: desktop-app
+        shell: bash
+        run: npm pkg set version="$VERSION"
+
+      - name: Build the installer
+        working-directory: desktop-app
+        shell: bash
+        run: npx electron-builder --win nsis --x64 --publish never
+
+      - name: Show what was built
+        shell: bash
+        run: |
+          ls -la desktop-app/dist
+          sha256sum desktop-app/dist/RankerNode-Setup-*.exe
+
+      # The test steps live in desktop-app/ci/ (so they can change without touching this file).
+      - name: Self-test (built app)
+        continue-on-error: true
+        shell: pwsh
+        run: ./desktop-app/ci/test-built.ps1
+
+      - name: Install silently + self-test the installed app
+        continue-on-error: true
+        shell: pwsh
+        run: ./desktop-app/ci/test-install.ps1
+
+      - name: Collect the report
+        id: report
+        if: always()
+        shell: bash
+        run: bash desktop-app/ci/collect.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: RankerNode-Windows-${{ env.VERSION }}
+          path: publish/
+          retention-days: 90
+
+      - name: Publish as a GitHub Release
+        if: always() && hashFiles('publish/RankerNode-Setup-*.exe') != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-v${{ env.VERSION }}
+          name: RankerNode Windows ${{ env.VERSION }}
+          body: |
+            Windows app (64-bit, Windows 10/11). Publish it on the website:
+            Admin → Apps → Windows → "Publish latest from GitHub" (or upload the .exe).
+            The test report and screenshots from a real Windows machine are attached.
+            Failed checks in this build: ${{ steps.report.outputs.fails }}
+          files: publish/*

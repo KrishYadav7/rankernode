@@ -46,6 +46,8 @@ const userSchema = new mongoose.Schema({
   }],
 
   quizResults: { type: Map, of: Object, default: {} },
+  /* ⭐ 2026-10-11 — practice: mastered mistakes, daily challenge, streak */
+  learning: { type: mongoose.Schema.Types.Mixed, default: {} },
   // ↑ Each value now may contain:
   //   {
   //     score, total, percent, marksEarned, marksPossible, attempts, lastAttemptAt,
@@ -81,6 +83,8 @@ const userSchema = new mongoose.Schema({
 
     autoRenew:        { type: Boolean, default: false },
     paymentMode:      { type: String,  default: 'subscription' }, // 'subscription' | 'one-time'
+    /* ⭐ an extension bought while premium is live — applied once its payment is confirmed */
+    pendingPlan:      { type: Object,  default: null },
     lastPaymentId:    { type: String,  default: null },
 
     history: [{
@@ -181,6 +185,45 @@ const userSchema = new mongoose.Schema({
   },
 
   /* ============================================================
+     ⭐ PROFESSOR ACCOUNT (2026-10-07)
+     Only used when role === 'professor'.
+       status: pending  → registered, waiting for the admin
+               approved → may sign in and request courses
+               rejected → application turned down (reviewNote = reason)
+               revoked  → access withdrawn later by the admin
+       courses:  course ids the admin has approved for this professor
+       requests: course-access requests (name + code typed by the professor)
+     ============================================================ */
+  professor: {
+    status:          { type: String, default: null },
+    designation:     { type: String, default: '' },
+    department:      { type: String, default: '' },
+    institution:     { type: String, default: '' },
+    qualification:   { type: String, default: '' },
+    specialization:  { type: String, default: '' },
+    experienceYears: { type: Number, default: 0 },
+    employeeId:      { type: String, default: '' },
+    profileUrl:      { type: String, default: '' },
+    bio:             { type: String, default: '' },
+    appliedAt:       { type: Date,   default: null },
+    reviewedAt:      { type: Date,   default: null },
+    reviewedBy:      { type: String, default: '' },
+    reviewNote:      { type: String, default: '' },
+    courses:         { type: [String], default: [] },
+    requests: [{
+      courseName:  { type: String, default: '' },
+      courseCode:  { type: String, default: '' },
+      message:     { type: String, default: '' },
+      status:      { type: String, default: 'pending' },   // pending | approved | rejected
+      courseId:    { type: String, default: null },        // the course the admin granted
+      requestedAt: { type: Date,   default: Date.now },
+      reviewedAt:  { type: Date,   default: null },
+      reviewedBy:  { type: String, default: '' },
+      reviewNote:  { type: String, default: '' }
+    }]
+  },
+
+  /* ============================================================
      ACTIVE SESSION
      ============================================================ */
   activeSession: {
@@ -188,7 +231,23 @@ const userSchema = new mongoose.Schema({
     deviceInfo: { type: String, default: '' },
     loginAt:    { type: Date,   default: null },
     lastSeenAt: { type: Date,   default: null }
-  }
+  },
+
+  /* ============================================================
+     ⭐ ADMIN MULTI-DEVICE SESSIONS (2026-10-08)
+     Admin accounts may stay signed in on up to ADMIN_MAX_SESSIONS
+     (default 3) devices at once. Signing in on one more device signs
+     out the least-recently-used one. Students and professors keep
+     the single-device `activeSession` above — this list stays empty.
+     ============================================================ */
+  sessions: [{
+    _id:        false,
+    sessionId:  { type: String, required: true },
+    deviceInfo: { type: String, default: '' },
+    ip:         { type: String, default: '' },
+    loginAt:    { type: Date,   default: Date.now },
+    lastSeenAt: { type: Date,   default: Date.now }
+  }]
 }, { timestamps: true });
 
 userSchema.index({ email: 1 });
@@ -197,5 +256,6 @@ userSchema.index({ role: 1, createdAt: -1 });
 userSchema.index({ 'subscription.status': 1 });
 userSchema.index({ role: 1, email: 1 });
 userSchema.index({ 'suspended.active': 1 });
+userSchema.index({ role: 1, 'professor.status': 1 });
 
 module.exports = mongoose.model('User', userSchema);

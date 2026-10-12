@@ -4,24 +4,39 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
+import android.os.SystemClock;
+import android.print.PrintAttributes;
+import android.print.PrintDocumentAdapter;
+import android.print.PrintManager;
 import android.provider.MediaStore;
+import android.util.Base64;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.window.OnBackInvokedDispatcher;
+import android.webkit.JavascriptInterface;
 import android.webkit.MimeTypeMap;
 import android.webkit.PermissionRequest;
+import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -41,7 +56,9 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
@@ -60,8 +77,14 @@ import java.util.Set;
  *   (and hides the content in the recent-apps switcher).
  * • File uploads (AI Doubt Solver, contributions) incl. taking a photo with the camera.
  * • Payment / bank pop-ups open inside the app; UPI apps open via their own links.
- * • Back button walks back through the site; offline screen with Retry.
+ * • Opens on the landing page; its buttons lead into the app.
+ * • Back button: closes the site's pop-ups / menus first (window.aeroBack),
+ *   then walks back through the site; at the very start "press back again
+ *   to exit" instead of closing at once. Offline screen with Retry.
  * • Checks the website for a newer APK and offers the update.
+ * • Downloads made by the website (notes PDF/PNG, exports, files) are saved to
+ *   Downloads/RankerNode through a small JavaScript bridge, and generated pages
+ *   (certificates) can be saved as PDF with Android's print service.
  */
 public class MainActivity extends Activity {
 
@@ -91,6 +114,11 @@ public class MainActivity extends Activity {
 
     private String appHost;
     private String lastFailedUrl;
+    /** host of the page now shown in the main view — the download bridge only serves our own site */
+    private volatile String mainHost = "";
+    /** time of the last back press that had nowhere to go (for "press again to exit") */
+    private long lastExitBackAt = 0;
+    private boolean backPending = false;
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -120,13 +148,45 @@ public class MainActivity extends Activity {
         root.addView(progress, lp);
 
         setContentView(root);
+        setupEdgeToEdge();
+
+        /* Android 13+: the back gesture / button comes here (onBackPressed is not called
+           on Android 16 for apps that target it) */
+        if (Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::handleBack);
+        }
 
         if (savedInstanceState != null && web.restoreState(savedInstanceState) != null) {
             // history restored after Android closed the app in the background
         } else {
             web.loadUrl(startUrl(getIntent()));
         }
-        maybeCheckForUpdate();
+        /* The Play Store version updates through Google Play only (Play policy). */
+        if (!IS_PLAY_BUILD) maybeCheckForUpdate();
+    }
+
+    /** true in the Google Play build (flavor "play"); false in the APK from the website */
+    private static final boolean IS_PLAY_BUILD = "play".equals(BuildConfig.STORE);
+
+    /** Android 15+ draws the app behind the status and navigation bars: keep the website
+        clear of them (and of the keyboard), with the bars in the brand colour. */
+    private void setupEdgeToEdge() {
+        if (Build.VERSION.SDK_INT < 35) return;          // older Android: the theme handles the bars
+        root.setBackgroundColor(getColor(R.color.brand_dark));
+        web.setBackgroundColor(Color.WHITE);
+        WindowInsetsController c = getWindow().getInsetsController();
+        if (c != null) {
+            c.setSystemBarsAppearance(0, WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+        }
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            Insets ime = insets.getInsets(WindowInsets.Type.ime());
+            v.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, ime.bottom));
+            return WindowInsets.CONSUMED;
+        });
+        root.requestApplyInsets();
     }
 
     @Override
@@ -169,7 +229,11 @@ public class MainActivity extends Activity {
     }
 
     @Override
-    public void onBackPressed() {
+    public void onBackPressed() {                         // Android 12 and older
+        handleBack();
+    }
+
+    private void handleBack() {
         if (fullscreenView != null) {
             exitFullscreen();
             return;
@@ -179,11 +243,32 @@ public class MainActivity extends Activity {
             else closePopup();
             return;
         }
+        /* let the website close its own pop-up / menu or go up a page first */
+        if (isOwnHost(mainHost) && !backPending) {
+            backPending = true;
+            web.evaluateJavascript(
+                    "(function(){try{return !!(window.aeroBack&&window.aeroBack());}catch(e){return false;}})()",
+                    value -> {
+                        backPending = false;
+                        if (!"true".equals(value)) backThroughHistory();
+                    });
+            return;
+        }
+        if (!backPending) backThroughHistory();
+    }
+
+    private void backThroughHistory() {
         if (web.canGoBack()) {
             web.goBack();
             return;
         }
-        super.onBackPressed();
+        long now = SystemClock.uptimeMillis();
+        if (now - lastExitBackAt < 2200) {
+            finish();
+        } else {
+            lastExitBackAt = now;
+            Toast.makeText(this, "Press back again to exit", Toast.LENGTH_SHORT).show();
+        }
     }
 
     // ------------------------------------------------------------------ WebView
@@ -193,7 +278,7 @@ public class MainActivity extends Activity {
         if (data != null && "https".equalsIgnoreCase(data.getScheme()) && isOwnHost(hostOf(data))) {
             return data.toString();
         }
-        return BuildConfig.APP_URL;
+        return BuildConfig.START_URL;
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -214,20 +299,35 @@ public class MainActivity extends Activity {
         s.setBuiltInZoomControls(true);
         s.setDisplayZoomControls(false);
         /* lets the website know it runs inside the app (hides "Get App" etc.) */
-        s.setUserAgentString(s.getUserAgentString() + " AltitudeAcademyApp/" + BuildConfig.VERSION_NAME);
+        /* The website reads this: it hides "Get App" inside the app, and in the Google Play
+           build ("Store/Play") it also hides buying, which Play policy requires. */
+        s.setUserAgentString(s.getUserAgentString() + " RankerNodeApp/" + BuildConfig.VERSION_NAME
+                + (IS_PLAY_BUILD ? " Store/Play" : ""));
 
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
         cookies.setAcceptThirdPartyCookies(w, true);   // payment gateway frames
 
         w.setBackgroundColor(Color.WHITE);
+        if (isPopup) w.addJavascriptInterface(new PrintBridge(w), "RankerNodePrint");
+        else w.addJavascriptInterface(new DownloadBridge(), "RankerNodeAndroid");
         w.setWebViewClient(new AppWebViewClient(isPopup));
         w.setWebChromeClient(new AppChromeClient());
         w.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
             Uri u = Uri.parse(url);
             String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
-            if (scheme.equals("http") || scheme.equals("https")) openExternal(u);
-            else toast("This file can't be downloaded in the app.");
+            String name = URLUtil.guessFileName(url, contentDisposition, mimeType);
+            boolean ours = !isPopup && isOwnHost(mainHost);
+            if (ours && (scheme.equals("blob") || scheme.equals("data")
+                    || ((scheme.equals("https")) && isOwnHost(hostOf(u))))) {
+                /* the page itself fetches the file (with the student's login) and streams it to us */
+                web.evaluateJavascript("window.__aeroSaveUrl && window.__aeroSaveUrl("
+                        + JSONObject.quote(url) + "," + JSONObject.quote(name) + ")", null);
+            } else if (scheme.equals("http") || scheme.equals("https")) {
+                openExternal(u);
+            } else {
+                toast("This file can't be downloaded in the app.");
+            }
         });
         return w;
     }
@@ -245,8 +345,13 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+            if (view == web) mainHost = hostOf(Uri.parse(url));
+        }
+
+        @Override
         public void onPageFinished(WebView view, String url) {
-            if (view == web) progress.setVisibility(View.GONE);
+            if (view == web) { progress.setVisibility(View.GONE); mainHost = hostOf(Uri.parse(url)); }
             if (isPopup && popupTitle != null) {
                 String t = view.getTitle();
                 popupTitle.setText(TextUtils.isEmpty(t) ? hostOf(Uri.parse(url)) : t);
@@ -270,7 +375,7 @@ public class MainActivity extends Activity {
         if (scheme.equals("file") && "/android_asset/offline.html".equals(uri.getPath())) return false;
 
         if (scheme.equals("altitude") && "retry".equals(uri.getHost())) {      // from the offline page
-            web.loadUrl(lastFailedUrl != null ? lastFailedUrl : BuildConfig.APP_URL);
+            web.loadUrl(lastFailedUrl != null ? lastFailedUrl : BuildConfig.START_URL);
             return true;
         }
 
@@ -403,6 +508,16 @@ public class MainActivity extends Activity {
         popupTitle.setEllipsize(TextUtils.TruncateAt.END);
         popupTitle.setText("Loading…");
         bar.addView(popupTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView pdf = new TextView(this);
+        pdf.setText("Save PDF");
+        pdf.setTextColor(Color.WHITE);
+        pdf.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        pdf.setGravity(Gravity.CENTER);
+        pdf.setPadding(dp(12), 0, dp(4), 0);
+        pdf.setContentDescription("Save this page as a PDF");
+        pdf.setOnClickListener(v -> { if (popup != null) printPage(popup); });
+        bar.addView(pdf, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
 
         popupBox.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
         popup = createWebView(true);
@@ -595,6 +710,190 @@ public class MainActivity extends Activity {
                 .setNegativeButton("Later", null)
                 .setNeutralButton("Skip this version", (d, w) -> prefs.edit().putString("skipVersion", version).apply())
                 .show();
+    }
+
+    // ------------------------------------------------------------------ downloads & PDF
+
+    /**
+     * Files the website creates or fetches (notes PDF/PNG, exports…) arrive here
+     * in base64 chunks: begin(name, mime) → chunk(…) × n → end(). They are written
+     * straight to Downloads/RankerNode, so memory use stays small even for big files.
+     */
+    private class DownloadBridge {
+        private OutputStream out;
+        private Uri outUri;
+        private File outFile;
+        private String outName = "", outMime = "";
+
+        private boolean allowed() { return isOwnHost(mainHost); }
+
+        @JavascriptInterface
+        public String version() { return BuildConfig.VERSION_NAME; }
+
+        @JavascriptInterface
+        public synchronized String begin(String name, String mime) {
+            if (!allowed()) return "denied";
+            closeQuietly();
+            try {
+                outName = cleanName(name);
+                outMime = TextUtils.isEmpty(mime) ? guessMime(outName) : mime;
+                if (Build.VERSION.SDK_INT >= 29) {
+                    ContentValues v = new ContentValues();
+                    v.put(MediaStore.MediaColumns.DISPLAY_NAME, outName);
+                    v.put(MediaStore.MediaColumns.MIME_TYPE, outMime);
+                    v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/RankerNode");
+                    v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                    outUri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                    if (outUri == null) return "error";
+                    out = getContentResolver().openOutputStream(outUri);
+                } else {
+                    File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                    if (dir == null) dir = new File(getFilesDir(), "Download");
+                    if (!dir.exists() && !dir.mkdirs()) return "error";
+                    outFile = uniqueFile(dir, outName);
+                    out = new FileOutputStream(outFile);
+                    outUri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".files", outFile);
+                }
+                return out == null ? "error" : "ok";
+            } catch (Exception e) {
+                closeQuietly();
+                return "error";
+            }
+        }
+
+        @JavascriptInterface
+        public synchronized boolean chunk(String b64) {
+            if (out == null) return false;
+            try {
+                out.write(Base64.decode(b64, Base64.DEFAULT));
+                return true;
+            } catch (Exception e) {
+                abort();
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public synchronized void end() {
+            if (out == null) return;
+            try {
+                out.close();
+                out = null;
+                if (Build.VERSION.SDK_INT >= 29 && outUri != null) {
+                    ContentValues v = new ContentValues();
+                    v.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    getContentResolver().update(outUri, v, null, null);
+                }
+                final Uri uri = outUri;
+                final String name = outName, mime = outMime;
+                runOnUiThread(() -> showSaved(uri, name, mime));
+            } catch (Exception e) {
+                abort();
+                runOnUiThread(() -> toast("Could not save the file."));
+            }
+        }
+
+        @JavascriptInterface
+        public synchronized void abort() {
+            closeQuietly();
+            try {
+                if (outUri != null && Build.VERSION.SDK_INT >= 29) getContentResolver().delete(outUri, null, null);
+                if (outFile != null) //noinspection ResultOfMethodCallIgnored
+                    outFile.delete();
+            } catch (Exception ignored) { }
+            outUri = null;
+            outFile = null;
+        }
+
+        /** the main page asks to print / save as PDF (e.g. a certificate) */
+        @JavascriptInterface
+        public void print() {
+            if (!allowed()) return;
+            runOnUiThread(() -> printPage(web));
+        }
+
+        private void closeQuietly() {
+            try { if (out != null) out.close(); } catch (Exception ignored) { }
+            out = null;
+        }
+    }
+
+    /** pop-up pages written by the site (certificates) call RankerNodePrint.print() */
+    private class PrintBridge {
+        private final WebView target;
+        PrintBridge(WebView target) { this.target = target; }
+
+        @JavascriptInterface
+        public void print() {
+            runOnUiThread(() -> { if (target == popup) printPage(target); });
+        }
+    }
+
+    private void printPage(WebView view) {
+        try {
+            PrintManager pm = (PrintManager) getSystemService(Context.PRINT_SERVICE);
+            String title = view.getTitle();
+            if (TextUtils.isEmpty(title) || title.startsWith("about:")) title = "RankerNode";
+            PrintDocumentAdapter adapter = view.createPrintDocumentAdapter(title);
+            pm.print(title, adapter, new PrintAttributes.Builder()
+                    .setMediaSize(PrintAttributes.MediaSize.ISO_A4).build());
+        } catch (Exception e) {
+            toast("Printing is not available on this phone.");
+        }
+    }
+
+    private void showSaved(Uri uri, String name, String mime) {
+        if (isFinishing()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Saved")
+                .setMessage("“" + name + "” is saved in " + (Build.VERSION.SDK_INT >= 29 ? "Downloads › RankerNode." : "the app's Downloads folder."))
+                .setPositiveButton("Open", (d, w) -> openSaved(uri, mime, false))
+                .setNeutralButton("Share", (d, w) -> openSaved(uri, mime, true))
+                .setNegativeButton("OK", null)
+                .show();
+    }
+
+    private void openSaved(Uri uri, String mime, boolean share) {
+        try {
+            Intent i;
+            if (share) {
+                i = new Intent(Intent.ACTION_SEND);
+                i.setType(mime);
+                i.putExtra(Intent.EXTRA_STREAM, uri);
+            } else {
+                i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(uri, mime);
+            }
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(i, share ? "Share" : "Open with"));
+        } catch (Exception e) {
+            toast("No app on this phone can open this file.");
+        }
+    }
+
+    private static String cleanName(String name) {
+        String n = name == null ? "" : name.replaceAll("[\\\\/:*?\"<>|\\u0000-\\u001f]+", " ").trim();
+        if (n.isEmpty()) n = "RankerNode-" + System.currentTimeMillis();
+        if (n.length() > 120) n = n.substring(n.length() - 120);
+        return n;
+    }
+
+    private static String guessMime(String name) {
+        int dot = name.lastIndexOf('.');
+        String m = dot > 0 ? MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(Locale.ROOT)) : null;
+        return m == null ? "application/octet-stream" : m;
+    }
+
+    private static File uniqueFile(File dir, String name) {
+        File f = new File(dir, name);
+        if (!f.exists()) return f;
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name, ext = dot > 0 ? name.substring(dot) : "";
+        for (int i = 1; i < 1000; i++) {
+            f = new File(dir, base + " (" + i + ")" + ext);
+            if (!f.exists()) return f;
+        }
+        return new File(dir, System.currentTimeMillis() + "-" + name);
     }
 
     // ------------------------------------------------------------------ helpers

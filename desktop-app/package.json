@@ -1,0 +1,70 @@
+{
+  "name": "rankernode-desktop",
+  "productName": "RankerNode",
+  "version": "1.0.0",
+  "description": "RankerNode — desktop app",
+  "author": "RankerNode",
+  "homepage": "https://rankernode.example",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "selftest": "electron . --aero-selftest=./selftest-out",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "dist:mac": "electron-builder --mac dmg --universal --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "41.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.altitudeacademy.app",
+    "productName": "RankerNode",
+    "copyright": "© RankerNode",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "electronLanguages": ["en-US", "en-GB", "hi"],
+    "protocols": [
+      { "name": "RankerNode", "schemes": ["rankernode"] }
+    ],
+    "publish": [
+      { "provider": "generic", "url": "https://rankernode.example/download/windows/" }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico",
+      "artifactName": "RankerNode-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "RankerNode",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "uninstallDisplayName": "RankerNode",
+      "artifactName": "RankerNode-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "category": "public.app-category.education",
+      "icon": "build/icon.png",
+      "target": ["dmg"],
+      "artifactName": "RankerNode-${version}-mac.${ext}"
+    }
+  }
+}

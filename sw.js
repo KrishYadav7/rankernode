@@ -1,12 +1,12 @@
 /* ============================================================
-   SERVICE WORKER — v138 (RankerNode)
+   SERVICE WORKER — v148 (RankerNode)
    ------------------------------------------------------------
    KEY RULE: NEVER cache app code (app.js, styles.css, media-viewer.js,
    sw.js, index.html, landing.html, /app). Those files must always
    come from the network. Only truly static assets (manifest, images)
    go in the cache.
    ============================================================ */
-const CACHE_NAME = 'rankernode-shell-v138';
+const CACHE_NAME = 'rankernode-shell-v148';
 
 /* ONLY these go into the offline cache — they never change silently */
 const SHELL_ASSETS = [
@@ -31,6 +31,10 @@ const NEVER_CACHE_PATTERNS = [
    /\/document-viewer\.js$/,
   /\/content-shield\.js$/,
   /\/login-popup\.js$/,
+  /\/notes\.js$/,
+  /\/tex-render\.js$/,
+  /\/learning\.js$/,
+  /\/notes\.css$/,
   /\/sw\.js$/
 ];
 
@@ -52,7 +56,8 @@ self.addEventListener('activate', (event) => {
     caches.keys()
       .then((keys) =>
         Promise.all(
-          keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
+          /* keep the on-device PDF page cache (media-viewer.js) */
+          keys.filter((k) => k !== CACHE_NAME && k.indexOf('aero-pdf-pages') !== 0).map((k) => caches.delete(k))
         )
       )
       .then(() => self.clients.claim())

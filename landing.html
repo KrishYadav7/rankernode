@@ -7,13 +7,13 @@
   <meta name="description" content="RankerNode — chapter-wise preparation for JEE Main, JEE Advanced, NEET and Class 11–12. Learn. Practice. Rank. Video lectures, notes, DPPs, PYQs and an AI doubt solver for Physics, Chemistry, Maths and Biology.">
   <link rel="manifest" href="manifest.json?v=138">
 
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=138">
-  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=138">
-  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=138">
-  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png?v=138">
-  <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png?v=138">
-  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=138">
-  <link rel="shortcut icon" href="/favicon-32.png?v=138">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=160">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=160">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=160">
+  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png?v=160">
+  <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png?v=160">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=160">
+  <link rel="shortcut icon" href="/favicon-32.png?v=160">
 
   <title>RankerNode — Learn. Practice. Rank. | JEE · NEET · Class 11–12</title>
 
@@ -30,20 +30,42 @@
         onload="this.onload=null;this.rel='stylesheet'">
   <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"></noscript>
 
+  <!-- ⭐ One scroll loop for the whole landing page: the position is read
+       once per frame, then every feature updates from that value — reads
+       never follow writes, so the browser never recalculates mid-frame. -->
+  <script>
+    (function () {
+      var subs = [], raf = 0, lastY = -1;
+      function frame() {
+        raf = 0;
+        var y = window.pageYOffset || 0;
+        if (y === lastY) return;
+        lastY = y;
+        for (var i = 0; i < subs.length; i++) { try { subs[i](y); } catch (e) {} }
+      }
+      function kick() { if (!raf) raf = requestAnimationFrame(frame); }
+      window.lpOnScroll = function (fn) { subs.push(fn); try { fn(window.pageYOffset || 0); } catch (e) {} };
+      window.lpScrollRefresh = function () { lastY = -1; kick(); };
+      window.addEventListener('scroll', kick, { passive: true });
+      window.addEventListener('resize', window.lpScrollRefresh, { passive: true });
+    })();
+  </script>
   <!-- Same global stylesheet → 100% theme continuity with the app -->
   <script>
     /* ⭐ Pre-paint theme — avoids a light flash for dark-mode users */
     (function () {
       try {
         var t = localStorage.getItem('aero_theme');
-        if (t !== 'light' && t !== 'dim' && t !== 'dark') {
+        if (t !== 'light' && t !== 'dim' && t !== 'dark' && t !== 'space' && t !== 'aurora') {
           t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
         }
-        document.documentElement.setAttribute('data-theme', t);
+        /* ⭐ Space = dark base + space skin · Aurora = light base + aurora skin (same as the app) */
+        if (t === 'space' || t === 'aurora') document.documentElement.setAttribute('data-skin', t);
+        document.documentElement.setAttribute('data-theme', t === 'space' ? 'dark' : t === 'aurora' ? 'light' : t);
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=138">
+  <link rel="stylesheet" href="styles.css?v=145">
   <!-- ⭐ Content shield — public page: block capture shortcuts, printing,
        right-click and copying; no focus cover here. -->
   <script>window.AERO_SHIELD_CONFIG = { coverOnBlur: false, report: false };</script>
@@ -125,15 +147,17 @@
       -webkit-backdrop-filter: blur(22px) saturate(180%);
       border-bottom: 1px solid var(--header-border);
       padding: 14px 32px;
-      transition: padding .25s var(--ease), box-shadow .25s var(--ease);
+      transition: box-shadow .25s var(--ease), background-color .25s var(--ease);
     }
     [data-theme="light"] .landing-nav {
       background: linear-gradient(135deg, #0a0e1f 0%, #131b3d 55%, #1f1a4d 100%);
     }
     [data-theme="dark"] .landing-nav { background: rgba(16,18,22,.72); }
     [data-theme="dim"]  .landing-nav { background: rgba(24,24,31,.78); }
+    /* ⭐ scrolled = shadow only. It used to shrink the padding too, which
+       changed the bar's height and re-laid out the whole page on every
+       frame of the first scroll — the stutter right at the start. */
     .landing-nav.scrolled {
-      padding: 10px 32px;
       box-shadow: 0 8px 32px rgba(0,0,0,.28);
     }
     .landing-nav-inner {
@@ -746,6 +770,21 @@
       color: var(--brand-500);
     }
     .landing-instructor-body { flex: 1; min-width: 280px; }
+    /* skeleton while the admin's founder details load (no built-in text) */
+    .landing-instructor-card.is-loading .landing-instructor-fallback,
+    .landing-instructor-card.is-loading #instructorRole,
+    .landing-instructor-card.is-loading #instructorName,
+    .landing-instructor-card.is-loading #instructorTitle,
+    .landing-instructor-card.is-loading #instructorBio {
+      color: transparent !important; background: linear-gradient(90deg, rgba(148,163,184,.16), rgba(148,163,184,.30), rgba(148,163,184,.16));
+      background-size: 200% 100%; animation: lpSkel 1.3s ease-in-out infinite; border-radius: 8px; border-color: transparent !important;
+    }
+    .landing-instructor-card.is-loading #instructorRole { display: inline-block; width: 80px; height: 22px; }
+    .landing-instructor-card.is-loading #instructorName { width: 60%; height: 34px; }
+    .landing-instructor-card.is-loading #instructorTitle { width: 40%; height: 18px; }
+    .landing-instructor-card.is-loading #instructorBio { height: 74px; }
+    @keyframes lpSkel { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+    @media (prefers-reduced-motion: reduce) { .landing-instructor-card.is-loading * { animation: none !important; } }
     .landing-instructor-role {
       display: inline-block;
       padding: 5px 14px;
@@ -1081,7 +1120,6 @@
     }
     @media (max-width: 860px) {
       .landing-nav { padding: 12px 20px; }
-      .landing-nav.scrolled { padding: 10px 20px; }
       .landing-links {
         position: absolute;
         top: 100%;
@@ -2281,8 +2319,62 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
 #curriculum .landing-curriculum-cta { margin-top: 34px; }
 @media (max-width: 640px) { .lp-cat-grid { grid-template-columns: 1fr; } }
 </style>
+  <style>
+    /* ⭐ 2026-10-08 — Space theme on the landing page (sky + stars come from styles.css) */
+    html[data-skin="space"] .landing-nav { background: rgba(5,7,24,.62); border-bottom-color: rgba(167,139,250,.28); }
+    @media (max-width: 860px) { html[data-skin="space"] .landing-links { background: rgba(6,8,26,.98); } }
+    html[data-skin="space"] .landing-hero,
+    html[data-skin="space"] .landing-cta {
+      background:
+        radial-gradient(700px 360px at 88% 0%, rgba(192,132,252,.34), transparent 62%),
+        radial-gradient(620px 340px at 5% 100%, rgba(34,211,238,.20), transparent 62%),
+        radial-gradient(1.3px 1.3px at 12% 22%, #fff, transparent 70%),
+        radial-gradient(1px 1px at 28% 64%, rgba(255,255,255,.8), transparent 70%),
+        radial-gradient(1.5px 1.5px at 47% 14%, rgba(253,230,138,.95), transparent 70%),
+        radial-gradient(1px 1px at 63% 78%, rgba(255,255,255,.75), transparent 70%),
+        radial-gradient(1.3px 1.3px at 81% 36%, rgba(165,243,252,.95), transparent 70%),
+        radial-gradient(1px 1px at 92% 82%, #fff, transparent 70%),
+        linear-gradient(160deg, rgba(5,8,22,.55) 0%, rgba(26,18,79,.55) 55%, rgba(44,15,102,.55) 100%);
+    }
+  </style>
+<style id="lp-mobile-perf">
+  /* ⭐ The top bar is sticky, but overflow-x:hidden on the page wrappers
+     silently turned that off (it scrolled away). "clip" cuts sideways
+     overflow the same way without breaking sticky. */
+  @supports (overflow: clip) {
+    html body, html body #landingPage { overflow-x: clip !important; }
+  }
+  /* ⭐ 2026-10-10 — smooth scrolling on phones.
+     • Frosted-glass blur (backdrop-filter) over content that is scrolling
+       has to be recomputed every frame; on phones the bars & pills become
+       near-solid glass instead (looks the same against the dark hero).
+     • The hero's glow orbs are already soft radial gradients — the extra
+       90px blur filter is dropped on phones (the drift stays, it is cheap).
+     • Numbers that count up keep a fixed width, so nothing beside them moves. */
+  @media (max-width: 900px), (hover: none) {
+    .landing-nav { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; background: rgba(10,14,31,.96); }
+    [data-theme="dark"] .landing-nav { background: rgba(16,18,22,.97); }
+    [data-theme="dim"] .landing-nav { background: rgba(24,24,31,.97); }
+    .landing-hero-eyebrow, .landing-cta-ghost, .landing-install-pill, .lp-mini-cta {
+      -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+    }
+    .landing-cta-ghost { background: rgba(255,255,255,.10); }
+    .lp-mini-cta { background: rgba(10,14,31,.97); }
+    .landing-hero-orb { filter: none !important; opacity: .8; }
+    .landing-hero-orb-1 { background: radial-gradient(circle, rgba(99,102,241,.55), transparent 65%); }
+    .landing-hero-orb-2 { background: radial-gradient(circle, rgba(6,182,212,.45), transparent 65%); }
+    .landing-hero-orb-3 { background: radial-gradient(circle, rgba(236,72,153,.35), transparent 65%); }
+  }
+  .landing-stat-num { font-variant-numeric: tabular-nums; }
+  @media (max-width: 900px) {
+    .landing-nav { transition: transform .28s cubic-bezier(.22,1,.36,1), box-shadow .25s ease; will-change: transform; }
+    .landing-nav.nav-away { transform: translateY(-105%); box-shadow: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .landing-nav { transition: none; } }
+</style>
 </head>
 <body>
+  <svg width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true" focusable="false"><symbol id="aeroFlagIN" viewBox="0 0 30 20"><rect width="30" height="20" fill="#fff"/><rect width="30" height="6.67" fill="#FF9933"/><rect y="13.33" width="30" height="6.67" fill="#138808"/><circle cx="15" cy="10" r="2.75" fill="none" stroke="#000080" stroke-width=".42"/><path d="M15 10L17.45 10.00 M15 10L17.37 10.63 M15 10L17.12 11.22 M15 10L16.73 11.73 M15 10L16.23 12.12 M15 10L15.63 12.37 M15 10L15.00 12.45 M15 10L14.37 12.37 M15 10L13.78 12.12 M15 10L13.27 11.73 M15 10L12.88 11.22 M15 10L12.63 10.63 M15 10L12.55 10.00 M15 10L12.63 9.37 M15 10L12.88 8.78 M15 10L13.27 8.27 M15 10L13.77 7.88 M15 10L14.37 7.63 M15 10L15.00 7.55 M15 10L15.63 7.63 M15 10L16.23 7.88 M15 10L16.73 8.27 M15 10L17.12 8.77 M15 10L17.37 9.37" stroke="#000080" stroke-width=".22"/><circle cx="15" cy="10" r=".55" fill="#000080"/></symbol></svg>
 
 <div id="landingPage">
 
@@ -2430,6 +2522,7 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
         <span class="landing-hero-eyebrow">
           <i class="fas fa-sparkles"></i> JEE Main · JEE Advanced · NEET · Class 11 &amp; 12
         </span>
+        <div class="lp-made-in"><span class="mii mii-hero" title="Made in India"><span class="mii-text">Made in India</span><svg class="mii-flag" viewBox="0 0 30 20" role="img" aria-label="Flag of India"><use href="#aeroFlagIN"/></svg></span></div>
 
         <h1>Learn. Practice.<br>Rank.</h1>
 
@@ -2442,6 +2535,10 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
         <div class="landing-hero-actions">
           <a href="/app?intent=register" class="landing-cta-magnet">
             <i class="fas fa-rocket"></i> Start Learning Free
+          </a>
+          <!-- ⭐ Browse the full catalog and curriculum without an account -->
+          <a href="/app?intent=explore" class="landing-cta-ghost landing-cta-explore">
+            <i class="fas fa-compass"></i> Explore Courses
           </a>
           <a href="#curriculum" class="landing-cta-ghost"
              onclick="scrollToId(event, 'curriculum')">
@@ -2860,7 +2957,7 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
 
     <p class="lp-apps-footnote reveal reveal-d4">
       <i class="fas fa-shield-halved"></i>
-      Verified &amp; signed builds · No ads · No trackers · Updates install automatically.
+      Official RankerNode apps · No ads · No trackers · Updates install automatically.
     </p>
   </div>
 </section>
@@ -2878,39 +2975,19 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
           </p>
         </div>
 
-        <div class="landing-instructor-card reveal reveal-d1">
+        <!-- ⭐ Filled ONLY from the founder details saved in the admin panel
+             (no built-in name or bio is ever shown). Shows a quiet skeleton
+             until they arrive; the whole section is removed if there are none. -->
+        <div class="landing-instructor-card reveal reveal-d1 is-loading" id="instructorCard" aria-busy="true">
           <div class="landing-instructor-photo" id="instructorPhoto">
-            <div class="landing-instructor-fallback">KY</div>
+            <div class="landing-instructor-fallback"></div>
           </div>
           <div class="landing-instructor-body">
-            <span class="landing-instructor-role">Founder</span>
-            <h2 id="instructorName">Krish Yadav</h2>
-            <div class="landing-instructor-title" id="instructorTitle">Founder &amp; Course Director</div>
-            <p id="instructorBio">
-              Founder of RankerNode and an IIT Kharagpur student who has mentored
-              2,000+ learners. Passionate about turning tough Physics, Chemistry and
-              Mathematics into clear, step-by-step concepts — and about giving every
-              JEE and NEET aspirant structured, chapter-wise preparation.
-            </p>
-
-            <!-- Social links (placeholders — update href values or later bind to DB) -->
-            <div class="landing-social-row" id="instructorSocials">
-              <a href="#" class="landing-social-btn social-youtube" data-social="youtube" target="_blank" rel="noopener noreferrer">
-                <i class="fab fa-youtube"></i> YouTube
-              </a>
-              <a href="#" class="landing-social-btn social-linkedin" data-social="linkedin" target="_blank" rel="noopener noreferrer">
-                <i class="fab fa-linkedin"></i> LinkedIn
-              </a>
-              <a href="#" class="landing-social-btn social-instagram" data-social="instagram" target="_blank" rel="noopener noreferrer">
-                <i class="fab fa-instagram"></i> Instagram
-              </a>
-              <a href="#" class="landing-social-btn social-twitter" data-social="twitter" target="_blank" rel="noopener noreferrer">
-                <i class="fab fa-x-twitter"></i> X
-              </a>
-              <a href="mailto:hello@rankernode.online" class="landing-social-btn social-email" data-social="email">
-                <i class="fas fa-envelope"></i> Email
-              </a>
-            </div>
+            <span class="landing-instructor-role" id="instructorRole"></span>
+            <h2 id="instructorName"></h2>
+            <div class="landing-instructor-title" id="instructorTitle"></div>
+            <p id="instructorBio"></p>
+            <div class="landing-social-row" id="instructorSocials"></div>
           </div>
         </div>
       </div>
@@ -2971,6 +3048,10 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
             <a href="/app?intent=register" class="landing-cta-magnet"
                style="padding:18px 42px;font-size:16px;">
               <i class="fas fa-rocket"></i> Start Learning Free
+            </a>
+            <a href="/app?intent=explore" class="landing-cta-ghost landing-cta-explore"
+               style="padding:18px 34px;font-size:16px;">
+              <i class="fas fa-compass"></i> Explore Courses
             </a>
           </div>
           <div class="landing-hero-trust" style="margin-top:22px;">
@@ -3036,8 +3117,8 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
     </div>
 
     <div class="landing-footer-bottom">
-      <span>&copy; <span id="landingYear">2026</span> RankerNode</span>
-      <span>Made with <i class="fas fa-heart" style="color:#ef4444;"></i> for JEE, NEET &amp; board aspirants</span>
+      <span>&copy; <span id="landingYear">2026</span> RankerNode · <a href="/privacy" style="color:inherit;">Privacy</a> · <a href="/delete-account" style="color:inherit;">Delete account</a></span>
+      <span class="lp-foot-made"><span class="mii mii-footer" title="Made in India"><span class="mii-text">Made in India</span><svg class="mii-flag" viewBox="0 0 30 20" role="img" aria-label="Flag of India"><use href="#aeroFlagIN"/></svg></span><span>with <i class="fas fa-heart" style="color:#ef4444;"></i> for JEE, NEET &amp; board aspirants</span></span>
     </div>
   </footer>
 
@@ -3054,8 +3135,22 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
      One animated sun ⇄ moon switch: Light ↔ the user's preferred dark style
      (Dim or Night, chosen in the app's Settings). */
   (function initLandingTheme() {
-    const DARK = ['dim', 'dark'];
-    function getTheme() { return document.documentElement.getAttribute('data-theme') || 'light'; }
+    const DARK = ['dim', 'dark', 'space'];
+    function getTheme() {
+      const skin = document.documentElement.getAttribute('data-skin');
+      if (skin === 'space' || skin === 'aurora') return skin;
+      return document.documentElement.getAttribute('data-theme') || 'light';
+    }
+    function setAttrs(t) {
+      if (t === 'space') { document.documentElement.setAttribute('data-theme', 'dark'); document.documentElement.setAttribute('data-skin', 'space'); }
+      else if (t === 'aurora') { document.documentElement.setAttribute('data-theme', 'light'); document.documentElement.setAttribute('data-skin', 'aurora'); }
+      else { document.documentElement.setAttribute('data-theme', t); document.documentElement.removeAttribute('data-skin'); }
+    }
+    function preferredLight() {
+      let t = null;
+      try { t = localStorage.getItem('aero_theme_light'); } catch (e) {}
+      return t === 'aurora' ? 'aurora' : 'light';
+    }
     function preferredDark() {
       let t = null;
       try { t = localStorage.getItem('aero_theme_dark'); } catch (e) {}
@@ -3071,19 +3166,20 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
       btn.setAttribute('title', label);
     }
     function applyTheme(t) {
-      document.documentElement.setAttribute('data-theme', t);
+      setAttrs(t);
       try { localStorage.setItem('aero_theme', t); } catch (e) {}
       if (DARK.includes(t)) { try { localStorage.setItem('aero_theme_dark', t); } catch (e) {} }
+      else { try { localStorage.setItem('aero_theme_light', t); } catch (e) {} }
       syncSwitch();
     }
-    function toggle() { applyTheme(DARK.includes(getTheme()) ? 'light' : preferredDark()); }
+    function toggle() { applyTheme(DARK.includes(getTheme()) ? preferredLight() : preferredDark()); }
 
     let saved = null;
     try { saved = localStorage.getItem('aero_theme'); } catch (e) {}
-    const valid = ['light', 'dim', 'dark'];
+    const valid = ['light', 'dim', 'dark', 'space', 'aurora'];
     const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
     const initial = valid.includes(saved) ? saved : (prefersDark ? 'dark' : 'light');
-    document.documentElement.setAttribute('data-theme', initial);
+    setAttrs(initial);
 
     const wire = () => {
       syncSwitch();
@@ -3098,12 +3194,20 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
   (function navScroll() {
     const nav = document.getElementById('landingNav');
     if (!nav) return;
-    const onScroll = () => {
-      if (window.scrollY > 30) nav.classList.add('scrolled');
-      else nav.classList.remove('scrolled');
-    };
-    window.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
+    let on = null, hidden = false, lastY = 0;
+    const phone = window.matchMedia('(max-width: 900px)');
+    lpOnScroll((y) => {
+      const want = y > 30;
+      if (want !== on) { on = want; nav.classList.toggle('scrolled', want); }   // touch the DOM only when it changes
+      /* phones: the two-row bar slides away while reading down, back on the way up */
+      const dy = y - lastY;
+      let hide = hidden;
+      if (!phone.matches || y < 160 || nav.classList.contains('menu-open')) hide = false;
+      else if (dy > 8) hide = true;
+      else if (dy < -6) hide = false;
+      if (Math.abs(dy) > 6 || hide !== hidden) lastY = y;
+      if (hide !== hidden) { hidden = hide; nav.classList.toggle('nav-away', hide); }
+    });
   })();
 
   /* ---------- Mobile menu toggle ---------- */
@@ -3298,74 +3402,78 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  /* ---------- Fetch instructor profile (silent, non-blocking, lazy photo) ---------- */
-  (async function loadInstructorProfile() {
-    try {
-      const res = await fetch('/api/settings/owner?_t=' + Date.now(), { cache: 'no-store' });
-      const data = await res.json();
-      if (!data || !data.success || !data.owner) return;
-      const o = data.owner;
-
-      /* ⭐ If the admin has hidden the founder section, remove it entirely
-            from the landing page and strip every link that scrolls to it.
-            Details in the database are preserved — this only affects
-            what visitors see on the public front page. */
-      if (o.visible === false) {
-        const section = document.getElementById('instructor');
-        if (section) section.remove();
-
-        // Remove nav link "About" and footer link "Instructor" — they
-        // both point at #instructor and would scroll to nothing.
-        document.querySelectorAll('a[href="#instructor"]').forEach(a => a.remove());
-        return;
-      }
-
-      if (o.name)  document.getElementById('instructorName').textContent  = o.name;
-      if (o.title) document.getElementById('instructorTitle').textContent = o.title;
-      if (o.bio)   document.getElementById('instructorBio').textContent   = o.bio;
-
-      if (o.photo) {
-        const slot = document.getElementById('instructorPhoto');
-        if (slot) {
-          const img = document.createElement('img');
-          img.src = o.photo;
-          img.alt = o.name || 'Instructor';
-          img.loading = 'lazy';           /* ⚡ lazy-loaded photo */
-          img.decoding = 'async';         /* ⚡ non-blocking decode */
-          img.width = 260; img.height = 260;
-          slot.innerHTML = '';
-          slot.appendChild(img);
-        }
-      } else if (o.name) {
-        const initials = o.name.split(/\s+/).filter(Boolean).slice(0, 2)
-          .map(w => w[0]).join('').toUpperCase();
-        const fb = document.querySelector('.landing-instructor-fallback');
-        if (fb) fb.textContent = initials || 'KY';
-      }
-
-      /* Wire up social links if the owner settings ever expose them.
-         Expected shape (future-proof): owner.social = { youtube, linkedin, instagram, twitter, email }
-         Falls back gracefully to whatever href is already in the HTML. */
-      const s = o.social || {};
-      const map = {
-        youtube:   s.youtube,
-        linkedin:  s.linkedin,
-        instagram: s.instagram,
-        twitter:   s.twitter,
-        email:     s.email
-      };
-      Object.keys(map).forEach(key => {
-        const url = map[key];
-        if (!url) return;
-        const btn = document.querySelector('[data-social="' + key + '"]');
-        if (!btn) return;
-        if (key === 'email') {
-          btn.setAttribute('href', 'mailto:' + String(url).replace(/^mailto:/, ''));
+  /* ---------- Founder / instructor — only what the admin saved ----------
+     Paints instantly from this device's last copy (if any), then from the
+     server. No name, bio or social link is built in: if the admin has not
+     filled the founder details, or has hidden them, the section and every
+     link to it are removed. */
+  (function loadInstructorProfile() {
+    var removed = false;
+    function removeSection() {
+      if (removed) return; removed = true;
+      var section = document.getElementById('instructor');
+      if (section) section.remove();
+      document.querySelectorAll('a[href="#instructor"]').forEach(function (a) { a.remove(); });
+    }
+    function setText(id, v) { var el = document.getElementById(id); if (el) { el.textContent = v || ''; el.hidden = !v; } }
+    function paint(o) {
+      if (!o || o.visible === false || !o.name) { removeSection(); return; }
+      var card = document.getElementById('instructorCard'); if (!card) return;
+      setText('instructorRole', o.role);
+      setText('instructorName', o.name);
+      setText('instructorTitle', o.title);
+      setText('instructorBio', o.bio);
+      var slot = document.getElementById('instructorPhoto');
+      if (slot) {
+        if (o.photo) {
+          var cur = slot.querySelector('img');
+          if (!cur || cur.getAttribute('src') !== o.photo) {
+            var img = document.createElement('img');
+            img.src = o.photo; img.alt = o.name; img.loading = 'lazy'; img.decoding = 'async';
+            img.width = 260; img.height = 260;
+            slot.innerHTML = ''; slot.appendChild(img);
+          }
         } else {
-          btn.setAttribute('href', url);
+          var initials = String(o.name).split(/\s+/).filter(Boolean).slice(0, 2).map(function (w) { return w[0]; }).join('').toUpperCase();
+          slot.innerHTML = '<div class="landing-instructor-fallback"></div>';
+          slot.firstChild.textContent = initials;
         }
+      }
+      /* social links: only the ones the admin actually has */
+      var row = document.getElementById('instructorSocials');
+      if (row) {
+        var s = o.social || {}, html = '';
+        var defs = [['youtube', 'fab fa-youtube', 'YouTube'], ['linkedin', 'fab fa-linkedin', 'LinkedIn'], ['instagram', 'fab fa-instagram', 'Instagram'], ['twitter', 'fab fa-x-twitter', 'X']];
+        row.innerHTML = '';
+        defs.forEach(function (d) {
+          var url = s[d[0]]; if (!url || !/^https?:\/\//i.test(url)) return;
+          var a = document.createElement('a');
+          a.className = 'landing-social-btn social-' + d[0]; a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.innerHTML = '<i class="' + d[1] + '"></i> ' + d[2]; row.appendChild(a);
+        });
+        var mail = s.email || o.email;
+        if (mail) {
+          var m = document.createElement('a');
+          m.className = 'landing-social-btn social-email'; m.href = 'mailto:' + String(mail).replace(/^mailto:/, '');
+          m.innerHTML = '<i class="fas fa-envelope"></i> Email'; row.appendChild(m);
+        }
+        row.hidden = !row.children.length;
+      }
+      card.classList.remove('is-loading'); card.removeAttribute('aria-busy');
+    }
+    try { var c = JSON.parse(localStorage.getItem('aero_owner_v2') || 'null'); if (c && typeof c.name === 'string') paint(c); } catch (e) {}
+    fetch('/api/settings/owner', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function (data) {
+        if (!data || !data.success || !data.owner) throw new Error('no data');
+        try { localStorage.setItem('aero_owner_v2', JSON.stringify(data.owner)); } catch (e) {}
+        paint(data.owner);
+      })
+      .catch(function () {
+        /* server unreachable: keep a copy we already showed, otherwise remove the empty card */
+        var card = document.getElementById('instructorCard');
+        if (card && card.classList.contains('is-loading')) removeSection();
       });
-    } catch (e) { /* silent — page works fine with defaults */ }
   })();
 </script>
 
@@ -3457,9 +3565,8 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
     btn.innerHTML = '<i class="fas fa-arrow-up"></i>';
     btn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
     document.body.appendChild(btn);
-    const toggle = () => btn.classList.toggle('visible', window.scrollY > 900);
-    window.addEventListener('scroll', toggle, { passive: true });
-    toggle();
+    let shown = null;
+    lpOnScroll((y) => { const v = y > 900; if (v !== shown) { shown = v; btn.classList.toggle('visible', v); } });
   }
 
   /* ---------- 3. Sticky mini-CTA ---------- */
@@ -3478,14 +3585,17 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
       cta.classList.remove('visible');
     });
     const hero = $('#hero');
-    const toggle = () => {
+    /* sizes are measured once (and on resize), not on every scroll event */
+    let heroH = 0, docH = 0, shown = null;
+    const measure = () => { heroH = hero ? hero.offsetHeight : 0; docH = document.documentElement.scrollHeight - window.innerHeight; };
+    measure();
+    window.addEventListener('load', () => { measure(); lpScrollRefresh(); });
+    if ('ResizeObserver' in window) new ResizeObserver(() => { measure(); lpScrollRefresh(); }).observe(document.body);
+    lpOnScroll((y) => {
       if (dismissed) return;
-      const past = hero ? window.scrollY > (hero.offsetHeight * 0.75) : window.scrollY > 700;
-      const nearEnd = window.scrollY > (document.documentElement.scrollHeight - window.innerHeight - 400);
-      cta.classList.toggle('visible', past && !nearEnd);
-    };
-    window.addEventListener('scroll', toggle, { passive: true });
-    toggle();
+      const v = (hero ? y > heroH * 0.75 : y > 700) && !(y > docH - 400);
+      if (v !== shown) { shown = v; cta.classList.toggle('visible', v); }
+    });
   }
 
   /* ---------- 4. Hero spotlight ---------- */
@@ -3842,7 +3952,7 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
 
   /* ---------- Boot ---------- */
   function boot() {
-    safe('progress',       setupProgress);
+    /* (scroll progress: the shared .aero-scroll-progress bar below does it — two bars doubled the work) */
     safe('backToTop',      setupBackToTop);
     safe('stickyCta',      setupStickyCta);
     safe('heroSpotlight',  setupHeroSpotlight);
@@ -3889,15 +3999,20 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
   let deferredPrompt = null;   // captured beforeinstallprompt event
   let installedAlready = false;
   let apkInfo = null;          // { version, size } when the real Android app is published
+  let winInfo = null;          // { version, size } when the real Windows app is published
 
   /* Inside the RankerNode Android app itself → no install buttons at all */
   const IN_NATIVE_APP = /RankerNodeApp\//.test(navigator.userAgent || '');
   if (IN_NATIVE_APP) document.documentElement.classList.add('aero-in-app');
 
   /* ---------- 2b. Real Android app (APK) published by the admin? ---------- */
+  let _relP = null;            // one request for both the Android and the Windows card
+  function appReleaseOnce() {
+    if (!_relP) _relP = fetch('/api/app-release', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null).catch(() => null);
+    return _relP;
+  }
   function fmtMB(n) { return (Number(n || 0) / 1048576).toFixed(1) + ' MB'; }
-  fetch('/api/app-release', { cache: 'no-cache' })
-    .then(r => r.ok ? r.json() : null)
+  appReleaseOnce()
     .then(d => {
       const a = d && d.android;
       if (!a || !a.available) return;
@@ -3916,6 +4031,40 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
       window.dispatchEvent(new Event('altitude:apk-ready'));
     })
     .catch(() => {});
+
+  /* ---------- 2c. Real Windows app published by the admin? ---------- */
+  appReleaseOnce()
+    .then(d => {
+      const w = d && d.windows;
+      if (!w || !w.available) return;
+      winInfo = w;
+      APP_DOWNLOADS.windows.exeUrl = w.url || '/download/windows';
+      window.__aeroWin = w;
+      const card = document.querySelector('.lp-app-card[data-platform="windows"]');
+      if (card) {
+        const desc = card.querySelector('.lp-app-desc');
+        const lbl  = card.querySelector('.lp-app-btn-label');
+        const hint = card.querySelector('.lp-app-hint');
+        const btn  = card.querySelector('.lp-app-btn');
+        card.classList.remove('lp-app-installed');
+        if (btn)  btn.disabled = false;
+        if (desc) desc.textContent = 'The real RankerNode app for your PC — Start menu & desktop icon, its own window, updates itself.';
+        if (lbl)  lbl.textContent  = 'Download for Windows';
+        if (hint) { hint.textContent = 'Version ' + w.version + ' · ' + fmtMB(w.size) + ' · Windows 10 & 11'; hint.classList.remove('is-error'); }
+      }
+      window.dispatchEvent(new Event('rankernode:win-ready'));
+    })
+    .catch(() => {});
+
+  function windowsSteps() {
+    return [
+      'Your download has started' + (winInfo ? ' — <strong>RankerNode-Setup-' + String(winInfo.version).replace(/[^0-9.]/g, '') + '.exe</strong> (' + fmtMB(winInfo.size) + ')' : '') + '.',
+      'Open it from your browser\'s <strong>Downloads</strong> (<strong>Ctrl + J</strong>). If the browser says it “isn\'t commonly downloaded”, choose <strong>⋯ → Keep</strong> (Edge: <strong>Keep anyway</strong>).',
+      'If Windows shows <strong>“Windows protected your PC”</strong>, click <strong>More info → Run anyway</strong>. <em>(Only the first time — the app is new, so Windows doesn\'t know it yet.)</em>',
+      'RankerNode installs in a few seconds — no admin password — and opens by itself. It is on your <strong>Desktop</strong> and in the <strong>Start menu</strong>.',
+      'Updates install automatically. Installed the website from your browser before? You can remove that old version.'
+    ];
+  }
 
   const IS_STANDALONE = window.matchMedia('(display-mode: standalone)').matches ||
                         window.navigator.standalone === true;
@@ -3999,8 +4148,8 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
     const lbl  = card ? card.querySelector('.lp-app-btn-label') : null;
     const originalLabel = lbl ? lbl.textContent : '';
 
-    /* ---- A. Already installed? ---- */
-    if (installedAlready || IS_STANDALONE) {
+    /* ---- A. Already installed? (a browser-installed copy can still get the real Windows app) ---- */
+    if ((installedAlready || IS_STANDALONE) && !(platform === 'windows' && winInfo)) {
       if (hint) {
         hint.textContent = 'App is already installed on this device.';
         hint.classList.remove('is-error');
@@ -4035,6 +4184,25 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
         'Tap <strong>Install</strong>, then <strong>Open</strong>. RankerNode is now a normal app in your app drawer — no browser, no badge.',
         'Had added the website to your home screen before? You can remove that old shortcut.'
       ]);
+      return;
+    }
+
+    if (directUrl && platform === 'windows') {
+      if (detectPlatform() !== 'windows') {
+        showInstallGuide(card, hint, 'Get the Windows app', [
+          'Open <strong>' + location.host + '</strong> on your <strong>Windows PC or laptop</strong> and click <strong>Get App</strong>.',
+          'Or download it here and copy it to your PC: <a href="' + directUrl + '" style="font-weight:700;">RankerNode-Setup.exe</a>' + (winInfo ? ' (' + fmtMB(winInfo.size) + ')' : '') + ' — for Windows 10 &amp; 11 (64-bit).'
+        ]);
+        return;
+      }
+      const a = document.createElement('a');
+      a.href = directUrl;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      if (hint) { hint.textContent = 'Downloading… then open the file to install.'; hint.classList.remove('is-error'); hint.classList.add('is-ok'); }
+      showInstallGuide(card, hint, 'Install RankerNode for Windows', windowsSteps());
       return;
     }
 
@@ -4354,8 +4522,28 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
   if (document.documentElement.dataset.aeroAppInstalled === '1') setInstalled();
 
   /* ---------- Click handler ---------- */
+  /* the real Windows app is published → this pill downloads it (even over a browser-installed copy) */
+  const IS_WIN_PC = /windows/i.test(navigator.userAgent || '') && !/android|iphone|ipad/i.test(navigator.userAgent || '');
+  window.addEventListener('rankernode:win-ready', () => {
+    if (!IS_WIN_PC) return;
+    btn.classList.remove('is-installed');
+    const label = btn.querySelector('.landing-install-pill-text');
+    if (label) label.textContent = 'Get App';
+    const icon = btn.querySelector('i');
+    if (icon) { icon.classList.remove('fa-check'); icon.classList.add('fa-download'); }
+    btn.title = 'Get the RankerNode app for Windows';
+    setReady(true);
+  });
+  if (window.__aeroWin && IS_WIN_PC) setReady(true);
+
   window.landingInstallClick = function (event) {
     if (event) event.preventDefault();
+
+    // Windows PC and the real app is published → download the installer
+    if (window.__aeroWin && IS_WIN_PC && typeof window.installApp === 'function') {
+      window.installApp('windows');
+      return;
+    }
 
     // Already installed → gentle nudge
     if (btn.classList.contains('is-installed')) {
@@ -4482,20 +4670,18 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
       bar.style.opacity = '0';
       document.body.appendChild(bar);
 
-      var raf = 0;
-      function paint() {
-        raf = 0;
-        var doc = document.documentElement;
-        var max = doc.scrollHeight - window.innerHeight;
-        var y = window.scrollY || doc.scrollTop || 0;
+      /* page height measured on load / resize, not every frame */
+      var max = 0;
+      function measure() { max = document.documentElement.scrollHeight - window.innerHeight; }
+      measure();
+      window.addEventListener('load', function () { measure(); lpScrollRefresh(); });
+      if ('ResizeObserver' in window) new ResizeObserver(function () { measure(); lpScrollRefresh(); }).observe(document.body);
+      lpOnScroll(function (y) {
         var pct = max > 40 ? Math.min(100, Math.max(0, (y / max) * 100)) : 0;
-        bar.style.width = pct.toFixed(2) + '%';
-        bar.style.opacity = pct > 0.5 ? '1' : '0';
-      }
-      function onScroll() { if (!raf) raf = requestAnimationFrame(paint); }
-      window.addEventListener('scroll', onScroll, { passive: true });
-      window.addEventListener('resize', onScroll, { passive: true });
-      paint();
+        bar.style.transform = 'scaleX(' + (pct / 100).toFixed(4) + ')';
+        var op = pct > 0.5 ? '1' : '0';
+        if (bar.style.opacity !== op) bar.style.opacity = op;
+      });
     } catch (e) { /* purely additive */ }
   }
   if (document.readyState === 'loading') {
@@ -4739,5 +4925,81 @@ html.aero-in-app #landingInstallPill, html.aero-in-app #apps, html.aero-in-app a
     .catch(function () {});
 })();
 </script>
+<script>
+  /* ⭐ 2026-10-10 — already signed in (e.g. came back here with the app's
+     back button)? Offer to continue instead of asking to log in again. */
+  (function () {
+    var user = null;
+    try { if (sessionStorage.getItem('aero_token')) user = JSON.parse(sessionStorage.getItem('aero_user') || 'null'); } catch (e) {}
+    if (!user) return;
+    var first = String(user.fullName || user.username || '').trim().split(/\s+/)[0] || '';
+    var safe = first.replace(/[<>&"']/g, '');
+    var home = '/app#/home';
+    function apply() {
+      var signin = document.querySelector('.landing-signin-btn');
+      if (signin) { signin.href = home; signin.innerHTML = '<i class="fas fa-gauge-high"></i> Dashboard'; }
+      var cta = document.querySelector('.landing-cta-btn');
+      if (cta) { cta.href = home; cta.innerHTML = '<i class="fas fa-arrow-right"></i> <span>' + (safe ? 'Continue as ' + safe : 'Continue') + '</span>'; }
+      document.querySelectorAll('a.landing-cta-magnet[href^="/app?intent=register"]').forEach(function (a) {
+        a.href = home; a.innerHTML = '<i class="fas fa-rocket"></i> Continue learning';
+      });
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply); else apply();
+  })();
+</script>
+<style id="lp-anim-perf">
+  /* ⭐ 2026-10-10 — the same pulses & shimmers, drawn by the GPU.
+     Animating box-shadow or background-position repaints on the main
+     thread every frame (forever, for looping ones) and stole time from
+     scrolling. These versions move/fade a layer instead — identical look. */
+
+  /* loading shimmer: a light band slides across (transform), the card stays still */
+  .lp-review--skeleton { animation: none !important; background: var(--bg-surface-2) !important; position: relative; overflow: hidden; }
+  .lp-review--skeleton::after,
+  .landing-instructor-card.is-loading #instructorRole::after,
+  .landing-instructor-card.is-loading #instructorName::after,
+  .landing-instructor-card.is-loading #instructorTitle::after,
+  .landing-instructor-card.is-loading #instructorBio::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(90deg, transparent 0%, rgba(148,163,184,.22) 50%, transparent 100%);
+    transform: translateX(-100%);
+    animation: lpShimmerMove 1.3s ease-in-out infinite;
+  }
+  .landing-instructor-card.is-loading #instructorRole,
+  .landing-instructor-card.is-loading #instructorName,
+  .landing-instructor-card.is-loading #instructorTitle,
+  .landing-instructor-card.is-loading #instructorBio {
+    animation: none !important; background: rgba(148,163,184,.18) !important; position: relative; overflow: hidden;
+  }
+  @keyframes lpShimmerMove { to { transform: translateX(100%); } }
+
+  /* green "ready" pulses: a ring that grows and fades (transform + opacity) */
+  .landing-install-pill.is-ready { animation: none !important; box-shadow: none !important; }
+  .landing-install-pill.is-ready::after {
+    content: ""; position: absolute; inset: -1px; border-radius: inherit; pointer-events: none;
+    box-shadow: 0 0 0 6px rgba(52,211,153,.45);
+    opacity: 0; animation: lpRingPulse 2.4s ease-out infinite;
+  }
+  .landing-install-pill-dot { animation: none !important; box-shadow: none !important; }
+  .landing-install-pill-dot::after {
+    content: ""; position: absolute; inset: -2px; border-radius: 50%; pointer-events: none;
+    box-shadow: 0 0 0 5px rgba(52,211,153,.6);
+    opacity: 0; animation: lpRingPulse 1.6s ease-out infinite;
+  }
+  .lp-app-card.lp-app-ready .lp-app-btn { animation: none !important; position: relative; }
+  .lp-app-card.lp-app-ready .lp-app-btn::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    box-shadow: 0 8px 26px rgba(16,185,129,.7);
+    opacity: 0; animation: lpGlowFade 2.4s ease-in-out infinite;
+  }
+  @keyframes lpRingPulse { 0% { opacity: .9; transform: scale(.92); } 100% { opacity: 0; transform: scale(1.18); } }
+  @keyframes lpGlowFade { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    .lp-review--skeleton::after, .landing-instructor-card.is-loading *::after,
+    .landing-install-pill.is-ready::after, .landing-install-pill-dot::after,
+    .lp-app-card.lp-app-ready .lp-app-btn::after { animation: none !important; }
+  }
+</style>
 </body>
 </html>

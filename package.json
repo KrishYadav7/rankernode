@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/test-auth-core.js && node scripts/test-security-helpers.js && node scripts/test-certificate.js && node scripts/test-bulk-guard.js && node scripts/test-office-render.js && node scripts/test-ai-helpers.js && node scripts/test-popup-sanitizer.js",
+    "test": "node scripts/test-auth-core.js && node scripts/test-admin-sessions.js && node scripts/test-login-tabs.js && node scripts/test-ai-engine.js && node scripts/test-ai-continue.js && node scripts/test-notes-api.js && node scripts/test-tex.js && node scripts/test-security-helpers.js && node scripts/test-certificate.js && node scripts/test-bulk-guard.js && node scripts/test-office-render.js && node scripts/test-ai-helpers.js && node scripts/test-popup-sanitizer.js",
     "smoke": "bash scripts/smoke-test.sh"
   },
   "keywords": [],
